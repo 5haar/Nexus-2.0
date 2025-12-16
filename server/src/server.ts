@@ -331,6 +331,46 @@ app.delete('/api/categories/:name', (req, res) => {
   res.json({ ok: true, removedFrom, deletedDocs, remaining: db.docs.length });
 });
 
+app.patch('/api/categories/:name', (req, res) => {
+  const raw = req.params.name ?? '';
+  let fromName = raw.trim().toLowerCase();
+  try {
+    fromName = decodeURIComponent(raw).trim().toLowerCase();
+  } catch {
+    // ignore malformed encoding; use raw param
+  }
+
+  const toRaw = String((req.body as any)?.to ?? '').trim();
+  const toName = toRaw.trim().toLowerCase();
+
+  if (!fromName) return res.status(400).json({ error: 'name is required' });
+  if (!toName) return res.status(400).json({ error: 'to is required' });
+  if (toName === fromName) return res.json({ ok: true, changed: 0 });
+
+  let changed = 0;
+  db.docs = db.docs.map((doc) => {
+    const before = doc.categories ?? [];
+    const has = before.some((c) => c.trim().toLowerCase() === fromName);
+    if (!has) return doc;
+
+    const renamed = before.map((c) => (c.trim().toLowerCase() === fromName ? toName : c));
+    const deduped: string[] = [];
+    const seen = new Set<string>();
+    for (const c of renamed) {
+      const key = c.trim().toLowerCase();
+      if (!key) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(key);
+    }
+    changed += 1;
+    return { ...doc, categories: deduped };
+  });
+
+  writeDB(db);
+  res.json({ ok: true, changed });
+});
+
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'file is required' });

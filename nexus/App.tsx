@@ -533,6 +533,15 @@ export default function App() {
                   throw err;
                 }
               }}
+              onRenameCategory={async (from, to) => {
+                await apiFetch<{ ok: boolean }>(`/api/categories/${encodeURIComponent(from)}`, {
+                  method: 'PATCH',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ to }),
+                });
+                setActiveCategory(null);
+                await refreshDocs();
+              }}
               onDeleteDoc={async (docId) => {
                 try {
                   await deleteDoc(docId);
@@ -921,6 +930,7 @@ function CategoriesScreen(props: {
   onRefresh: () => void;
   onDeleteCategory: (name: string, mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => void;
   onDeleteCategories?: (names: string[], mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => Promise<void> | void;
+  onRenameCategory?: (from: string, to: string) => Promise<void> | void;
   onDeleteDoc: (docId: string) => void;
   onView: (uri: string) => void;
 }) {
@@ -932,6 +942,9 @@ function CategoriesScreen(props: {
   const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
   const [selectionMode, setSelectionMode] = useState(false);
   const [deletingSelected, setDeletingSelected] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameText, setRenameText] = useState('');
+  const [renaming, setRenaming] = useState(false);
 
   const pageStyle = useMemo(() => [styles.mcPage, { padding: pagePadding }], [pagePadding]);
   const categoryRowStyle = categoryColumns > 1 ? styles.mcGridRow : undefined;
@@ -941,6 +954,7 @@ function CategoriesScreen(props: {
     [props.categories],
   );
   const isSelecting = selectionMode;
+  const selectedName = selectedCategories.size === 1 ? Array.from(selectedCategories)[0] : null;
   const toggleCategorySelected = (name: string) => {
     setSelectionMode(true);
     setSelectedCategories((prev) => {
@@ -961,10 +975,6 @@ function CategoriesScreen(props: {
     const normal = props.categories.filter((c) => c.name.toLowerCase().includes(query));
     return [...normal, { name: '__refresh__', count: 0 }];
   }, [categoryQuery, categoriesData, props.categories]);
-  const filteredRealCategories = useMemo(
-    () => filteredCategoriesData.filter((c) => c.name !== '__refresh__'),
-    [filteredCategoriesData],
-  );
 
   const runDeleteSelected = async (mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => {
     const names = Array.from(selectedCategories);
@@ -985,7 +995,7 @@ function CategoriesScreen(props: {
   };
 
   const confirmDeleteSelected = () => {
-    if (!selectedCategories.size) return;
+    if (selectedCategories.size < 2) return;
     Alert.alert(
       `Delete ${selectedCategories.size} categor${selectedCategories.size === 1 ? 'y' : 'ies'}?`,
       'Choose what to delete.',
@@ -997,36 +1007,31 @@ function CategoriesScreen(props: {
     );
   };
 
-  const openHeaderMenu = () => {
-    const buttons: { text: string; style?: 'cancel' | 'destructive'; onPress?: () => void }[] = [];
-    if (selectionMode) {
-      buttons.push({ text: 'Done', onPress: exitSelectionMode });
-    } else {
-      buttons.push({ text: 'Select categories', onPress: () => setSelectionMode(true) });
+  const openRename = () => {
+    if (!selectedName) return;
+    setRenameText(selectedName);
+    setRenameOpen(true);
+  };
+
+  const runRename = async () => {
+    if (!selectedName || renaming) return;
+    const nextName = renameText.trim().toLowerCase();
+    if (!nextName) return;
+    if (nextName === selectedName.trim().toLowerCase()) {
+      setRenameOpen(false);
+      return;
     }
-
-    if (filteredRealCategories.length) {
-      buttons.push({
-        text: selectionMode ? 'Select all (visible)' : 'Select all (visible)',
-        onPress: () => {
-          setSelectionMode(true);
-          setSelectedCategories(new Set(filteredRealCategories.map((c) => c.name)));
-        },
-      });
+    setRenaming(true);
+    try {
+      if (!props.onRenameCategory) throw new Error('Rename is not configured on the server.');
+      await props.onRenameCategory(selectedName, nextName);
+      setRenameOpen(false);
+      exitSelectionMode();
+    } catch (err: any) {
+      Alert.alert('Rename failed', err?.message ?? 'Failed to rename category.');
+    } finally {
+      setRenaming(false);
     }
-
-    if (selectionMode && selectedCategories.size) {
-      buttons.push({
-        text: `Delete selected (${selectedCategories.size})`,
-        style: 'destructive',
-        onPress: confirmDeleteSelected,
-      });
-    }
-
-    buttons.push({ text: 'Refresh', onPress: props.onRefresh });
-    buttons.push({ text: 'Cancel', style: 'cancel' });
-
-    Alert.alert('Categories', undefined, buttons);
   };
 
   const CategoryCard = (p: { name: string; count: number; index: number }) => {
@@ -1267,14 +1272,19 @@ function CategoriesScreen(props: {
           <Text style={styles.mcH1}>Categories</Text>
           <Text style={styles.mcMuted}>Your organized knowledge clusters.</Text>
         </View>
-        <Pressable onPress={openHeaderMenu} style={({ pressed }) => [styles.mcHeaderMenu, pressed && styles.pressed]}>
-          <Ionicons name="ellipsis-horizontal" size={20} color={COLORS.text} />
+        <Pressable
+          onPress={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
+          style={({ pressed }) => [styles.mcHeaderMenu, pressed && styles.pressed]}
+        >
+          <Ionicons name={selectionMode ? 'close' : 'ellipsis-horizontal'} size={20} color={COLORS.text} />
         </Pressable>
       </View>
 
-      {isSelecting && (
+      {selectionMode && (
         <View style={styles.mcSelectionBar}>
-          <Text style={styles.mcSelectionText}>{selectedCategories.size} selected</Text>
+          <Text style={styles.mcSelectionText}>
+            {selectedCategories.size ? `${selectedCategories.size} selected` : 'Select categories'}
+          </Text>
           <View style={styles.mcSelectionActions}>
             <Pressable
               onPress={exitSelectionMode}
@@ -1283,18 +1293,30 @@ function CategoriesScreen(props: {
             >
               <Text style={styles.mcSelectionButtonText}>Done</Text>
             </Pressable>
-            <Pressable
-              onPress={confirmDeleteSelected}
-              style={({ pressed }) => [styles.mcSelectionButtonDanger, pressed && styles.pressed]}
-              disabled={deletingSelected || selectedCategories.size === 0}
-            >
-              {deletingSelected ? (
-                <ActivityIndicator size="small" color={COLORS.accentText} />
-              ) : (
-                <Ionicons name="trash-outline" size={16} color={COLORS.accentText} />
-              )}
-              <Text style={styles.mcSelectionButtonDangerText}>Delete</Text>
-            </Pressable>
+            {selectedCategories.size === 1 && (
+              <Pressable
+                onPress={openRename}
+                style={({ pressed }) => [styles.mcSelectionButton, pressed && styles.pressed]}
+                disabled={renaming}
+              >
+                {renaming ? <ActivityIndicator size="small" color={COLORS.text} /> : null}
+                <Text style={styles.mcSelectionButtonText}>Rename</Text>
+              </Pressable>
+            )}
+            {selectedCategories.size >= 2 && (
+              <Pressable
+                onPress={confirmDeleteSelected}
+                style={({ pressed }) => [styles.mcSelectionButtonDanger, pressed && styles.pressed]}
+                disabled={deletingSelected}
+              >
+                {deletingSelected ? (
+                  <ActivityIndicator size="small" color={COLORS.accentText} />
+                ) : (
+                  <Ionicons name="trash-outline" size={16} color={COLORS.accentText} />
+                )}
+                <Text style={styles.mcSelectionButtonDangerText}>Delete</Text>
+              </Pressable>
+            )}
           </View>
           <Text style={styles.mcSelectionHint}>Tap categories to select. Long-press also works.</Text>
         </View>
@@ -1333,20 +1355,60 @@ function CategoriesScreen(props: {
   );
 
   return (
-    <FlatList
-      data={filteredCategoriesData}
-      key={`cats-${categoryColumns}`}
-      keyExtractor={(item) => item.name}
-      numColumns={categoryColumns}
-      columnWrapperStyle={categoryRowStyle}
-      contentContainerStyle={pageStyle as any}
-      ItemSeparatorComponent={categoryColumns === 1 ? () => <View style={{ height: 24 }} /> : undefined}
-      ListHeaderComponent={categoriesHeader}
-      renderItem={({ item, index }) => {
-        if (item.name === '__refresh__') return <RefreshCard index={index} />;
-        return <CategoryCard name={item.name} count={item.count} index={index} />;
-      }}
-    />
+    <View style={styles.screen}>
+      <FlatList
+        data={filteredCategoriesData}
+        key={`cats-${categoryColumns}`}
+        keyExtractor={(item) => item.name}
+        numColumns={categoryColumns}
+        columnWrapperStyle={categoryRowStyle}
+        contentContainerStyle={pageStyle as any}
+        ItemSeparatorComponent={categoryColumns === 1 ? () => <View style={{ height: 24 }} /> : undefined}
+        ListHeaderComponent={categoriesHeader}
+        renderItem={({ item, index }) => {
+          if (item.name === '__refresh__') return <RefreshCard index={index} />;
+          return <CategoryCard name={item.name} count={item.count} index={index} />;
+        }}
+      />
+
+      <Modal visible={renameOpen} transparent animationType="fade" onRequestClose={() => setRenameOpen(false)}>
+        <View style={styles.renameBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setRenameOpen(false)} />
+          <View style={styles.renameCard}>
+            <Text style={styles.renameTitle}>Rename category</Text>
+            <TextInput
+              value={renameText}
+              onChangeText={setRenameText}
+              placeholder="New name"
+              placeholderTextColor={COLORS.muted2}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={styles.renameInput}
+            />
+            <View style={styles.renameActions}>
+              <Pressable
+                onPress={() => setRenameOpen(false)}
+                style={({ pressed }) => [styles.renameButton, pressed && styles.pressed]}
+                disabled={renaming}
+              >
+                <Text style={styles.renameButtonText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                onPress={runRename}
+                style={({ pressed }) => [styles.renameButtonPrimary, pressed && styles.pressed]}
+                disabled={renaming}
+              >
+                {renaming ? (
+                  <ActivityIndicator size="small" color={COLORS.accentText} />
+                ) : (
+                  <Text style={styles.renameButtonPrimaryText}>Save</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </View>
   );
 }
 
@@ -2204,6 +2266,8 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   mcSelectionButton: {
+    flexDirection: 'row',
+    gap: 8,
     height: 40,
     paddingHorizontal: 14,
     borderRadius: 14,
@@ -2237,6 +2301,78 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 16,
     fontFamily: FONT_SANS,
+  },
+  renameBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.18)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  renameCard: {
+    width: '100%',
+    maxWidth: 420,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    padding: 16,
+    gap: 12,
+    shadowColor: COLORS.shadow,
+    shadowOpacity: 0.22,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 12 },
+    elevation: 4,
+  },
+  renameTitle: {
+    color: COLORS.text,
+    fontSize: 16,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  renameInput: {
+    height: 46,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+    paddingHorizontal: 14,
+    color: COLORS.text,
+    fontSize: 15,
+    fontFamily: FONT_SANS,
+  },
+  renameActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+  },
+  renameButton: {
+    height: 40,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  renameButtonText: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  renameButtonPrimary: {
+    height: 40,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: COLORS.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minWidth: 86,
+  },
+  renameButtonPrimaryText: {
+    color: COLORS.accentText,
+    fontSize: 13,
+    fontFamily: FONT_SANS_EXTRABOLD,
   },
   mcDetailHeaderWrap: {
     marginBottom: 22,
