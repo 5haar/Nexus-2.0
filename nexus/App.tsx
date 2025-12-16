@@ -518,6 +518,21 @@ export default function App() {
                   setUiError(err?.message ?? 'Failed to delete category');
                 }
               }}
+              onDeleteCategories={async (names, mode) => {
+                try {
+                  for (const name of names) {
+                    await apiFetch<{ ok: boolean }>(
+                      `/api/categories/${encodeURIComponent(name)}?mode=${encodeURIComponent(mode)}`,
+                      { method: 'DELETE' },
+                    );
+                  }
+                  setActiveCategory(null);
+                  await refreshDocs();
+                } catch (err: any) {
+                  setUiError(err?.message ?? 'Failed to delete categories');
+                  throw err;
+                }
+              }}
               onDeleteDoc={async (docId) => {
                 try {
                   await deleteDoc(docId);
@@ -905,6 +920,7 @@ function CategoriesScreen(props: {
   docsInActiveCategory: ServerDoc[];
   onRefresh: () => void;
   onDeleteCategory: (name: string, mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => void;
+  onDeleteCategories?: (names: string[], mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => Promise<void> | void;
   onDeleteDoc: (docId: string) => void;
   onView: (uri: string) => void;
 }) {
@@ -913,6 +929,8 @@ function CategoriesScreen(props: {
   const mediaColumns = width >= 1280 ? 5 : width >= 1024 ? 4 : width >= 768 ? 3 : 2;
   const pagePadding = width >= 768 ? 32 : 24;
   const [categoryQuery, setCategoryQuery] = useState('');
+  const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
+  const [deletingSelected, setDeletingSelected] = useState(false);
 
   const pageStyle = useMemo(() => [styles.mcPage, { padding: pagePadding }], [pagePadding]);
   const categoryRowStyle = categoryColumns > 1 ? styles.mcGridRow : undefined;
@@ -921,6 +939,16 @@ function CategoriesScreen(props: {
     () => [...props.categories, { name: '__refresh__', count: 0 }],
     [props.categories],
   );
+  const isSelecting = selectedCategories.size > 0;
+  const toggleCategorySelected = (name: string) => {
+    setSelectedCategories((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+  const clearSelectedCategories = () => setSelectedCategories(new Set());
   const filteredCategoriesData = useMemo(() => {
     const query = categoryQuery.trim().toLowerCase();
     if (!query) return categoriesData;
@@ -928,8 +956,27 @@ function CategoriesScreen(props: {
     return [...normal, { name: '__refresh__', count: 0 }];
   }, [categoryQuery, categoriesData, props.categories]);
 
+  const runDeleteSelected = async (mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => {
+    const names = Array.from(selectedCategories);
+    if (!names.length || deletingSelected) return;
+    setDeletingSelected(true);
+    try {
+      if (props.onDeleteCategories) {
+        await props.onDeleteCategories(names, mode);
+      } else {
+        for (const name of names) props.onDeleteCategory(name, mode);
+      }
+      clearSelectedCategories();
+    } catch (err: any) {
+      Alert.alert('Delete failed', err?.message ?? 'Failed to delete selected categories.');
+    } finally {
+      setDeletingSelected(false);
+    }
+  };
+
   const CategoryCard = (p: { name: string; count: number; index: number }) => {
     const anim = useRef(new Animated.Value(0)).current;
+    const selected = selectedCategories.has(p.name);
     useEffect(() => {
       Animated.timing(anim, {
         toValue: 1,
@@ -945,38 +992,63 @@ function CategoriesScreen(props: {
     return (
       <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ translateY }] }]}>
         <Pressable
-          onPress={() => props.onSetActiveCategory(p.name)}
-          style={({ pressed }) => [styles.mcCard, pressed && styles.mcCardPressed]}
+          onPress={() => (isSelecting ? toggleCategorySelected(p.name) : props.onSetActiveCategory(p.name))}
+          onLongPress={() => toggleCategorySelected(p.name)}
+          delayLongPress={180}
+          style={({ pressed }) => [
+            styles.mcCard,
+            selected && styles.mcCardSelected,
+            pressed && styles.mcCardPressed,
+          ]}
         >
           <View style={styles.mcCardDecor} pointerEvents="none" />
           <View style={styles.mcCardTop}>
             <View style={styles.mcCardIcon}>
               <Ionicons name="folder-open" size={22} color={COLORS.accentText} />
             </View>
-            <Pressable
-              onPress={(e) => {
-                e.stopPropagation?.();
-                Alert.alert(p.name, 'Category actions', [
-                  { text: 'Cancel', style: 'cancel' },
-                  { text: 'Open', onPress: () => props.onSetActiveCategory(p.name) },
-                  {
-                    text: 'Remove category',
-                    style: 'destructive',
-                    onPress: () => props.onDeleteCategory(p.name, 'unlink'),
-                  },
-                  {
-                    text: 'Delete category + photos',
-                    style: 'destructive',
-                    onPress: () => props.onDeleteCategory(p.name, 'purge'),
-                  },
-                ]);
-              }}
-              onPressIn={(e) => e.stopPropagation?.()}
-              style={({ pressed }) => [styles.mcIconButton, pressed && styles.mcIconButtonPressed]}
-              hitSlop={10}
-            >
-              <Ionicons name="ellipsis-horizontal" size={20} color={COLORS.muted} />
-            </Pressable>
+            {isSelecting ? (
+              <Pressable
+                onPress={(e) => {
+                  e.stopPropagation?.();
+                  toggleCategorySelected(p.name);
+                }}
+                onPressIn={(e) => e.stopPropagation?.()}
+                style={({ pressed }) => [
+                  styles.mcSelectPill,
+                  selected && styles.mcSelectPillSelected,
+                  pressed && styles.mcSelectPillPressed,
+                ]}
+                hitSlop={10}
+              >
+                {selected && <Ionicons name="checkmark" size={16} color={COLORS.accentText} />}
+              </Pressable>
+            ) : (
+              <Pressable
+                onPress={(e) => {
+                  e.stopPropagation?.();
+                  Alert.alert(p.name, 'Category actions', [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Select multiple', onPress: () => toggleCategorySelected(p.name) },
+                    { text: 'Open', onPress: () => props.onSetActiveCategory(p.name) },
+                    {
+                      text: 'Remove category',
+                      style: 'destructive',
+                      onPress: () => props.onDeleteCategory(p.name, 'unlink'),
+                    },
+                    {
+                      text: 'Delete category + photos',
+                      style: 'destructive',
+                      onPress: () => props.onDeleteCategory(p.name, 'purge'),
+                    },
+                  ]);
+                }}
+                onPressIn={(e) => e.stopPropagation?.()}
+                style={({ pressed }) => [styles.mcIconButton, pressed && styles.mcIconButtonPressed]}
+                hitSlop={10}
+              >
+                <Ionicons name="ellipsis-horizontal" size={20} color={COLORS.muted} />
+              </Pressable>
+            )}
           </View>
 
           <View style={styles.mcCardBottom}>
@@ -1165,6 +1237,51 @@ function CategoriesScreen(props: {
         <Text style={styles.mcH1}>Categories</Text>
         <Text style={styles.mcMuted}>Your organized knowledge clusters.</Text>
 
+        {isSelecting && (
+          <View style={styles.mcSelectionBar}>
+            <Text style={styles.mcSelectionText}>{selectedCategories.size} selected</Text>
+            <View style={styles.mcSelectionActions}>
+              <Pressable
+                onPress={clearSelectedCategories}
+                style={({ pressed }) => [styles.mcSelectionButton, pressed && styles.pressed]}
+                disabled={deletingSelected}
+              >
+                <Text style={styles.mcSelectionButtonText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => {
+                  Alert.alert(
+                    `Delete ${selectedCategories.size} categor${selectedCategories.size === 1 ? 'y' : 'ies'}?`,
+                    'Choose what to delete.',
+                    [
+                      { text: 'Cancel', style: 'cancel' },
+                      {
+                        text: 'Remove categories',
+                        style: 'destructive',
+                        onPress: () => runDeleteSelected('unlink'),
+                      },
+                      {
+                        text: 'Delete categories + photos',
+                        style: 'destructive',
+                        onPress: () => runDeleteSelected('purge'),
+                      },
+                    ],
+                  );
+                }}
+                style={({ pressed }) => [styles.mcSelectionButtonDanger, pressed && styles.pressed]}
+                disabled={deletingSelected}
+              >
+                {deletingSelected ? (
+                  <ActivityIndicator size="small" color={COLORS.accentText} />
+                ) : (
+                  <Ionicons name="trash-outline" size={16} color={COLORS.accentText} />
+                )}
+                <Text style={styles.mcSelectionButtonDangerText}>Delete</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+
         <View style={styles.mcSearch}>
           <Ionicons name="search" size={16} color={COLORS.muted} style={styles.mcSearchIcon} />
           <TextInput
@@ -1198,7 +1315,15 @@ function CategoriesScreen(props: {
         {props.uiError && <Text style={[styles.inlineError, { marginTop: 10 }]}>{props.uiError}</Text>}
       </View>
     );
-  }, [categoryQuery, filteredCategoriesData.length, props.categories.length, props.uiError]);
+  }, [
+    categoryQuery,
+    deletingSelected,
+    filteredCategoriesData.length,
+    isSelecting,
+    props.categories.length,
+    props.uiError,
+    selectedCategories.size,
+  ]);
 
   return (
     <FlatList
@@ -1933,6 +2058,24 @@ const styles = StyleSheet.create({
   mcIconButtonPressed: {
     backgroundColor: COLORS.overlay,
   },
+  mcSelectPill: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  mcSelectPillPressed: {
+    backgroundColor: COLORS.overlay,
+    borderColor: COLORS.borderStrong,
+  },
+  mcSelectPillSelected: {
+    backgroundColor: COLORS.accent,
+    borderColor: 'rgba(15, 23, 42, 0.25)',
+  },
   mcCardBottom: {
     marginTop: 32,
     gap: 4,
@@ -2009,6 +2152,58 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontSize: 16,
     fontFamily: FONT_SANS_MEDIUM,
+  },
+  mcCardSelected: {
+    borderColor: COLORS.borderStrong,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  mcSelectionBar: {
+    marginTop: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+    borderRadius: 18,
+    padding: 12,
+    gap: 10,
+  },
+  mcSelectionText: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  mcSelectionActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  mcSelectionButton: {
+    height: 40,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  mcSelectionButtonText: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  mcSelectionButtonDanger: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    height: 40,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: COLORS.accent,
+  },
+  mcSelectionButtonDangerText: {
+    color: COLORS.accentText,
+    fontSize: 13,
+    fontFamily: FONT_SANS_EXTRABOLD,
   },
   mcDetailHeaderWrap: {
     marginBottom: 22,
