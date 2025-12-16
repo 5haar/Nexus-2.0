@@ -921,6 +921,113 @@ function ImportScreen(props: {
   );
 }
 
+function CategoriesCategoryCard(props: {
+  name: string;
+  count: number;
+  index: number;
+  selectionMode: boolean;
+  selected: boolean;
+  onOpen: (name: string) => void;
+  onToggle: (name: string) => void;
+}) {
+  const anim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(anim, {
+      toValue: 1,
+      duration: 420,
+      delay: props.index * 100,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+  }, [anim, props.index]);
+
+  const translateY = anim.interpolate({ inputRange: [0, 1], outputRange: [20, 0] });
+
+  return (
+    <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ translateY }] }]}>
+      <Pressable
+        onPress={() => (props.selectionMode ? props.onToggle(props.name) : props.onOpen(props.name))}
+        onLongPress={() => props.onToggle(props.name)}
+        delayLongPress={180}
+        style={({ pressed }) => [
+          styles.mcCard,
+          props.selected && styles.mcCardSelected,
+          pressed && styles.mcCardPressed,
+        ]}
+      >
+        <View style={styles.mcCardDecor} pointerEvents="none" />
+        <View style={styles.mcCardTop}>
+          <View style={styles.mcCardIcon}>
+            <Ionicons name="folder-open" size={22} color={COLORS.accentText} />
+          </View>
+          {props.selectionMode && (
+            <Pressable
+              onPress={(e) => {
+                e.stopPropagation?.();
+                props.onToggle(props.name);
+              }}
+              onPressIn={(e) => e.stopPropagation?.()}
+              style={({ pressed }) => [
+                styles.mcSelectPill,
+                props.selected && styles.mcSelectPillSelected,
+                pressed && styles.mcSelectPillPressed,
+              ]}
+              hitSlop={10}
+            >
+              {props.selected && <Ionicons name="checkmark" size={16} color={COLORS.accentText} />}
+            </Pressable>
+          )}
+        </View>
+
+        <View style={styles.mcCardBottom}>
+          <Text style={styles.mcCardTitle} numberOfLines={1}>
+            {props.name}
+          </Text>
+          <View style={styles.mcMetaRow}>
+            <Text style={styles.mcMetaText}>{props.count} items</Text>
+            <View style={styles.mcMetaDot} />
+            <View style={styles.mcMetaRow}>
+              <Ionicons name="time-outline" size={14} color={COLORS.muted} />
+              <Text style={styles.mcMetaText}>Updated today</Text>
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.mcHoverAction} pointerEvents="none">
+          <View style={styles.mcHoverActionCircle}>
+            <Ionicons name="arrow-forward" size={18} color={COLORS.text} />
+          </View>
+        </View>
+      </Pressable>
+    </Animated.View>
+  );
+}
+
+function CategoriesRefreshCard(props: { index: number; onRefresh: () => void }) {
+  const anim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(anim, {
+      toValue: 1,
+      duration: 420,
+      delay: Math.min(props.index * 100, 400),
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+  }, [anim, props.index]);
+
+  const translateY = anim.interpolate({ inputRange: [0, 1], outputRange: [20, 0] });
+  return (
+    <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ translateY }] }]}>
+      <Pressable onPress={props.onRefresh} style={({ pressed }) => [styles.mcDashedCard, pressed && styles.mcDashedCardPressed]}>
+        <View style={styles.mcDashedIcon}>
+          <Ionicons name="folder-outline" size={26} color={COLORS.muted} />
+        </View>
+        <Text style={styles.mcDashedText}>Refresh</Text>
+      </Pressable>
+    </Animated.View>
+  );
+}
+
 function CategoriesScreen(props: {
   uiError: string | null;
   categories: { name: string; count: number }[];
@@ -1032,109 +1139,6 @@ function CategoriesScreen(props: {
     } finally {
       setRenaming(false);
     }
-  };
-
-  const CategoryCard = (p: { name: string; count: number; index: number }) => {
-    const anim = useRef(new Animated.Value(0)).current;
-    const selected = selectedCategories.has(p.name);
-    useEffect(() => {
-      Animated.timing(anim, {
-        toValue: 1,
-        duration: 420,
-        delay: p.index * 100,
-        easing: Easing.out(Easing.cubic),
-        useNativeDriver: true,
-      }).start();
-    }, [anim, p.index]);
-
-    const translateY = anim.interpolate({ inputRange: [0, 1], outputRange: [20, 0] });
-
-    return (
-      <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ translateY }] }]}>
-        <Pressable
-          onPress={() => (isSelecting ? toggleCategorySelected(p.name) : props.onSetActiveCategory(p.name))}
-          onLongPress={() => toggleCategorySelected(p.name)}
-          delayLongPress={180}
-          style={({ pressed }) => [
-            styles.mcCard,
-            selected && styles.mcCardSelected,
-            pressed && styles.mcCardPressed,
-          ]}
-        >
-          <View style={styles.mcCardDecor} pointerEvents="none" />
-          <View style={styles.mcCardTop}>
-            <View style={styles.mcCardIcon}>
-              <Ionicons name="folder-open" size={22} color={COLORS.accentText} />
-            </View>
-            {isSelecting && (
-              <Pressable
-                onPress={(e) => {
-                  e.stopPropagation?.();
-                  toggleCategorySelected(p.name);
-                }}
-                onPressIn={(e) => e.stopPropagation?.()}
-                style={({ pressed }) => [
-                  styles.mcSelectPill,
-                  selected && styles.mcSelectPillSelected,
-                  pressed && styles.mcSelectPillPressed,
-                ]}
-                hitSlop={10}
-              >
-                {selected && <Ionicons name="checkmark" size={16} color={COLORS.accentText} />}
-              </Pressable>
-            )}
-          </View>
-
-          <View style={styles.mcCardBottom}>
-            <Text style={styles.mcCardTitle} numberOfLines={1}>
-              {p.name}
-            </Text>
-            <View style={styles.mcMetaRow}>
-              <Text style={styles.mcMetaText}>{p.count} items</Text>
-              <View style={styles.mcMetaDot} />
-              <View style={styles.mcMetaRow}>
-                <Ionicons name="time-outline" size={14} color={COLORS.muted} />
-                <Text style={styles.mcMetaText}>Updated today</Text>
-              </View>
-            </View>
-          </View>
-
-          <View style={styles.mcHoverAction} pointerEvents="none">
-            <View style={styles.mcHoverActionCircle}>
-              <Ionicons name="arrow-forward" size={18} color={COLORS.text} />
-            </View>
-          </View>
-        </Pressable>
-      </Animated.View>
-    );
-  };
-
-  const RefreshCard = (p: { index: number }) => {
-    const anim = useRef(new Animated.Value(0)).current;
-    useEffect(() => {
-      Animated.timing(anim, {
-        toValue: 1,
-        duration: 420,
-        delay: Math.min(p.index * 100, 400),
-        easing: Easing.out(Easing.cubic),
-        useNativeDriver: true,
-      }).start();
-    }, [anim, p.index]);
-
-    const translateY = anim.interpolate({ inputRange: [0, 1], outputRange: [20, 0] });
-    return (
-      <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ translateY }] }]}>
-        <Pressable
-          onPress={props.onRefresh}
-          style={({ pressed }) => [styles.mcDashedCard, pressed && styles.mcDashedCardPressed]}
-        >
-          <View style={styles.mcDashedIcon}>
-            <Ionicons name="folder-outline" size={26} color={COLORS.muted} />
-          </View>
-          <Text style={styles.mcDashedText}>Refresh</Text>
-        </Pressable>
-      </Animated.View>
-    );
   };
 
   const MediaCard = (p: { doc: ServerDoc; index: number }) => {
@@ -1366,8 +1370,18 @@ function CategoriesScreen(props: {
         ItemSeparatorComponent={categoryColumns === 1 ? () => <View style={{ height: 24 }} /> : undefined}
         ListHeaderComponent={categoriesHeader}
         renderItem={({ item, index }) => {
-          if (item.name === '__refresh__') return <RefreshCard index={index} />;
-          return <CategoryCard name={item.name} count={item.count} index={index} />;
+          if (item.name === '__refresh__') return <CategoriesRefreshCard index={index} onRefresh={props.onRefresh} />;
+          return (
+            <CategoriesCategoryCard
+              name={item.name}
+              count={item.count}
+              index={index}
+              selectionMode={selectionMode}
+              selected={selectedCategories.has(item.name)}
+              onOpen={props.onSetActiveCategory}
+              onToggle={toggleCategorySelected}
+            />
+          );
         }}
       />
 
