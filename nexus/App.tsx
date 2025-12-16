@@ -930,6 +930,7 @@ function CategoriesScreen(props: {
   const pagePadding = width >= 768 ? 32 : 24;
   const [categoryQuery, setCategoryQuery] = useState('');
   const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
+  const [selectionMode, setSelectionMode] = useState(false);
   const [deletingSelected, setDeletingSelected] = useState(false);
 
   const pageStyle = useMemo(() => [styles.mcPage, { padding: pagePadding }], [pagePadding]);
@@ -939,8 +940,9 @@ function CategoriesScreen(props: {
     () => [...props.categories, { name: '__refresh__', count: 0 }],
     [props.categories],
   );
-  const isSelecting = selectedCategories.size > 0;
+  const isSelecting = selectionMode;
   const toggleCategorySelected = (name: string) => {
+    setSelectionMode(true);
     setSelectedCategories((prev) => {
       const next = new Set(prev);
       if (next.has(name)) next.delete(name);
@@ -949,12 +951,20 @@ function CategoriesScreen(props: {
     });
   };
   const clearSelectedCategories = () => setSelectedCategories(new Set());
+  const exitSelectionMode = () => {
+    setSelectionMode(false);
+    clearSelectedCategories();
+  };
   const filteredCategoriesData = useMemo(() => {
     const query = categoryQuery.trim().toLowerCase();
     if (!query) return categoriesData;
     const normal = props.categories.filter((c) => c.name.toLowerCase().includes(query));
     return [...normal, { name: '__refresh__', count: 0 }];
   }, [categoryQuery, categoriesData, props.categories]);
+  const filteredRealCategories = useMemo(
+    () => filteredCategoriesData.filter((c) => c.name !== '__refresh__'),
+    [filteredCategoriesData],
+  );
 
   const runDeleteSelected = async (mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => {
     const names = Array.from(selectedCategories);
@@ -966,12 +976,57 @@ function CategoriesScreen(props: {
       } else {
         for (const name of names) props.onDeleteCategory(name, mode);
       }
-      clearSelectedCategories();
+      exitSelectionMode();
     } catch (err: any) {
       Alert.alert('Delete failed', err?.message ?? 'Failed to delete selected categories.');
     } finally {
       setDeletingSelected(false);
     }
+  };
+
+  const confirmDeleteSelected = () => {
+    if (!selectedCategories.size) return;
+    Alert.alert(
+      `Delete ${selectedCategories.size} categor${selectedCategories.size === 1 ? 'y' : 'ies'}?`,
+      'Choose what to delete.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Remove categories', style: 'destructive', onPress: () => runDeleteSelected('unlink') },
+        { text: 'Delete categories + photos', style: 'destructive', onPress: () => runDeleteSelected('purge') },
+      ],
+    );
+  };
+
+  const openHeaderMenu = () => {
+    const buttons: { text: string; style?: 'cancel' | 'destructive'; onPress?: () => void }[] = [];
+    if (selectionMode) {
+      buttons.push({ text: 'Done', onPress: exitSelectionMode });
+    } else {
+      buttons.push({ text: 'Select categories', onPress: () => setSelectionMode(true) });
+    }
+
+    if (filteredRealCategories.length) {
+      buttons.push({
+        text: selectionMode ? 'Select all (visible)' : 'Select all (visible)',
+        onPress: () => {
+          setSelectionMode(true);
+          setSelectedCategories(new Set(filteredRealCategories.map((c) => c.name)));
+        },
+      });
+    }
+
+    if (selectionMode && selectedCategories.size) {
+      buttons.push({
+        text: `Delete selected (${selectedCategories.size})`,
+        style: 'destructive',
+        onPress: confirmDeleteSelected,
+      });
+    }
+
+    buttons.push({ text: 'Refresh', onPress: props.onRefresh });
+    buttons.push({ text: 'Cancel', style: 'cancel' });
+
+    Alert.alert('Categories', undefined, buttons);
   };
 
   const CategoryCard = (p: { name: string; count: number; index: number }) => {
@@ -1006,7 +1061,7 @@ function CategoriesScreen(props: {
             <View style={styles.mcCardIcon}>
               <Ionicons name="folder-open" size={22} color={COLORS.accentText} />
             </View>
-            {isSelecting ? (
+            {isSelecting && (
               <Pressable
                 onPress={(e) => {
                   e.stopPropagation?.();
@@ -1021,32 +1076,6 @@ function CategoriesScreen(props: {
                 hitSlop={10}
               >
                 {selected && <Ionicons name="checkmark" size={16} color={COLORS.accentText} />}
-              </Pressable>
-            ) : (
-              <Pressable
-                onPress={(e) => {
-                  e.stopPropagation?.();
-                  Alert.alert(p.name, 'Category actions', [
-                    { text: 'Cancel', style: 'cancel' },
-                    { text: 'Select multiple', onPress: () => toggleCategorySelected(p.name) },
-                    { text: 'Open', onPress: () => props.onSetActiveCategory(p.name) },
-                    {
-                      text: 'Remove category',
-                      style: 'destructive',
-                      onPress: () => props.onDeleteCategory(p.name, 'unlink'),
-                    },
-                    {
-                      text: 'Delete category + photos',
-                      style: 'destructive',
-                      onPress: () => props.onDeleteCategory(p.name, 'purge'),
-                    },
-                  ]);
-                }}
-                onPressIn={(e) => e.stopPropagation?.()}
-                style={({ pressed }) => [styles.mcIconButton, pressed && styles.mcIconButtonPressed]}
-                hitSlop={10}
-              >
-                <Ionicons name="ellipsis-horizontal" size={20} color={COLORS.muted} />
               </Pressable>
             )}
           </View>
@@ -1226,104 +1255,82 @@ function CategoriesScreen(props: {
     );
   }
 
-  const renderCategoriesHeader = useMemo(() => {
-    const query = categoryQuery.trim();
-    const shownCount = filteredCategoriesData.length ? filteredCategoriesData.length - 1 : 0; // exclude refresh card
-    const empty = props.categories.length === 0;
-    const noMatch = !empty && shownCount === 0;
+  const query = categoryQuery.trim();
+  const shownCount = filteredCategoriesData.length ? filteredCategoriesData.length - 1 : 0; // exclude refresh card
+  const empty = props.categories.length === 0;
+  const noMatch = !empty && shownCount === 0;
 
-    return (
-      <View style={styles.mcHeader}>
-        <Text style={styles.mcH1}>Categories</Text>
-        <Text style={styles.mcMuted}>Your organized knowledge clusters.</Text>
-
-        {isSelecting && (
-          <View style={styles.mcSelectionBar}>
-            <Text style={styles.mcSelectionText}>{selectedCategories.size} selected</Text>
-            <View style={styles.mcSelectionActions}>
-              <Pressable
-                onPress={clearSelectedCategories}
-                style={({ pressed }) => [styles.mcSelectionButton, pressed && styles.pressed]}
-                disabled={deletingSelected}
-              >
-                <Text style={styles.mcSelectionButtonText}>Cancel</Text>
-              </Pressable>
-              <Pressable
-                onPress={() => {
-                  Alert.alert(
-                    `Delete ${selectedCategories.size} categor${selectedCategories.size === 1 ? 'y' : 'ies'}?`,
-                    'Choose what to delete.',
-                    [
-                      { text: 'Cancel', style: 'cancel' },
-                      {
-                        text: 'Remove categories',
-                        style: 'destructive',
-                        onPress: () => runDeleteSelected('unlink'),
-                      },
-                      {
-                        text: 'Delete categories + photos',
-                        style: 'destructive',
-                        onPress: () => runDeleteSelected('purge'),
-                      },
-                    ],
-                  );
-                }}
-                style={({ pressed }) => [styles.mcSelectionButtonDanger, pressed && styles.pressed]}
-                disabled={deletingSelected}
-              >
-                {deletingSelected ? (
-                  <ActivityIndicator size="small" color={COLORS.accentText} />
-                ) : (
-                  <Ionicons name="trash-outline" size={16} color={COLORS.accentText} />
-                )}
-                <Text style={styles.mcSelectionButtonDangerText}>Delete</Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
-
-        <View style={styles.mcSearch}>
-          <Ionicons name="search" size={16} color={COLORS.muted} style={styles.mcSearchIcon} />
-          <TextInput
-            value={categoryQuery}
-            onChangeText={setCategoryQuery}
-            placeholder="Search categories…"
-            placeholderTextColor={COLORS.muted2}
-            style={styles.mcSearchInput}
-            autoCapitalize="none"
-            autoCorrect={false}
-            returnKeyType="search"
-            clearButtonMode="never"
-          />
-          {!!query && (
-            <Pressable
-              onPress={() => setCategoryQuery('')}
-              hitSlop={10}
-              style={({ pressed }) => [styles.mcSearchClear, pressed && styles.pressed]}
-            >
-              <Ionicons name="close-circle" size={18} color={COLORS.muted} />
-            </Pressable>
-          )}
+  const categoriesHeader = (
+    <View style={styles.mcHeader}>
+      <View style={styles.mcHeaderTop}>
+        <View style={styles.mcHeaderTitles}>
+          <Text style={styles.mcH1}>Categories</Text>
+          <Text style={styles.mcMuted}>Your organized knowledge clusters.</Text>
         </View>
-
-        {empty && (
-          <Text style={[styles.mcMuted, { marginTop: 12 }]}>
-            No categories yet. Import and index some screenshots first.
-          </Text>
-        )}
-        {noMatch && <Text style={[styles.mcMuted, { marginTop: 12 }]}>No matching categories.</Text>}
-        {props.uiError && <Text style={[styles.inlineError, { marginTop: 10 }]}>{props.uiError}</Text>}
+        <Pressable onPress={openHeaderMenu} style={({ pressed }) => [styles.mcHeaderMenu, pressed && styles.pressed]}>
+          <Ionicons name="ellipsis-horizontal" size={20} color={COLORS.text} />
+        </Pressable>
       </View>
-    );
-  }, [
-    categoryQuery,
-    deletingSelected,
-    filteredCategoriesData.length,
-    isSelecting,
-    props.categories.length,
-    props.uiError,
-    selectedCategories.size,
-  ]);
+
+      {isSelecting && (
+        <View style={styles.mcSelectionBar}>
+          <Text style={styles.mcSelectionText}>{selectedCategories.size} selected</Text>
+          <View style={styles.mcSelectionActions}>
+            <Pressable
+              onPress={exitSelectionMode}
+              style={({ pressed }) => [styles.mcSelectionButton, pressed && styles.pressed]}
+              disabled={deletingSelected}
+            >
+              <Text style={styles.mcSelectionButtonText}>Done</Text>
+            </Pressable>
+            <Pressable
+              onPress={confirmDeleteSelected}
+              style={({ pressed }) => [styles.mcSelectionButtonDanger, pressed && styles.pressed]}
+              disabled={deletingSelected || selectedCategories.size === 0}
+            >
+              {deletingSelected ? (
+                <ActivityIndicator size="small" color={COLORS.accentText} />
+              ) : (
+                <Ionicons name="trash-outline" size={16} color={COLORS.accentText} />
+              )}
+              <Text style={styles.mcSelectionButtonDangerText}>Delete</Text>
+            </Pressable>
+          </View>
+          <Text style={styles.mcSelectionHint}>Tap categories to select. Long-press also works.</Text>
+        </View>
+      )}
+
+      <View style={styles.mcSearch}>
+        <Ionicons name="search" size={16} color={COLORS.muted} style={styles.mcSearchIcon} />
+        <TextInput
+          value={categoryQuery}
+          onChangeText={setCategoryQuery}
+          placeholder="Search categories…"
+          placeholderTextColor={COLORS.muted2}
+          style={styles.mcSearchInput}
+          autoCapitalize="none"
+          autoCorrect={false}
+          returnKeyType="search"
+          clearButtonMode="never"
+        />
+        {!!query && (
+          <Pressable
+            onPress={() => setCategoryQuery('')}
+            hitSlop={10}
+            style={({ pressed }) => [styles.mcSearchClear, pressed && styles.pressed]}
+          >
+            <Ionicons name="close-circle" size={18} color={COLORS.muted} />
+          </Pressable>
+        )}
+      </View>
+
+      {empty && (
+        <Text style={[styles.mcMuted, { marginTop: 12 }]}>No categories yet. Import and index some screenshots first.</Text>
+      )}
+      {noMatch && <Text style={[styles.mcMuted, { marginTop: 12 }]}>No matching categories.</Text>}
+      {props.uiError && <Text style={[styles.inlineError, { marginTop: 10 }]}>{props.uiError}</Text>}
+    </View>
+  );
 
   return (
     <FlatList
@@ -1334,7 +1341,7 @@ function CategoriesScreen(props: {
       columnWrapperStyle={categoryRowStyle}
       contentContainerStyle={pageStyle as any}
       ItemSeparatorComponent={categoryColumns === 1 ? () => <View style={{ height: 24 }} /> : undefined}
-      ListHeaderComponent={renderCategoriesHeader}
+      ListHeaderComponent={categoriesHeader}
       renderItem={({ item, index }) => {
         if (item.name === '__refresh__') return <RefreshCard index={index} />;
         return <CategoryCard name={item.name} count={item.count} index={index} />;
@@ -1948,6 +1955,26 @@ const styles = StyleSheet.create({
     marginBottom: 32,
     gap: 8,
   },
+  mcHeaderTop: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  mcHeaderTitles: {
+    flex: 1,
+    gap: 8,
+  },
+  mcHeaderMenu: {
+    width: 40,
+    height: 40,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
   mcH1: {
     color: COLORS.text,
     fontSize: 30,
@@ -2204,6 +2231,12 @@ const styles = StyleSheet.create({
     color: COLORS.accentText,
     fontSize: 13,
     fontFamily: FONT_SANS_EXTRABOLD,
+  },
+  mcSelectionHint: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 16,
+    fontFamily: FONT_SANS,
   },
   mcDetailHeaderWrap: {
     marginBottom: 22,
