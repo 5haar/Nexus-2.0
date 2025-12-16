@@ -652,44 +652,52 @@ function HamburgerMenu(props: {
     <Modal visible={props.visible} transparent animationType="fade" onRequestClose={props.onClose}>
       <View style={styles.menuBackdrop}>
         <Pressable style={StyleSheet.absoluteFill} onPress={props.onClose} />
-        <View style={styles.menuPanel}>
-          <View style={styles.menuHeader}>
-            <View style={styles.brand}>
-              <View style={styles.brandIcon}>
-                <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
+        <SafeAreaView style={styles.menuPanelSafe}>
+          <View style={styles.menuPanelInner}>
+            <View style={styles.menuHeader}>
+              <View style={styles.brand}>
+                <View style={styles.brandIcon}>
+                  <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
+                </View>
+                <Text style={styles.menuTitle}>Nexus</Text>
               </View>
-              <Text style={styles.menuTitle}>Nexus</Text>
-            </View>
-            <Pressable onPress={props.onClose} style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}>
-              <Ionicons name="close" size={20} color={COLORS.text} />
-            </Pressable>
-          </View>
-          <Text style={styles.menuSubtitle} numberOfLines={2}>
-            {props.apiBase}
-          </Text>
-          <View style={styles.menuDivider} />
-          {([
-            { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' as const },
-            { key: 'import', label: 'Import', icon: 'image-outline' as const },
-            { key: 'categories', label: 'Categories', icon: 'folder-open-outline' as const },
-          ] as const).map((item) => {
-            const isActive = props.route === item.key;
-            return (
-              <Pressable
-                key={item.key}
-                onPress={() => props.onNavigate(item.key)}
-                style={({ pressed }) => [
-                  styles.menuItem,
-                  isActive && styles.menuItemActive,
-                  pressed && styles.pressed,
-                ]}
-              >
-                <Ionicons name={item.icon} size={18} color={isActive ? COLORS.text : COLORS.muted} />
-                <Text style={[styles.menuItemText, isActive && styles.menuItemTextActive]}>{item.label}</Text>
+              <Pressable onPress={props.onClose} style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}>
+                <Ionicons name="close" size={20} color={COLORS.text} />
               </Pressable>
-            );
-          })}
-        </View>
+            </View>
+
+            <View style={styles.menuNav}>
+              {([
+                { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' as const },
+                { key: 'import', label: 'Import', icon: 'image-outline' as const },
+                { key: 'categories', label: 'Categories', icon: 'folder-open-outline' as const },
+              ] as const).map((item) => {
+                const isActive = props.route === item.key;
+                return (
+                  <Pressable
+                    key={item.key}
+                    onPress={() => props.onNavigate(item.key)}
+                    style={({ pressed }) => [
+                      styles.menuItem,
+                      isActive && styles.menuItemActive,
+                      pressed && styles.pressed,
+                    ]}
+                  >
+                    <Ionicons name={item.icon} size={18} color={isActive ? COLORS.text : COLORS.muted} />
+                    <Text style={[styles.menuItemText, isActive && styles.menuItemTextActive]}>{item.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            <View style={styles.menuFooter}>
+              <Text style={styles.menuFooterLabel}>API</Text>
+              <Text style={styles.menuFooterValue} numberOfLines={2}>
+                {props.apiBase}
+              </Text>
+            </View>
+          </View>
+        </SafeAreaView>
       </View>
     </Modal>
   );
@@ -1346,6 +1354,17 @@ const styles = StyleSheet.create({
     borderRightWidth: 1,
     gap: 12,
   },
+  menuPanelSafe: {
+    width: 280,
+    backgroundColor: COLORS.surface,
+    borderRightColor: COLORS.border,
+    borderRightWidth: 1,
+  },
+  menuPanelInner: {
+    flex: 1,
+    padding: 16,
+    gap: 12,
+  },
   menuHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1356,16 +1375,10 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontFamily: FONT_HEADING_BOLD,
   },
-  menuSubtitle: {
-    color: COLORS.muted,
-    fontSize: 12,
-    lineHeight: 16,
-    fontFamily: FONT_SANS,
-  },
-  menuDivider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: COLORS.border,
-    marginVertical: 6,
+  menuNav: {
+    marginTop: 10,
+    gap: 10,
+    flex: 1,
   },
   menuItem: {
     flexDirection: 'row',
@@ -1389,6 +1402,25 @@ const styles = StyleSheet.create({
   },
   menuItemTextActive: {
     color: COLORS.text,
+  },
+  menuFooter: {
+    borderTopColor: COLORS.border,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    paddingTop: 12,
+    gap: 4,
+  },
+  menuFooterLabel: {
+    color: COLORS.muted,
+    fontSize: 11,
+    fontFamily: FONT_SANS_SEMIBOLD,
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+  },
+  menuFooterValue: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 16,
+    fontFamily: FONT_SANS,
   },
   screen: {
     flex: 1,
