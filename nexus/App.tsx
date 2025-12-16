@@ -1053,6 +1053,20 @@ function CategoriesRefreshCard(props: { index: number; onRefresh: () => void }) 
   );
 }
 
+function CategoriesEmptyState(props: { onRefresh: () => void }) {
+  return (
+    <View style={styles.mcEmptyWrap}>
+      <Pressable onPress={props.onRefresh} style={({ pressed }) => [styles.mcEmptyCard, pressed && styles.mcDashedCardPressed]}>
+        <View style={styles.mcDashedIcon}>
+          <Ionicons name="images-outline" size={28} color={COLORS.muted} />
+        </View>
+        <Text style={styles.mcEmptyTitle}>No categories yet</Text>
+        <Text style={styles.mcEmptySubtitle}>Import and index some screenshots first.</Text>
+      </Pressable>
+    </View>
+  );
+}
+
 function CategoriesScreen(props: {
   uiError: string | null;
   categories: { name: string; count: number }[];
@@ -1081,10 +1095,16 @@ function CategoriesScreen(props: {
   const pageStyle = useMemo(() => [styles.mcPage, { padding: pagePadding }], [pagePadding]);
   const categoryRowStyle = categoryColumns > 1 ? styles.mcGridRow : undefined;
   const mediaRowStyle = mediaColumns > 1 ? styles.mcGridRowTight : undefined;
-  const categoriesData = useMemo(
-    () => [...props.categories, { name: '__refresh__', count: 0 }],
-    [props.categories],
-  );
+  const visibleCategories = useMemo(() => {
+    const query = categoryQuery.trim().toLowerCase();
+    if (!query) return props.categories;
+    return props.categories.filter((c) => c.name.toLowerCase().includes(query));
+  }, [categoryQuery, props.categories]);
+  const listData = useMemo(() => {
+    const query = categoryQuery.trim();
+    if (props.categories.length === 0 && !query) return [];
+    return [...visibleCategories, { name: '__refresh__', count: 0 }];
+  }, [categoryQuery, props.categories.length, visibleCategories]);
   const isSelecting = selectionMode;
   const selectedName = selectedCategories.size === 1 ? Array.from(selectedCategories)[0] : null;
   const toggleCategorySelected = (name: string) => {
@@ -1101,13 +1121,6 @@ function CategoriesScreen(props: {
     setSelectionMode(false);
     clearSelectedCategories();
   };
-  const filteredCategoriesData = useMemo(() => {
-    const query = categoryQuery.trim().toLowerCase();
-    if (!query) return categoriesData;
-    const normal = props.categories.filter((c) => c.name.toLowerCase().includes(query));
-    return [...normal, { name: '__refresh__', count: 0 }];
-  }, [categoryQuery, categoriesData, props.categories]);
-
   const runDeleteSelected = async (mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => {
     const names = Array.from(selectedCategories);
     if (!names.length || deletingSelected) return;
@@ -1290,9 +1303,9 @@ function CategoriesScreen(props: {
   }
 
   const query = categoryQuery.trim();
-  const shownCount = filteredCategoriesData.length ? filteredCategoriesData.length - 1 : 0; // exclude refresh card
-  const empty = props.categories.length === 0;
-  const noMatch = !empty && shownCount === 0;
+  const shownCount = visibleCategories.length;
+  const empty = props.categories.length === 0 && !query;
+  const noMatch = props.categories.length > 0 && !!query && shownCount === 0;
 
   const categoriesHeader = (
     <View style={styles.mcHeader}>
@@ -1375,9 +1388,6 @@ function CategoriesScreen(props: {
         )}
       </View>
 
-      {empty && (
-        <Text style={[styles.mcMuted, { marginTop: 12 }]}>No categories yet. Import and index some screenshots first.</Text>
-      )}
       {noMatch && <Text style={[styles.mcMuted, { marginTop: 12 }]}>No matching categories.</Text>}
       {props.uiError && <Text style={[styles.inlineError, { marginTop: 10 }]}>{props.uiError}</Text>}
     </View>
@@ -1386,14 +1396,15 @@ function CategoriesScreen(props: {
   return (
     <View style={styles.screen}>
       <FlatList
-        data={filteredCategoriesData}
+        data={listData}
         key={`cats-${categoryColumns}`}
         keyExtractor={(item) => item.name}
         numColumns={categoryColumns}
         columnWrapperStyle={categoryRowStyle}
-        contentContainerStyle={pageStyle as any}
+        contentContainerStyle={[...pageStyle, { flexGrow: 1 }] as any}
         ItemSeparatorComponent={categoryColumns === 1 ? () => <View style={{ height: 24 }} /> : undefined}
         ListHeaderComponent={categoriesHeader}
+        ListEmptyComponent={empty ? <CategoriesEmptyState onRefresh={props.onRefresh} /> : null}
         renderItem={({ item, index }) => {
           if (item.name === '__refresh__') return <CategoriesRefreshCard index={index} onRefresh={props.onRefresh} />;
           return (
@@ -2294,6 +2305,38 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontSize: 16,
     fontFamily: FONT_SANS_MEDIUM,
+  },
+  mcEmptyWrap: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingTop: 24,
+    paddingBottom: 40,
+  },
+  mcEmptyCard: {
+    width: '100%',
+    maxWidth: 420,
+    borderRadius: 24,
+    padding: 24,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderStyle: 'dashed',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    backgroundColor: 'transparent',
+  },
+  mcEmptyTitle: {
+    color: COLORS.text,
+    fontSize: 16,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  mcEmptySubtitle: {
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: 'center',
+    fontFamily: FONT_SANS,
   },
   mcCardSelected: {
     borderColor: COLORS.borderStrong,
