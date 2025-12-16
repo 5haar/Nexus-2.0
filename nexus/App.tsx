@@ -51,6 +51,7 @@ type ChatEntry = {
   id: string;
   role: 'user' | 'assistant';
   text: string;
+  streaming?: boolean;
 };
 
 type RouteKey = 'chat' | 'import' | 'categories';
@@ -65,6 +66,24 @@ type ResolvedAsset = {
 };
 
 const API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+
+const COLORS = {
+  bg: '#ffffff',
+  surface: '#ffffff',
+  surfaceAlt: '#f8fafc',
+  text: '#0f172a',
+  muted: '#64748b',
+  muted2: '#94a3b8',
+  border: 'rgba(15, 23, 42, 0.12)',
+  borderStrong: 'rgba(15, 23, 42, 0.18)',
+  overlay: 'rgba(15, 23, 42, 0.04)',
+  overlayStrong: 'rgba(15, 23, 42, 0.08)',
+  shadow: 'rgba(15, 23, 42, 0.10)',
+  accent: '#111827',
+  accentText: '#ffffff',
+  danger: '#b91c1c',
+  dangerSoft: 'rgba(185, 28, 28, 0.08)',
+} as const;
 
 const FONT_SANS = 'Inter_400Regular';
 const FONT_SANS_MEDIUM = 'Inter_500Medium';
@@ -130,6 +149,9 @@ export default function App() {
   const [processing, setProcessing] = useState(false);
   const [screenshots, setScreenshots] = useState<ResolvedAsset[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [assetStageById, setAssetStageById] = useState<Record<string, 'uploading' | 'indexing' | 'done' | 'error'>>(
+    {},
+  );
 
   const [docs, setDocs] = useState<ServerDoc[]>([]);
   const [uiError, setUiError] = useState<string | null>(null);
@@ -200,6 +222,7 @@ export default function App() {
       );
       setScreenshots(resolved);
       setSelected(new Set());
+      setAssetStageById({});
     } catch (err: any) {
       setUiError(err?.message ?? 'Failed to load screenshots');
     } finally {
@@ -245,7 +268,19 @@ export default function App() {
       const targets = screenshots.filter((s) => selected.has(s.id)).slice(0, 10);
       const uploaded: ServerDoc[] = [];
       for (const asset of targets) {
-        uploaded.push(await uploadAssetToServer(asset));
+        setAssetStageById((prev) => ({ ...prev, [asset.id]: 'uploading' }));
+        const stageTimer = setTimeout(() => {
+          setAssetStageById((prev) => (prev[asset.id] === 'uploading' ? { ...prev, [asset.id]: 'indexing' } : prev));
+        }, 550);
+        try {
+          uploaded.push(await uploadAssetToServer(asset));
+          setAssetStageById((prev) => ({ ...prev, [asset.id]: 'done' }));
+        } catch (err) {
+          setAssetStageById((prev) => ({ ...prev, [asset.id]: 'error' }));
+          throw err;
+        } finally {
+          clearTimeout(stageTimer);
+        }
       }
       if (uploaded.length) setDocs((prev) => [...uploaded, ...prev]);
       setSelected(new Set());
@@ -264,15 +299,19 @@ export default function App() {
     setUiError(null);
 
     const userEntry: ChatEntry = { id: randomId(), role: 'user', text: prompt };
-    setChatHistory((prev) => [userEntry, ...prev]);
-
     const assistantId = randomId();
+    setChatHistory((prev) => [{ id: assistantId, role: 'assistant', text: '', streaming: true }, userEntry, ...prev]);
+
     const updateAssistant = (text: string) => {
       setChatHistory((prev) => {
         const existing = prev.find((e) => e.id === assistantId);
         if (existing) return prev.map((e) => (e.id === assistantId ? { ...e, text } : e));
-        return [{ id: assistantId, role: 'assistant', text }, ...prev];
+        return [{ id: assistantId, role: 'assistant', text, streaming: true }, ...prev];
       });
+    };
+
+    const setAssistantStreaming = (streaming: boolean) => {
+      setChatHistory((prev) => prev.map((e) => (e.id === assistantId ? { ...e, streaming } : e)));
     };
 
     let assistantText = '';
@@ -333,6 +372,7 @@ export default function App() {
             doneReceived = true;
             scheduleFlush();
             finishOnce(() => {
+              setAssistantStreaming(false);
               try {
                 ws.close();
               } finally {
@@ -341,6 +381,7 @@ export default function App() {
             });
           } else if (parsed.type === 'error') {
             finishOnce(() => {
+              setAssistantStreaming(false);
               try {
                 ws.close();
               } finally {
@@ -361,11 +402,13 @@ export default function App() {
       const message = err?.message ?? 'Failed to run RAG search';
       setUiError(message);
       Alert.alert('Chat error', message);
+      setAssistantStreaming(false);
     } finally {
       setChatThinking(false);
       if (!assistantText) {
         assistantText = 'No response (nothing indexed yet?). Go to Import and index screenshots first.';
         scheduleFlush();
+        setAssistantStreaming(false);
       }
     }
   };
@@ -409,9 +452,9 @@ export default function App() {
   if (!fontsLoaded) {
     return (
       <SafeAreaView style={styles.safeArea}>
-        <StatusBar style="light" />
+        <StatusBar style="dark" />
         <View style={styles.fontSplash}>
-          <ActivityIndicator size="large" color="#a78bfa" />
+          <ActivityIndicator size="large" color={COLORS.text} />
           <Text style={styles.fontSplashText}>Loading…</Text>
         </View>
       </SafeAreaView>
@@ -420,11 +463,7 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <StatusBar style="light" />
-      <View pointerEvents="none" style={styles.glowLayer}>
-        <View style={[styles.glow, styles.glowA]} />
-        <View style={[styles.glow, styles.glowB]} />
-      </View>
+      <StatusBar style="dark" />
 
       <View style={[styles.shell, !isWide && styles.shellMobile]}>
         {isWide ? (
@@ -462,6 +501,7 @@ export default function App() {
               screenshots={screenshots}
               selected={selected}
               onToggleSelect={toggleSelect}
+              assetStageById={assetStageById}
             />
           ) : (
             <CategoriesScreen
@@ -523,7 +563,7 @@ function AppHeader(props: { title: string; onOpenMenu: () => void }) {
     <View style={styles.header}>
       <View style={styles.brand}>
         <View style={styles.brandIcon}>
-          <Ionicons name="sparkles" size={16} color="#fff" />
+          <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
         </View>
         <Text style={styles.brandText}>Nexus</Text>
       </View>
@@ -535,7 +575,7 @@ function AppHeader(props: { title: string; onOpenMenu: () => void }) {
         style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
         hitSlop={10}
       >
-        <Ionicons name="menu" size={22} color="#e9edff" />
+        <Ionicons name="menu" size={22} color={COLORS.text} />
       </Pressable>
     </View>
   );
@@ -560,7 +600,7 @@ function Sidebar(props: { apiBase: string; route: RouteKey; onNavigate: (route: 
     <View style={styles.sidebar}>
       <View style={styles.sidebarHeader}>
         <View style={styles.brandIconLarge}>
-          <Ionicons name="sparkles" size={18} color="#fff" />
+          <Ionicons name="sparkles" size={18} color={COLORS.accentText} />
         </View>
         <Text style={styles.sidebarTitle}>Nexus</Text>
       </View>
@@ -581,7 +621,7 @@ function Sidebar(props: { apiBase: string; route: RouteKey; onNavigate: (route: 
               <Ionicons
                 name={item.icon}
                 size={18}
-                color={active ? '#a78bfa' : '#9aa6d6'}
+                color={active ? COLORS.text : COLORS.muted}
                 style={styles.navIcon}
               />
               <Text style={[styles.navText, active && styles.navTextActive]}>{item.label}</Text>
@@ -616,12 +656,12 @@ function HamburgerMenu(props: {
           <View style={styles.menuHeader}>
             <View style={styles.brand}>
               <View style={styles.brandIcon}>
-                <Ionicons name="sparkles" size={16} color="#fff" />
+                <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
               </View>
               <Text style={styles.menuTitle}>Nexus</Text>
             </View>
             <Pressable onPress={props.onClose} style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}>
-              <Ionicons name="close" size={20} color="#e9edff" />
+              <Ionicons name="close" size={20} color={COLORS.text} />
             </Pressable>
           </View>
           <Text style={styles.menuSubtitle} numberOfLines={2}>
@@ -644,7 +684,7 @@ function HamburgerMenu(props: {
                   pressed && styles.pressed,
                 ]}
               >
-                <Ionicons name={item.icon} size={18} color={isActive ? '#a78bfa' : '#9aa6d6'} />
+                <Ionicons name={item.icon} size={18} color={isActive ? COLORS.text : COLORS.muted} />
                 <Text style={[styles.menuItemText, isActive && styles.menuItemTextActive]}>{item.label}</Text>
               </Pressable>
             );
@@ -662,19 +702,6 @@ function ChatScreen(props: {
   chatThinking: boolean;
   onSend: () => void;
 }) {
-  const Typing = () => (
-    <View style={[styles.messageRow, styles.messageRowAi]}>
-      <View style={[styles.avatar, styles.avatarAi]}>
-        <Ionicons name="sparkles" size={18} color="#c7d2fe" />
-      </View>
-      <View style={[styles.messageBubble, styles.messageBubbleAi, styles.typingBubble]}>
-        <View style={styles.typingDot} />
-        <View style={[styles.typingDot, styles.typingDotMid]} />
-        <View style={[styles.typingDot, styles.typingDotEnd]} />
-      </View>
-    </View>
-  );
-
   return (
     <KeyboardAvoidingView
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -687,13 +714,19 @@ function ChatScreen(props: {
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.chatList}
         keyboardDismissMode="on-drag"
-        ListHeaderComponent={props.chatThinking ? <Typing /> : null}
+        ListHeaderComponent={null}
         renderItem={({ item }) => {
           const isUser = item.role === 'user';
           return (
             <View style={[styles.messageRow, isUser ? styles.messageRowUser : styles.messageRowAi]}>
               <View style={[styles.avatar, isUser ? styles.avatarUser : styles.avatarAi]}>
-                <Ionicons name={isUser ? 'person' : 'sparkles'} size={18} color={isUser ? '#fff' : '#c7d2fe'} />
+                {isUser ? (
+                  <Ionicons name="person" size={18} color={COLORS.accentText} />
+                ) : item.streaming ? (
+                  <ActivityIndicator size="small" color={COLORS.muted} />
+                ) : (
+                  <Ionicons name="sparkles" size={18} color={COLORS.muted} />
+                )}
               </View>
               <View style={[styles.messageBubble, isUser ? styles.messageBubbleUser : styles.messageBubbleAi]}>
                 <Text style={[styles.messageText, isUser && styles.messageTextUser]}>{item.text}</Text>
@@ -706,11 +739,11 @@ function ChatScreen(props: {
         <View style={styles.composerGlow} pointerEvents="none" />
         <View style={styles.composerInner}>
           <Pressable style={({ pressed }) => [styles.composerIconButton, pressed && styles.pressed]} hitSlop={8}>
-            <Ionicons name="image-outline" size={20} color="#9aa6d6" />
+            <Ionicons name="image-outline" size={20} color={COLORS.muted} />
           </Pressable>
           <TextInput
             placeholder="Ask about your screenshots…"
-            placeholderTextColor="#6f7ba6"
+            placeholderTextColor={COLORS.muted2}
             value={props.chatInput}
             onChangeText={props.onChangeChatInput}
             style={styles.composerInput}
@@ -725,7 +758,7 @@ function ChatScreen(props: {
             ]}
             hitSlop={8}
           >
-            <Ionicons name="send" size={18} color="#0b1224" />
+            <Ionicons name="send" size={18} color={COLORS.accentText} />
           </Pressable>
         </View>
       </View>
@@ -744,6 +777,7 @@ function ImportScreen(props: {
   screenshots: ResolvedAsset[];
   selected: Set<string>;
   onToggleSelect: (id: string) => void;
+  assetStageById: Record<string, 'uploading' | 'indexing' | 'done' | 'error'>;
 }) {
   return (
     <View style={styles.screen}>
@@ -757,7 +791,7 @@ function ImportScreen(props: {
             onPress={props.onLoadScreenshots}
             style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
           >
-            <Ionicons name="image-outline" size={16} color="#e9edff" />
+            <Ionicons name="image-outline" size={16} color={COLORS.text} />
             <Text style={styles.pillButtonText}>{props.loadingScreenshots ? 'Loading…' : 'Import'}</Text>
           </Pressable>
         </View>
@@ -766,7 +800,7 @@ function ImportScreen(props: {
 
         {props.permissionStatus !== 'granted' && (
           <View style={styles.callout}>
-            <Ionicons name="lock-closed-outline" size={16} color="#c7d2fe" />
+            <Ionicons name="lock-closed-outline" size={16} color={COLORS.muted} />
             <Text style={styles.calloutText}>Allow Photo Library access to import screenshots.</Text>
           </View>
         )}
@@ -774,10 +808,10 @@ function ImportScreen(props: {
         {props.screenshots.length === 0 ? (
           <View style={styles.placeholder}>
             {props.loadingScreenshots ? (
-              <ActivityIndicator color="#a78bfa" />
+              <ActivityIndicator color={COLORS.text} />
             ) : (
               <View style={styles.emptyCard}>
-                <Ionicons name="images-outline" size={26} color="#9aa6d6" />
+                <Ionicons name="images-outline" size={26} color={COLORS.muted} />
                 <Text style={styles.emptyTitle}>No screenshots loaded</Text>
                 <Text style={styles.emptySubtitle}>Tap Import to load your latest screenshots.</Text>
               </View>
@@ -793,6 +827,8 @@ function ImportScreen(props: {
             contentContainerStyle={styles.assetGrid}
             renderItem={({ item }) => {
               const isSelected = props.selected.has(item.id);
+              const stage = props.assetStageById[item.id];
+              const showLoader = stage === 'uploading' || stage === 'indexing';
               return (
                 <Pressable onPress={() => props.onToggleSelect(item.id)} style={styles.assetWrapper}>
                   <Image source={{ uri: item.uri }} style={styles.asset} />
@@ -801,6 +837,16 @@ function ImportScreen(props: {
                   <View style={[styles.check, isSelected && styles.checkSelected]}>
                     {isSelected && <Ionicons name="checkmark" size={14} color="#fff" />}
                   </View>
+                  {showLoader && (
+                    <View style={styles.assetLoader}>
+                      <ActivityIndicator size="small" color={COLORS.accentText} />
+                    </View>
+                  )}
+                  {stage === 'error' && (
+                    <View style={[styles.assetLoader, styles.assetLoaderError]}>
+                      <Ionicons name="alert-circle" size={16} color={COLORS.accentText} />
+                    </View>
+                  )}
                   {item.mediaType === MediaLibrary.MediaType.video && (
                     <View style={styles.videoBadge}>
                       <Text style={styles.videoBadgeText}>VIDEO</Text>
@@ -829,7 +875,11 @@ function ImportScreen(props: {
               ]}
               disabled={props.processing}
             >
-              <Ionicons name={props.processing ? 'hourglass-outline' : 'cloud-upload-outline'} size={16} color="#fff" />
+              <Ionicons
+                name={props.processing ? 'hourglass-outline' : 'cloud-upload-outline'}
+                size={16}
+                color={COLORS.accentText}
+              />
               <Text style={styles.floatingBarButtonText}>{props.processing ? 'Indexing…' : 'Index selected'}</Text>
             </Pressable>
           </View>
@@ -893,7 +943,7 @@ function CategoriesScreen(props: {
           <View style={styles.mcCardDecor} pointerEvents="none" />
           <View style={styles.mcCardTop}>
             <View style={styles.mcCardIcon}>
-              <Ionicons name="folder-open" size={22} color="#fff" />
+              <Ionicons name="folder-open" size={22} color={COLORS.accentText} />
             </View>
             <Pressable
               onPress={(e) => {
@@ -917,7 +967,7 @@ function CategoriesScreen(props: {
               style={({ pressed }) => [styles.mcIconButton, pressed && styles.mcIconButtonPressed]}
               hitSlop={10}
             >
-              <Ionicons name="ellipsis-horizontal" size={20} color="#9aa6d6" />
+              <Ionicons name="ellipsis-horizontal" size={20} color={COLORS.muted} />
             </Pressable>
           </View>
 
@@ -929,7 +979,7 @@ function CategoriesScreen(props: {
               <Text style={styles.mcMetaText}>{p.count} items</Text>
               <View style={styles.mcMetaDot} />
               <View style={styles.mcMetaRow}>
-                <Ionicons name="time-outline" size={14} color="#9aa6d6" />
+                <Ionicons name="time-outline" size={14} color={COLORS.muted} />
                 <Text style={styles.mcMetaText}>Updated today</Text>
               </View>
             </View>
@@ -937,7 +987,7 @@ function CategoriesScreen(props: {
 
           <View style={styles.mcHoverAction} pointerEvents="none">
             <View style={styles.mcHoverActionCircle}>
-              <Ionicons name="arrow-forward" size={18} color="#fff" />
+              <Ionicons name="arrow-forward" size={18} color={COLORS.text} />
             </View>
           </View>
         </Pressable>
@@ -965,7 +1015,7 @@ function CategoriesScreen(props: {
           style={({ pressed }) => [styles.mcDashedCard, pressed && styles.mcDashedCardPressed]}
         >
           <View style={styles.mcDashedIcon}>
-            <Ionicons name="folder-outline" size={26} color="#9aa6d6" />
+            <Ionicons name="folder-outline" size={26} color={COLORS.muted} />
           </View>
           <Text style={styles.mcDashedText}>Refresh</Text>
         </Pressable>
@@ -1051,7 +1101,7 @@ function CategoriesScreen(props: {
                   style={({ pressed }) => [styles.mcBackButton, pressed && styles.mcBackButtonPressed]}
                   hitSlop={10}
                 >
-                  <Ionicons name="arrow-back" size={20} color="#e9edff" />
+                  <Ionicons name="arrow-back" size={20} color={COLORS.text} />
                 </Pressable>
                 <View style={styles.mcDetailHeaderText}>
                   <Text style={styles.mcH1} numberOfLines={1}>
@@ -1079,7 +1129,7 @@ function CategoriesScreen(props: {
                 }}
                 style={({ pressed }) => [styles.mcDangerButton, pressed && styles.mcDangerButtonPressed]}
               >
-                <Ionicons name="trash-outline" size={16} color="#fecdd3" />
+                <Ionicons name="trash-outline" size={16} color={COLORS.danger} />
                 <Text style={styles.mcDangerButtonText}>Delete category</Text>
               </Pressable>
             </View>
@@ -1108,12 +1158,12 @@ function CategoriesScreen(props: {
         <Text style={styles.mcMuted}>Your organized knowledge clusters.</Text>
 
         <View style={styles.mcSearch}>
-          <Ionicons name="search" size={16} color="#9aa6d6" style={styles.mcSearchIcon} />
+          <Ionicons name="search" size={16} color={COLORS.muted} style={styles.mcSearchIcon} />
           <TextInput
             value={categoryQuery}
             onChangeText={setCategoryQuery}
             placeholder="Search categories…"
-            placeholderTextColor="#6f7aa8"
+            placeholderTextColor={COLORS.muted2}
             style={styles.mcSearchInput}
             autoCapitalize="none"
             autoCorrect={false}
@@ -1126,7 +1176,7 @@ function CategoriesScreen(props: {
               hitSlop={10}
               style={({ pressed }) => [styles.mcSearchClear, pressed && styles.pressed]}
             >
-              <Ionicons name="close-circle" size={18} color="#9aa6d6" />
+              <Ionicons name="close-circle" size={18} color={COLORS.muted} />
             </Pressable>
           )}
         </View>
@@ -1163,7 +1213,7 @@ function CategoriesScreen(props: {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#050812',
+    backgroundColor: COLORS.bg,
   },
   fontSplash: {
     flex: 1,
@@ -1172,7 +1222,7 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   fontSplashText: {
-    color: '#9aa6d6',
+    color: COLORS.muted,
     fontSize: 13,
     fontFamily: FONT_SANS_MEDIUM,
   },
@@ -1188,14 +1238,14 @@ const styles = StyleSheet.create({
   glowA: {
     width: 520,
     height: 520,
-    backgroundColor: '#7c3aed',
+    backgroundColor: COLORS.accent,
     top: -240,
     left: -200,
   },
   glowB: {
     width: 420,
     height: 420,
-    backgroundColor: '#2563eb',
+    backgroundColor: COLORS.accent,
     bottom: -200,
     right: -160,
   },
@@ -1212,14 +1262,14 @@ const styles = StyleSheet.create({
   topBar: {
     paddingHorizontal: 18,
     paddingVertical: 14,
-    borderBottomColor: 'rgba(255,255,255,0.08)',
+    borderBottomColor: COLORS.border,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    backgroundColor: 'rgba(255,255,255,0.02)',
+    backgroundColor: COLORS.surface,
   },
   topBarTitle: {
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 18,
-    fontWeight: '900',
+    fontFamily: FONT_HEADING_BOLD,
   },
   header: {
     flexDirection: 'row',
@@ -1227,14 +1277,14 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingHorizontal: 16,
     paddingVertical: 10,
-    borderBottomColor: 'rgba(255,255,255,0.08)',
+    borderBottomColor: COLORS.border,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    backgroundColor: 'rgba(255,255,255,0.02)',
+    backgroundColor: COLORS.surface,
   },
   headerTitle: {
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 16,
-    fontWeight: '900',
+    fontFamily: FONT_HEADING_BOLD,
     flex: 1,
     textAlign: 'center',
     paddingHorizontal: 10,
@@ -1250,8 +1300,8 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#7c3aed',
-    borderColor: 'rgba(124,58,237,0.35)',
+    backgroundColor: COLORS.accent,
+    borderColor: COLORS.border,
     borderWidth: 1,
   },
   brandIconLarge: {
@@ -1260,13 +1310,13 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#7c3aed',
-    borderColor: 'rgba(124,58,237,0.35)',
+    backgroundColor: COLORS.accent,
+    borderColor: COLORS.border,
     borderWidth: 1,
   },
   brandText: {
-    color: '#e9edff',
-    fontWeight: '900',
+    color: COLORS.text,
+    fontFamily: FONT_HEADING_BOLD,
     fontSize: 14,
   },
   iconButton: {
@@ -1275,24 +1325,24 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
-    borderColor: 'rgba(255,255,255,0.12)',
+    borderColor: COLORS.border,
     borderWidth: 1,
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    backgroundColor: COLORS.surfaceAlt,
   },
   iconButtonDanger: {
-    borderColor: 'rgba(255, 154, 162, 0.35)',
-    backgroundColor: 'rgba(255, 154, 162, 0.10)',
+    borderColor: 'rgba(185, 28, 28, 0.25)',
+    backgroundColor: COLORS.dangerSoft,
   },
   menuBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.55)',
+    backgroundColor: 'rgba(15, 23, 42, 0.18)',
     flexDirection: 'row',
   },
   menuPanel: {
     width: 260,
-    backgroundColor: 'rgba(10, 14, 30, 0.98)',
+    backgroundColor: COLORS.surface,
     padding: 14,
-    borderRightColor: 'rgba(255,255,255,0.10)',
+    borderRightColor: COLORS.border,
     borderRightWidth: 1,
     gap: 12,
   },
@@ -1302,18 +1352,19 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   menuTitle: {
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 18,
-    fontWeight: '900',
+    fontFamily: FONT_HEADING_BOLD,
   },
   menuSubtitle: {
-    color: '#8a94bc',
+    color: COLORS.muted,
     fontSize: 12,
     lineHeight: 16,
+    fontFamily: FONT_SANS,
   },
   menuDivider: {
     height: StyleSheet.hairlineWidth,
-    backgroundColor: 'rgba(255,255,255,0.10)',
+    backgroundColor: COLORS.border,
     marginVertical: 6,
   },
   menuItem: {
@@ -1323,24 +1374,25 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 12,
     borderRadius: 14,
-    backgroundColor: 'rgba(255,255,255,0.03)',
-    borderColor: 'rgba(255,255,255,0.10)',
+    backgroundColor: COLORS.surfaceAlt,
+    borderColor: COLORS.border,
     borderWidth: 1,
   },
   menuItemActive: {
-    borderColor: 'rgba(167, 139, 250, 0.7)',
-    backgroundColor: 'rgba(124, 58, 237, 0.10)',
+    borderColor: COLORS.borderStrong,
+    backgroundColor: COLORS.overlay,
   },
   menuItemText: {
-    color: '#e1e7ff',
+    color: COLORS.text,
     fontSize: 15,
-    fontWeight: '800',
+    fontFamily: FONT_SANS_SEMIBOLD,
   },
   menuItemTextActive: {
-    color: '#f1edff',
+    color: COLORS.text,
   },
   screen: {
     flex: 1,
+    backgroundColor: COLORS.bg,
   },
   scroll: {
     padding: 16,
@@ -1348,16 +1400,17 @@ const styles = StyleSheet.create({
     gap: 16,
   },
   inlineError: {
-    color: '#ff9aa2',
+    color: COLORS.danger,
     fontSize: 13,
     lineHeight: 18,
+    fontFamily: FONT_SANS,
   },
   inlineErrorPad: {
     paddingHorizontal: 14,
     paddingTop: 10,
   },
   pressed: {
-    opacity: 0.85,
+    opacity: 0.7,
   },
   disabled: {
     opacity: 0.4,
@@ -1388,12 +1441,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   avatarUser: {
-    backgroundColor: '#7c3aed',
-    borderColor: 'rgba(124,58,237,0.35)',
+    backgroundColor: COLORS.accent,
+    borderColor: COLORS.border,
   },
   avatarAi: {
-    backgroundColor: 'rgba(99, 102, 241, 0.14)',
-    borderColor: 'rgba(255,255,255,0.10)',
+    backgroundColor: COLORS.surfaceAlt,
+    borderColor: COLORS.border,
   },
   messageBubble: {
     maxWidth: '78%',
@@ -1403,22 +1456,23 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   messageBubbleUser: {
-    backgroundColor: 'rgba(124, 58, 237, 0.95)',
-    borderColor: 'rgba(124, 58, 237, 0.55)',
+    backgroundColor: COLORS.accent,
+    borderColor: COLORS.borderStrong,
     borderTopRightRadius: 6,
   },
   messageBubbleAi: {
-    backgroundColor: 'rgba(255,255,255,0.06)',
-    borderColor: 'rgba(255,255,255,0.12)',
+    backgroundColor: COLORS.surfaceAlt,
+    borderColor: COLORS.border,
     borderTopLeftRadius: 6,
   },
   messageText: {
-    color: '#f0f3ff',
+    color: COLORS.text,
     fontSize: 14,
     lineHeight: 19,
+    fontFamily: FONT_SANS,
   },
   messageTextUser: {
-    color: '#ffffff',
+    color: COLORS.accentText,
   },
   typingBubble: {
     flexDirection: 'row',
@@ -1441,9 +1495,9 @@ const styles = StyleSheet.create({
   },
   composerOuter: {
     padding: 14,
-    borderTopColor: 'rgba(255,255,255,0.08)',
+    borderTopColor: COLORS.border,
     borderTopWidth: StyleSheet.hairlineWidth,
-    backgroundColor: 'rgba(5, 8, 18, 0.92)',
+    backgroundColor: COLORS.surface,
   },
   composerGlow: {
     position: 'absolute',
@@ -1452,13 +1506,13 @@ const styles = StyleSheet.create({
     top: 10,
     bottom: 10,
     borderRadius: 20,
-    backgroundColor: 'rgba(124, 58, 237, 0.10)',
+    backgroundColor: COLORS.overlay,
   },
   composerInner: {
     flexDirection: 'row',
     alignItems: 'flex-end',
-    backgroundColor: 'rgba(255,255,255,0.05)',
-    borderColor: 'rgba(255,255,255,0.12)',
+    backgroundColor: COLORS.surfaceAlt,
+    borderColor: COLORS.border,
     borderWidth: 1,
     borderRadius: 20,
     paddingHorizontal: 8,
@@ -1474,8 +1528,9 @@ const styles = StyleSheet.create({
   },
   composerInput: {
     flex: 1,
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 15,
+    fontFamily: FONT_SANS,
     paddingHorizontal: 10,
     paddingVertical: 10,
     minHeight: 42,
@@ -1485,7 +1540,7 @@ const styles = StyleSheet.create({
     width: 44,
     height: 44,
     borderRadius: 14,
-    backgroundColor: '#7c3aed',
+    backgroundColor: COLORS.accent,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1503,15 +1558,16 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   pageTitle: {
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 22,
-    fontWeight: '900',
+    fontFamily: FONT_HEADING_BOLD,
   },
   pageSubtitle: {
-    color: '#9aa6d6',
+    color: COLORS.muted,
     marginTop: 4,
     fontSize: 13,
     lineHeight: 18,
+    fontFamily: FONT_SANS,
   },
   pillButton: {
     flexDirection: 'row',
@@ -1521,29 +1577,30 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.12)',
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
   },
   pillButtonText: {
-    color: '#e9edff',
-    fontWeight: '800',
+    color: COLORS.text,
+    fontFamily: FONT_SANS_SEMIBOLD,
     fontSize: 13,
   },
   callout: {
     borderRadius: 14,
-    borderColor: 'rgba(255,255,255,0.12)',
+    borderColor: COLORS.border,
     borderWidth: 1,
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    backgroundColor: COLORS.surfaceAlt,
     padding: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
   },
   calloutText: {
-    color: '#d9e2ff',
+    color: COLORS.text,
     fontSize: 13,
     lineHeight: 18,
     flex: 1,
+    fontFamily: FONT_SANS,
   },
   placeholder: {
     paddingVertical: 30,
@@ -1555,28 +1612,30 @@ const styles = StyleSheet.create({
     maxWidth: 420,
     borderRadius: 18,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.12)',
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
     padding: 16,
     gap: 8,
     alignItems: 'center',
   },
   emptyTitle: {
-    color: '#f0f3ff',
-    fontWeight: '900',
+    color: COLORS.text,
+    fontFamily: FONT_SANS_BOLD,
     fontSize: 14,
   },
   emptySubtitle: {
-    color: '#9aa6d6',
+    color: COLORS.muted,
     fontSize: 12,
     lineHeight: 16,
     textAlign: 'center',
+    fontFamily: FONT_SANS,
   },
   placeholderText: {
-    color: '#8a94bc',
+    color: COLORS.muted,
     fontSize: 13,
     lineHeight: 18,
     textAlign: 'center',
+    fontFamily: FONT_SANS,
   },
   assetGrid: {
     gap: 10,
@@ -1591,9 +1650,9 @@ const styles = StyleSheet.create({
     borderRadius: 18,
     overflow: 'hidden',
     position: 'relative',
-    borderColor: 'rgba(255,255,255,0.12)',
+    borderColor: COLORS.border,
     borderWidth: 1,
-    backgroundColor: 'rgba(255,255,255,0.03)',
+    backgroundColor: COLORS.surfaceAlt,
   },
   assetPressable: {
     flex: 1,
@@ -1604,38 +1663,55 @@ const styles = StyleSheet.create({
   },
   assetGradient: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.18)',
+    backgroundColor: 'rgba(15, 23, 42, 0.06)',
   },
   assetMissing: {
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    backgroundColor: COLORS.surfaceAlt,
   },
   assetOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.20)',
+    backgroundColor: 'rgba(15, 23, 42, 0.12)',
     opacity: 0,
   },
   assetOverlaySelected: {
     opacity: 1,
-    backgroundColor: 'rgba(124, 58, 237, 0.22)',
+    backgroundColor: 'rgba(15, 23, 42, 0.16)',
   },
   check: {
     position: 'absolute',
     top: 8,
     right: 8,
-    backgroundColor: 'rgba(0,0,0,0.35)',
+    backgroundColor: 'rgba(15, 23, 42, 0.55)',
     width: 24,
     height: 24,
     borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.14)',
+    borderColor: 'rgba(255,255,255,0.18)',
   },
   checkSelected: {
-    backgroundColor: '#7c3aed',
-    borderColor: 'rgba(124, 58, 237, 0.4)',
+    backgroundColor: COLORS.accent,
+    borderColor: 'rgba(15, 23, 42, 0.25)',
+  },
+  assetLoader: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: COLORS.accent,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.18)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  assetLoaderError: {
+    backgroundColor: COLORS.danger,
+    borderColor: 'rgba(185, 28, 28, 0.25)',
   },
   videoBadge: {
     position: 'absolute',
@@ -1649,9 +1725,9 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   videoBadgeText: {
-    color: '#e9edff',
+    color: COLORS.accentText,
     fontSize: 10,
-    fontWeight: '900',
+    fontFamily: FONT_SANS_EXTRABOLD,
     letterSpacing: 0.6,
   },
   floatingBar: {
@@ -1668,37 +1744,40 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 14,
     borderRadius: 18,
-    backgroundColor: '#f8f9ff',
-    shadowColor: '#7c3aed',
-    shadowOpacity: 0.25,
-    shadowRadius: 18,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    shadowColor: COLORS.shadow,
+    shadowOpacity: 0.18,
+    shadowRadius: 16,
     shadowOffset: { width: 0, height: 10 },
   },
   floatingBarText: {
-    color: '#0b1224',
-    fontWeight: '800',
+    color: COLORS.text,
+    fontFamily: FONT_SANS_SEMIBOLD,
     fontSize: 14,
   },
   floatingBarCount: {
-    color: '#7c3aed',
+    color: COLORS.text,
+    fontFamily: FONT_SANS_EXTRABOLD,
   },
   floatingBarDivider: {
     width: 1,
     height: 18,
-    backgroundColor: 'rgba(11,18,36,0.14)',
+    backgroundColor: COLORS.border,
   },
   floatingBarButton: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    backgroundColor: '#7c3aed',
+    backgroundColor: COLORS.accent,
     borderRadius: 14,
     paddingHorizontal: 14,
     paddingVertical: 10,
   },
   floatingBarButtonText: {
-    color: '#fff',
-    fontWeight: '900',
+    color: COLORS.accentText,
+    fontFamily: FONT_SANS_EXTRABOLD,
     fontSize: 13,
   },
 
@@ -1713,14 +1792,14 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   mcH1: {
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 30,
     lineHeight: 36,
     fontFamily: FONT_HEADING_BOLD,
     letterSpacing: -0.6,
   },
   mcMuted: {
-    color: '#9aa6d6',
+    color: COLORS.muted,
     fontSize: 14,
     lineHeight: 19,
     fontFamily: FONT_SANS,
@@ -1734,15 +1813,15 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     paddingHorizontal: 14,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.10)',
-    backgroundColor: 'rgba(255,255,255,0.03)',
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
   },
   mcSearchIcon: {
     marginTop: 1,
   },
   mcSearchInput: {
     flex: 1,
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 15,
     fontFamily: FONT_SANS,
     paddingVertical: 0,
@@ -1773,20 +1852,20 @@ const styles = StyleSheet.create({
     minHeight: 240,
     borderRadius: 24,
     padding: 24,
-    backgroundColor: 'rgba(255,255,255,0.03)',
-    borderColor: 'rgba(255,255,255,0.10)',
+    backgroundColor: COLORS.surface,
+    borderColor: COLORS.border,
     borderWidth: 1,
     overflow: 'hidden',
-    shadowColor: '#7c3aed',
-    shadowOpacity: 0.08,
+    shadowColor: COLORS.shadow,
+    shadowOpacity: 0.10,
     shadowRadius: 22,
     shadowOffset: { width: 0, height: 14 },
     elevation: 2,
   },
   mcCardPressed: {
     transform: [{ scale: 0.985 }],
-    borderColor: 'rgba(255,255,255,0.16)',
-    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderColor: COLORS.borderStrong,
+    backgroundColor: COLORS.surfaceAlt,
   },
   mcCardDecor: {
     position: 'absolute',
@@ -1795,8 +1874,8 @@ const styles = StyleSheet.create({
     width: 160,
     height: 160,
     borderRadius: 80,
-    backgroundColor: '#7c3aed',
-    opacity: 0.08,
+    backgroundColor: COLORS.text,
+    opacity: 0.05,
   },
   mcCardTop: {
     flexDirection: 'row',
@@ -1809,12 +1888,7 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#7c3aed',
-    shadowColor: '#7c3aed',
-    shadowOpacity: 0.25,
-    shadowRadius: 18,
-    shadowOffset: { width: 0, height: 10 },
-    elevation: 2,
+    backgroundColor: COLORS.accent,
   },
   mcIconButton: {
     width: 36,
@@ -1822,17 +1896,17 @@ const styles = StyleSheet.create({
     borderRadius: 18,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.01)',
+    backgroundColor: 'transparent',
   },
   mcIconButtonPressed: {
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: COLORS.overlay,
   },
   mcCardBottom: {
     marginTop: 32,
     gap: 4,
   },
   mcCardTitle: {
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 20,
     lineHeight: 26,
     fontFamily: FONT_HEADING_BOLD,
@@ -1844,7 +1918,7 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
   },
   mcMetaText: {
-    color: '#9aa6d6',
+    color: COLORS.muted,
     fontSize: 14,
     lineHeight: 20,
     fontFamily: FONT_SANS,
@@ -1853,7 +1927,7 @@ const styles = StyleSheet.create({
     width: 4,
     height: 4,
     borderRadius: 2,
-    backgroundColor: 'rgba(255,255,255,0.20)',
+    backgroundColor: COLORS.borderStrong,
   },
   mcHoverAction: {
     position: 'absolute',
@@ -1865,8 +1939,8 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: 'rgba(255,255,255,0.05)',
-    borderColor: 'rgba(255,255,255,0.10)',
+    backgroundColor: COLORS.overlay,
+    borderColor: COLORS.border,
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
@@ -1877,16 +1951,16 @@ const styles = StyleSheet.create({
     borderRadius: 24,
     padding: 24,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.10)',
+    borderColor: COLORS.border,
     borderStyle: 'dashed',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 14,
-    backgroundColor: 'rgba(255,255,255,0.00)',
+    backgroundColor: 'transparent',
   },
   mcDashedCardPressed: {
-    backgroundColor: 'rgba(255,255,255,0.03)',
-    borderColor: 'rgba(167, 139, 250, 0.35)',
+    backgroundColor: COLORS.surfaceAlt,
+    borderColor: COLORS.borderStrong,
     transform: [{ scale: 0.985 }],
   },
   mcDashedIcon: {
@@ -1895,12 +1969,12 @@ const styles = StyleSheet.create({
     borderRadius: 32,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.06)',
-    borderColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: COLORS.surfaceAlt,
+    borderColor: COLORS.border,
     borderWidth: 1,
   },
   mcDashedText: {
-    color: '#c7d2fe',
+    color: COLORS.text,
     fontSize: 16,
     fontFamily: FONT_SANS_MEDIUM,
   },
@@ -1926,12 +2000,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.12)',
-    backgroundColor: 'rgba(255,255,255,0.03)',
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
   },
   mcBackButtonPressed: {
-    backgroundColor: 'rgba(255,255,255,0.06)',
-    borderColor: 'rgba(255,255,255,0.16)',
+    backgroundColor: COLORS.overlay,
+    borderColor: COLORS.borderStrong,
   },
   mcDetailHeaderText: {
     flex: 1,
@@ -1945,15 +2019,15 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.12)',
-    backgroundColor: 'rgba(255,255,255,0.03)',
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
   },
   mcDangerButtonPressed: {
-    backgroundColor: 'rgba(255,255,255,0.06)',
-    borderColor: 'rgba(255, 154, 162, 0.35)',
+    backgroundColor: COLORS.overlay,
+    borderColor: 'rgba(185, 28, 28, 0.25)',
   },
   mcDangerButtonText: {
-    color: '#fecdd3',
+    color: COLORS.danger,
     fontSize: 13,
     fontFamily: FONT_SANS_MEDIUM,
   },
@@ -1963,8 +2037,8 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     overflow: 'hidden',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.10)',
-    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
   },
   mcMediaImage: {
     width: '100%',
@@ -1981,8 +2055,8 @@ const styles = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: 'rgba(0,0,0,0.40)',
-    borderColor: 'rgba(255,255,255,0.10)',
+    backgroundColor: 'rgba(15, 23, 42, 0.48)',
+    borderColor: 'rgba(255,255,255,0.14)',
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
@@ -2015,8 +2089,8 @@ const styles = StyleSheet.create({
     width: '48%',
     borderRadius: 18,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.12)',
-    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
     padding: 12,
     gap: 10,
   },
@@ -2027,28 +2101,29 @@ const styles = StyleSheet.create({
     width: 44,
     height: 44,
     borderRadius: 16,
-    backgroundColor: '#7c3aed',
-    borderColor: 'rgba(124, 58, 237, 0.35)',
+    backgroundColor: COLORS.accent,
+    borderColor: COLORS.border,
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
   },
   categoryName: {
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 15,
-    fontWeight: '900',
+    fontFamily: FONT_SANS_BOLD,
   },
   categoryCount: {
-    color: '#9aa6d6',
+    color: COLORS.muted,
     fontSize: 12,
     lineHeight: 16,
+    fontFamily: FONT_SANS,
   },
   detailHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 16,
     paddingVertical: 12,
-    borderBottomColor: 'rgba(255,255,255,0.08)',
+    borderBottomColor: COLORS.border,
     borderBottomWidth: StyleSheet.hairlineWidth,
     gap: 12,
   },
@@ -2069,9 +2144,9 @@ const styles = StyleSheet.create({
   sidebar: {
     width: 260,
     padding: 16,
-    borderRightColor: 'rgba(255,255,255,0.10)',
+    borderRightColor: COLORS.border,
     borderRightWidth: StyleSheet.hairlineWidth,
-    backgroundColor: 'rgba(255,255,255,0.02)',
+    backgroundColor: COLORS.surface,
   },
   sidebarHeader: {
     flexDirection: 'row',
@@ -2080,9 +2155,9 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   sidebarTitle: {
-    color: '#f8f9ff',
+    color: COLORS.text,
     fontSize: 18,
-    fontWeight: '900',
+    fontFamily: FONT_HEADING_BOLD,
   },
   sidebarNav: {
     marginTop: 14,
@@ -2096,48 +2171,49 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.10)',
-    backgroundColor: 'rgba(255,255,255,0.03)',
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
   },
   navItemActive: {
-    borderColor: 'rgba(167, 139, 250, 0.55)',
-    backgroundColor: 'rgba(124, 58, 237, 0.10)',
+    borderColor: COLORS.borderStrong,
+    backgroundColor: COLORS.overlay,
   },
   navIcon: {
     marginRight: 10,
   },
   navText: {
-    color: '#c7d2fe',
+    color: COLORS.text,
     fontSize: 14,
-    fontWeight: '800',
+    fontFamily: FONT_SANS_SEMIBOLD,
   },
   navTextActive: {
-    color: '#f1edff',
+    color: COLORS.text,
   },
   navDot: {
     marginLeft: 'auto',
     width: 7,
     height: 7,
     borderRadius: 3.5,
-    backgroundColor: '#a78bfa',
+    backgroundColor: COLORS.text,
   },
   sidebarFooter: {
-    borderTopColor: 'rgba(255,255,255,0.10)',
+    borderTopColor: COLORS.border,
     borderTopWidth: StyleSheet.hairlineWidth,
     paddingTop: 12,
     gap: 4,
   },
   sidebarFooterLabel: {
-    color: '#9aa6d6',
+    color: COLORS.muted,
     fontSize: 11,
-    fontWeight: '800',
+    fontFamily: FONT_SANS_SEMIBOLD,
     letterSpacing: 1,
     textTransform: 'uppercase',
   },
   sidebarFooterValue: {
-    color: '#c7d2fe',
+    color: COLORS.muted,
     fontSize: 12,
     lineHeight: 16,
+    fontFamily: FONT_SANS,
   },
   viewerBackdrop: {
     flex: 1,
@@ -2152,8 +2228,8 @@ const styles = StyleSheet.create({
     borderRadius: 24,
     overflow: 'hidden',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.10)',
-    backgroundColor: 'rgba(255,255,255,0.03)',
+    borderColor: 'rgba(255,255,255,0.14)',
+    backgroundColor: 'rgba(255,255,255,0.04)',
     shadowColor: '#000',
     shadowOpacity: 0.4,
     shadowRadius: 24,
