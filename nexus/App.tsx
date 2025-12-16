@@ -683,7 +683,7 @@ function HamburgerMenu(props: {
                 <View style={styles.brandIcon}>
                   <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
                 </View>
-                <Text style={styles.menuTitle}>Nexus</Text>
+                <Text style={styles.brandText}>Nexus</Text>
               </View>
               <Pressable onPress={props.onClose} style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}>
                 <Ionicons name="close" size={20} color={COLORS.text} />
@@ -1577,11 +1577,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-  },
-  menuTitle: {
-    color: COLORS.text,
-    fontSize: 18,
-    fontFamily: FONT_HEADING_BOLD,
   },
   menuNav: {
     marginTop: 10,
