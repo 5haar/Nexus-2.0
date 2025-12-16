@@ -452,19 +452,8 @@ export default function App() {
 
   const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : 'Categories';
 
-  if (!fontsLoaded) {
-    return (
-      <SafeAreaView style={styles.safeArea}>
-        <StatusBar style="dark" />
-        <View style={styles.bootSplash}>
-          <Image source={require('./assets/icon.png')} style={styles.bootIcon} />
-          <Text style={styles.bootTitle}>Nexus</Text>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
   useEffect(() => {
+    if (!fontsLoaded) return;
     const timer = setTimeout(() => {
       Animated.timing(bootOpacity, {
         toValue: 0,
@@ -476,7 +465,19 @@ export default function App() {
       });
     }, 1000);
     return () => clearTimeout(timer);
-  }, [bootOpacity]);
+  }, [bootOpacity, fontsLoaded]);
+
+  if (!fontsLoaded) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar style="dark" />
+        <View style={styles.bootSplash}>
+          <Image source={require('./assets/icon.png')} style={styles.bootIcon} />
+          <Text style={styles.bootTitle}>Nexus</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.safeArea}>
