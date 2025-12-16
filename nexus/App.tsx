@@ -138,6 +138,9 @@ export default function App() {
     PlusJakartaSans_800ExtraBold,
   });
 
+  const [bootSplashVisible, setBootSplashVisible] = useState(true);
+  const bootOpacity = useRef(new Animated.Value(1)).current;
+
   const { width } = useWindowDimensions();
   const isWide = width >= 860;
 
@@ -453,13 +456,27 @@ export default function App() {
     return (
       <SafeAreaView style={styles.safeArea}>
         <StatusBar style="dark" />
-        <View style={styles.fontSplash}>
-          <ActivityIndicator size="large" color={COLORS.text} />
-          <Text style={styles.fontSplashText}>Loading…</Text>
+        <View style={styles.bootSplash}>
+          <Image source={require('./assets/icon.png')} style={styles.bootIcon} />
+          <Text style={styles.bootTitle}>Nexus</Text>
         </View>
       </SafeAreaView>
     );
   }
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      Animated.timing(bootOpacity, {
+        toValue: 0,
+        duration: 360,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start(({ finished }) => {
+        if (finished) setBootSplashVisible(false);
+      });
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [bootOpacity]);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -578,6 +595,13 @@ export default function App() {
           )}
         </View>
       </Modal>
+
+      {bootSplashVisible && (
+        <Animated.View pointerEvents="none" style={[styles.bootSplashOverlay, { opacity: bootOpacity }]}>
+          <Image source={require('./assets/icon.png')} style={styles.bootIcon} />
+          <Text style={styles.bootTitle}>Nexus</Text>
+        </Animated.View>
+      )}
     </SafeAreaView>
   );
 }
@@ -591,7 +615,7 @@ function AppHeader(props: { title: string; onOpenMenu: () => void }) {
         </View>
         <Text style={styles.brandText}>Nexus</Text>
       </View>
-      <Text style={styles.headerTitle} numberOfLines={1}>
+      <Text pointerEvents="none" style={styles.headerTitle} numberOfLines={1}>
         {props.title}
       </Text>
       <Pressable
@@ -1431,16 +1455,30 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.bg,
   },
-  fontSplash: {
+  bootSplash: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     gap: 10,
+    backgroundColor: COLORS.bg,
   },
-  fontSplashText: {
-    color: COLORS.muted,
-    fontSize: 13,
-    fontFamily: FONT_SANS_MEDIUM,
+  bootSplashOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    backgroundColor: COLORS.bg,
+  },
+  bootIcon: {
+    width: 84,
+    height: 84,
+    borderRadius: 18,
+  },
+  bootTitle: {
+    color: COLORS.text,
+    fontSize: 18,
+    fontFamily: FONT_HEADING_BOLD,
+    letterSpacing: -0.2,
   },
   glowLayer: {
     ...StyleSheet.absoluteFillObject,
@@ -1488,6 +1526,7 @@ const styles = StyleSheet.create({
     fontFamily: FONT_HEADING_BOLD,
   },
   header: {
+    position: 'relative',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -1501,9 +1540,11 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontSize: 16,
     fontFamily: FONT_HEADING_BOLD,
-    flex: 1,
+    position: 'absolute',
+    left: 0,
+    right: 0,
     textAlign: 'center',
-    paddingHorizontal: 10,
+    paddingHorizontal: 92,
   },
   brand: {
     flexDirection: 'row',
@@ -1570,7 +1611,9 @@ const styles = StyleSheet.create({
   },
   menuPanelInner: {
     flex: 1,
-    padding: 16,
+    paddingHorizontal: 16,
+    paddingBottom: 16,
+    paddingTop: 10,
     gap: 12,
   },
   menuHeader: {
