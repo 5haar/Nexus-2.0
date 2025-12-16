@@ -1,0 +1,11 @@
+# Node + build artifacts
+node_modules/
+dist/
+
+# Server storage
+server/storage/uploads/
+server/storage/data.json
+server/**/storage/
+
+# OS
+.DS_Store

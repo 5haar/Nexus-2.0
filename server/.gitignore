@@ -1,0 +1,6 @@
+node_modules/
+dist/
+storage/uploads/
+storage/data.json
+server/storage/
+.env
