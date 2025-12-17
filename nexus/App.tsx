@@ -13,6 +13,7 @@ import {
   KeyboardAvoidingView,
   Linking,
   Modal,
+  NativeModules,
   Platform,
   Pressable,
   SafeAreaView,
@@ -66,7 +67,24 @@ type ResolvedAsset = {
   asset: MediaLibrary.Asset;
 };
 
-const API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+const inferDevServerHost = () => {
+  const scriptURL: string | undefined = (NativeModules as any)?.SourceCode?.scriptURL;
+  if (!scriptURL) return null;
+  const match = scriptURL.match(/^https?:\/\/([^/:]+)(?::\d+)?\//);
+  return match?.[1] ?? null;
+};
+
+const resolveApiBase = (configured: string) => {
+  const trimmed = configured.trim();
+  if (!trimmed) return 'http://localhost:4000';
+  if (trimmed.includes('localhost') || trimmed.includes('127.0.0.1')) {
+    const host = inferDevServerHost();
+    if (host) return `http://${host}:4000`;
+  }
+  return trimmed;
+};
+
+const API_BASE = resolveApiBase(process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000');
 
 const COLORS = {
   bg: '#ffffff',
@@ -126,7 +144,13 @@ const ensureAssetUri = async (asset: MediaLibrary.Asset) => {
 };
 
 const apiFetch = async <T,>(path: string, init?: RequestInit): Promise<T> => {
-  const res = await fetch(`${API_BASE}${path}`, init);
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, init);
+  } catch (err: any) {
+    const detail = String(err?.message ?? err ?? '');
+    throw new Error(`Network request failed (API: ${API_BASE}).\n${detail}`.trim());
+  }
   if (!res.ok) {
     const detail = await res.text();
     throw new Error(detail || `Request failed: ${res.status}`);
@@ -291,7 +315,15 @@ export default function App() {
     } as any);
     form.append('createdAt', String(item.createdAt ?? Date.now()));
 
-    const res = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: form });
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: form });
+    } catch (err: any) {
+      const detail = String(err?.message ?? err ?? '');
+      throw new Error(
+        `Network request failed (API: ${API_BASE}). Make sure the server is reachable from your phone.\n${detail}`.trim(),
+      );
+    }
     if (!res.ok) {
       const detail = await res.text();
       throw new Error(detail || 'Upload failed');
