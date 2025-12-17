@@ -81,6 +81,7 @@ const DB_USER = process.env.DB_USER;
 const DB_PASSWORD = process.env.DB_PASSWORD;
 const DB_NAME = process.env.DB_NAME;
 const DB_AUTO_MIGRATE = process.env.DB_AUTO_MIGRATE === '1';
+const DB_ENSURE_SCHEMA = process.env.DB_ENSURE_SCHEMA !== '0';
 
 const mysqlPool =
   DB_HOST && DB_USER && DB_NAME
@@ -191,15 +192,30 @@ const ensureMysqlSchema = async () => {
   );
 };
 
+let schemaEnsured: Promise<void> | null = null;
+const ensureSchemaOnce = async () => {
+  if (!mysqlPool) return;
+  if (!DB_ENSURE_SCHEMA) return;
+  if (!schemaEnsured) {
+    schemaEnsured = ensureMysqlSchema().catch((err) => {
+      schemaEnsured = null;
+      throw err;
+    });
+  }
+  await schemaEnsured;
+};
+
 const normalizeCategory = (value: string) => value.trim().toLowerCase();
 
 const ensureUserRow = async (userId: string) => {
   if (!mysqlPool) return;
+  await ensureSchemaOnce();
   await mysqlPool.execute('INSERT IGNORE INTO users (id, created_at) VALUES (?, ?)', [userId, Date.now()]);
 };
 
 const upsertCategoryId = async (userId: string, name: string) => {
   if (!mysqlPool) throw new Error('DB not configured');
+  await ensureSchemaOnce();
   const normalized = normalizeCategory(name);
   const [result] = (await mysqlPool.execute(
     'INSERT INTO categories (user_id, name) VALUES (?, ?) ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)',
@@ -210,6 +226,7 @@ const upsertCategoryId = async (userId: string, name: string) => {
 
 const listDocsFromDb = async (userId: string, opts?: { includeEmbedding?: boolean }): Promise<ScreenshotDoc[]> => {
   if (!mysqlPool) throw new Error('DB not configured');
+  await ensureSchemaOnce();
   await ensureUserRow(userId);
   const includeEmbedding = !!opts?.includeEmbedding;
   const fields = includeEmbedding
@@ -276,6 +293,7 @@ const listDocsFromDb = async (userId: string, opts?: { includeEmbedding?: boolea
 
 const saveDocToDb = async (doc: ScreenshotDoc) => {
   if (!mysqlPool) throw new Error('DB not configured');
+  await ensureSchemaOnce();
   await ensureUserRow(doc.userId);
   await mysqlPool.execute(
     `INSERT INTO docs
@@ -306,6 +324,7 @@ const saveDocToDb = async (doc: ScreenshotDoc) => {
 
 const deleteDocFromDb = async (userId: string, docId: string) => {
   if (!mysqlPool) throw new Error('DB not configured');
+  await ensureSchemaOnce();
   const [rows] = (await mysqlPool.execute('SELECT storage, file_path AS filePath, s3_key AS s3Key FROM docs WHERE id=? AND user_id=?', [
     docId,
     userId,
@@ -322,6 +341,7 @@ const deleteDocFromDb = async (userId: string, docId: string) => {
 
 const renameCategoryInDb = async (userId: string, from: string, to: string) => {
   if (!mysqlPool) throw new Error('DB not configured');
+  await ensureSchemaOnce();
   const fromName = normalizeCategory(from);
   const toName = normalizeCategory(to);
   if (!fromName || !toName || fromName === toName) return 0;
@@ -364,6 +384,7 @@ const deleteCategoryInDb = async (
   mode: 'unlink' | 'purge' | 'unlink-delete-orphans',
 ) => {
   if (!mysqlPool) throw new Error('DB not configured');
+  await ensureSchemaOnce();
   const categoryName = normalizeCategory(name);
   if (!categoryName) return { removedFrom: 0, deletedDocs: 0 };
   const cleanupMeta = async (meta: null | { filePath?: string; s3Key?: string }) => {
@@ -1281,9 +1302,9 @@ wss.on('connection', (ws) => {
 });
 
 const start = async () => {
-  if (mysqlPool && DB_AUTO_MIGRATE) {
+  if (mysqlPool && (DB_AUTO_MIGRATE || DB_ENSURE_SCHEMA)) {
     try {
-      await ensureMysqlSchema();
+      await ensureSchemaOnce();
       console.log('DB schema ensured.');
     } catch (err) {
       console.error('DB schema ensure failed (continuing to start web):', err);
