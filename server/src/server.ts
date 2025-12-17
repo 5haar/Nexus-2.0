@@ -2,7 +2,6 @@ import 'dotenv/config';
 import cors from 'cors';
 import express from 'express';
 import multer from 'multer';
-import sharp from 'sharp';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -480,9 +479,10 @@ const cosine = (a: number[], b: number[]) => {
   return dot / (Math.sqrt(ma) * Math.sqrt(mb) || 1);
 };
 
-const analyzeScreenshot = async (filePath: string): Promise<Analysis> => {
+const analyzeScreenshot = async (filePath: string, mime: string): Promise<Analysis> => {
   if (!openai) throw new Error('Missing OPENAI_API_KEY');
   const base64 = fs.readFileSync(filePath, { encoding: 'base64' });
+  const safeMime = mime?.startsWith('image/') ? mime : 'image/png';
   const response = await openai.chat.completions.create({
     model: VISION_MODEL,
     response_format: {
@@ -518,7 +518,7 @@ const analyzeScreenshot = async (filePath: string): Promise<Analysis> => {
           {
             type: 'image_url',
             image_url: {
-              url: `data:image/png;base64,${base64}`,
+              url: `data:${safeMime};base64,${base64}`,
             },
           },
         ],
@@ -566,6 +566,15 @@ const buildRetrievalContext = async (query: string, topK: number, userId: string
   return { context, ranked };
 };
 
+let sharpLoader: Promise<any> | null = null;
+const loadSharp = async () => {
+  if (sharpLoader) return sharpLoader;
+  sharpLoader = import('sharp')
+    .then((m) => m?.default ?? m)
+    .catch(() => null);
+  return sharpLoader;
+};
+
 const convertImageToPng = async (filePath: string, mime: string) => {
   const ext = path.extname(filePath).toLowerCase();
   const isImage = mime.startsWith('image/');
@@ -575,6 +584,8 @@ const convertImageToPng = async (filePath: string, mime: string) => {
   // First try sharp (fast path when libvips has HEIC support)
   const pngPath = `${filePath}.png`;
   try {
+    const sharp = await loadSharp();
+    if (!sharp) throw new Error('sharp unavailable');
     await sharp(filePath).png().toFile(pngPath);
     fs.unlinkSync(filePath);
     return { filePath: pngPath, converted: true };
@@ -592,7 +603,7 @@ const convertImageToPng = async (filePath: string, mime: string) => {
         );
       }
     }
-    throw new Error('Image conversion failed. Ensure image format is supported or convert to PNG/JPEG before upload.');
+    return { filePath, converted: false };
   }
 };
 
@@ -936,7 +947,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 
     if (isImage) {
       const { filePath: usablePath, converted } = await convertImageToPng(req.file.path, fileMime);
-      const analysis = await analyzeScreenshot(usablePath);
+      const analysis = await analyzeScreenshot(usablePath, converted ? 'image/png' : fileMime);
       const combinedText = [analysis.caption, ...(analysis.text ?? [])].join('\n');
       const embedding = await embedText(combinedText);
       const id = randomId();
@@ -948,7 +959,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
         originalName: converted
           ? req.file.originalname.replace(/\.[^.]+$/i, '.png')
           : req.file.originalname,
-        fileMime: 'image/png',
+        fileMime: converted ? 'image/png' : fileMime,
         mediaType: 'image',
         caption: analysis.caption || 'Screenshot',
         categories: analysis.categories?.slice(0, 5) ?? [],
