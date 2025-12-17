@@ -95,6 +95,7 @@ const resolveApiBase = (configured: string) => {
 
 const DEFAULT_API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
 const API_BASE_STORAGE_KEY = 'nexus.apiBase';
+const USER_ID_STORAGE_KEY = 'nexus.userId';
 
 const COLORS = {
   bg: '#ffffff',
@@ -200,10 +201,12 @@ const ensureAssetUri = async (asset: MediaLibrary.Asset) => {
   return info.localUri ?? legacyLocalUri ?? asset.uri;
 };
 
-const apiFetch = async <T,>(apiBase: string, path: string, init?: RequestInit): Promise<T> => {
+const apiFetch = async <T,>(apiBase: string, userId: string, path: string, init?: RequestInit): Promise<T> => {
   let res: Response;
   try {
-    res = await fetch(`${apiBase}${path}`, init);
+    const headers = new Headers(init?.headers ?? {});
+    if (userId) headers.set('x-nexus-user-id', userId);
+    res = await fetch(`${apiBase}${path}`, { ...init, headers });
   } catch (err: any) {
     const detail = String(err?.message ?? err ?? '');
     throw new Error(`Network request failed (API: ${apiBase}).\n${detail}`.trim());
@@ -233,6 +236,7 @@ export default function App() {
   const [apiBase, setApiBase] = useState(() => resolveApiBase(DEFAULT_API_BASE));
   const [apiModalOpen, setApiModalOpen] = useState(false);
   const [apiDraft, setApiDraft] = useState('');
+  const [userId, setUserId] = useState('');
 
   const { width } = useWindowDimensions();
   const isWide = width >= 860;
@@ -262,13 +266,33 @@ export default function App() {
 
   useEffect(() => {
     MediaLibrary.getPermissionsAsync(false).then((p) => setPermission(p));
-    refreshDocs();
   }, []);
 
   useEffect(() => {
-    if (route === 'categories') refreshDocs();
+    let cancelled = false;
+    (async () => {
+      try {
+        const existing = (await AsyncStorage.getItem(USER_ID_STORAGE_KEY))?.trim();
+        if (existing) {
+          if (!cancelled) setUserId(existing);
+          return;
+        }
+        const next = `anon_${randomId()}`;
+        await AsyncStorage.setItem(USER_ID_STORAGE_KEY, next);
+        if (!cancelled) setUserId(next);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (route === 'categories' && userId) refreshDocs();
     if (route !== 'categories') setActiveCategory(null);
-  }, [route]);
+  }, [route, userId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -301,12 +325,18 @@ export default function App() {
 
   const refreshDocs = async () => {
     try {
-      const data = await apiFetch<{ docs: ServerDoc[] }>(apiBase, '/api/docs');
+      if (!userId) return;
+      const data = await apiFetch<{ docs: ServerDoc[] }>(apiBase, userId, '/api/docs');
       setDocs(data.docs ?? []);
     } catch (err: any) {
       setUiError(err?.message ?? 'Failed to load stored documents');
     }
   };
+
+  useEffect(() => {
+    if (!userId) return;
+    refreshDocs();
+  }, [apiBase, userId]);
 
   const handleRequestAccess = async () => {
     const response = await MediaLibrary.requestPermissionsAsync(false);
@@ -394,6 +424,7 @@ export default function App() {
   };
 
   const uploadAssetToServer = async (item: ResolvedAsset) => {
+    if (!userId) throw new Error('Missing user id');
     const uri = item.uri || (await ensureAssetUri(item.asset));
     if (!uri) throw new Error('No local URI for asset');
 
@@ -407,7 +438,11 @@ export default function App() {
 
     let res: Response;
     try {
-      res = await fetch(`${apiBase}/api/upload`, { method: 'POST', body: form });
+      res = await fetch(`${apiBase}/api/upload`, {
+        method: 'POST',
+        headers: { 'x-nexus-user-id': userId },
+        body: form,
+      });
     } catch (err: any) {
       const detail = String(err?.message ?? err ?? '');
       Alert.alert('Network error', `Can’t reach your server at:\n${apiBase}`, [
@@ -428,6 +463,10 @@ export default function App() {
 
   const handleSendToAI = async () => {
     if (!selected.size || processing) return;
+    if (!userId) {
+      Alert.alert('Just a sec', 'Finishing setup… please try again.');
+      return;
+    }
     setProcessing(true);
     setUiError(null);
     try {
@@ -459,6 +498,10 @@ export default function App() {
 
   const handleAsk = async () => {
     if (!chatInput.trim() || chatThinking) return;
+    if (!userId) {
+      Alert.alert('Just a sec', 'Finishing setup… please try again.');
+      return;
+    }
     const prompt = chatInput.trim();
     setChatInput('');
     setChatThinking(true);
@@ -507,7 +550,7 @@ export default function App() {
 
       await new Promise<void>((resolve, reject) => {
         ws.onopen = () => {
-          ws.send(JSON.stringify({ type: 'search', query: prompt }));
+          ws.send(JSON.stringify({ type: 'search', query: prompt, userId }));
         };
 
         ws.onmessage = (evt) => {
@@ -600,13 +643,16 @@ export default function App() {
   }, [docs, activeCategory]);
 
   const deleteDoc = async (docId: string) => {
-    await apiFetch<{ ok: boolean }>(apiBase, `/api/docs/${encodeURIComponent(docId)}`, { method: 'DELETE' });
+    if (!userId) return;
+    await apiFetch<{ ok: boolean }>(apiBase, userId, `/api/docs/${encodeURIComponent(docId)}`, { method: 'DELETE' });
     setDocs((prev) => prev.filter((d) => d.id !== docId));
   };
 
   const deleteCategory = async (name: string, mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => {
+    if (!userId) return;
     await apiFetch<{ ok: boolean }>(
       apiBase,
+      userId,
       `/api/categories/${encodeURIComponent(name)}?mode=${encodeURIComponent(mode)}`,
       { method: 'DELETE' },
     );
@@ -711,9 +757,11 @@ export default function App() {
               }}
               onDeleteCategories={async (names, mode) => {
                 try {
+                  if (!userId) throw new Error('Missing user id');
                   for (const name of names) {
                     await apiFetch<{ ok: boolean }>(
                       apiBase,
+                      userId,
                       `/api/categories/${encodeURIComponent(name)}?mode=${encodeURIComponent(mode)}`,
                       { method: 'DELETE' },
                     );
@@ -726,7 +774,8 @@ export default function App() {
                 }
               }}
               onRenameCategory={async (from, to) => {
-                await apiFetch<{ ok: boolean }>(apiBase, `/api/categories/${encodeURIComponent(from)}`, {
+                if (!userId) throw new Error('Missing user id');
+                await apiFetch<{ ok: boolean }>(apiBase, userId, `/api/categories/${encodeURIComponent(from)}`, {
                   method: 'PATCH',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ to }),
