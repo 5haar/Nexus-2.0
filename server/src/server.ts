@@ -91,6 +91,7 @@ const mysqlPool =
         user: DB_USER,
         password: DB_PASSWORD,
         database: DB_NAME,
+        connectTimeout: Number(process.env.DB_CONNECT_TIMEOUT_MS || 5000),
         waitForConnections: true,
         connectionLimit: 10,
         enableKeepAlive: true,
@@ -643,8 +644,34 @@ const uploadToS3 = async (userId: string, docId: string, filePath: string, conte
   return key;
 };
 
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
+app.get('/', (_req, res) => {
+  res.status(200).send('ok');
+});
+
+app.get('/api/health', async (_req, res) => {
+  let dbOk = false;
+  if (mysqlPool) {
+    try {
+      await mysqlPool.query('SELECT 1');
+      dbOk = true;
+    } catch {
+      dbOk = false;
+    }
+  }
+  res.json({
+    ok: true,
+    db: {
+      configured: !!mysqlPool,
+      ok: dbOk,
+      host: DB_HOST ? String(DB_HOST) : null,
+      name: DB_NAME ? String(DB_NAME) : null,
+    },
+    s3: {
+      configured: !!(s3 && S3_BUCKET),
+      bucket: S3_BUCKET ?? null,
+      region: AWS_REGION,
+    },
+  });
 });
 
 app.get('/api/docs', async (req, res) => {
@@ -1244,8 +1271,12 @@ wss.on('connection', (ws) => {
 
 const start = async () => {
   if (mysqlPool && DB_AUTO_MIGRATE) {
-    await ensureMysqlSchema();
-    console.log('DB schema ensured.');
+    try {
+      await ensureMysqlSchema();
+      console.log('DB schema ensured.');
+    } catch (err) {
+      console.error('DB schema ensure failed (continuing to start web):', err);
+    }
   }
   server.listen(PORT, () => {
     console.log(`API ready on http://localhost:${PORT}`);
