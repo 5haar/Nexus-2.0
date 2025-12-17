@@ -93,6 +93,8 @@ const resolveApiBase = (configured: string) => {
 
 const DEFAULT_API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
 const API_BASE_STORAGE_KEY = 'nexus.apiBase';
+const FALLBACK_HEADER_HEIGHT = 56;
+const FALLBACK_TOPBAR_HEIGHT = 56;
 
 const COLORS = {
   bg: '#ffffff',
@@ -190,6 +192,8 @@ export default function App() {
 
   const [route, setRoute] = useState<RouteKey>('chat');
   const [menuOpen, setMenuOpen] = useState(false);
+  const [headerHeight, setHeaderHeight] = useState(0);
+  const [topBarHeight, setTopBarHeight] = useState(0);
 
   const [permission, setPermission] = useState<MediaLibrary.PermissionResponse | null>(null);
   const [loadingScreenshots, setLoadingScreenshots] = useState(false);
@@ -566,6 +570,12 @@ export default function App() {
   };
 
   const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : 'Categories';
+  const keyboardVerticalOffset =
+    Platform.OS === 'ios'
+      ? isWide
+        ? topBarHeight || FALLBACK_TOPBAR_HEIGHT
+        : headerHeight || FALLBACK_HEADER_HEIGHT
+      : 0;
 
   useEffect(() => {
     if (!fontsLoaded) return;
@@ -610,11 +620,15 @@ export default function App() {
             onPressApi={openApiModal}
           />
         ) : (
-          <AppHeader title={headerTitle} onOpenMenu={() => setMenuOpen(true)} />
+          <AppHeader
+            title={headerTitle}
+            onOpenMenu={() => setMenuOpen(true)}
+            onMeasuredHeight={(h) => setHeaderHeight(h)}
+          />
         )}
 
         <View style={styles.main}>
-          {isWide && <TopBar title={headerTitle} />}
+          {isWide && <TopBar title={headerTitle} onMeasuredHeight={(h) => setTopBarHeight(h)} />}
           {route === 'chat' ? (
             <ChatScreen
               chatHistory={chatHistory}
@@ -622,6 +636,7 @@ export default function App() {
               onChangeChatInput={setChatInput}
               chatThinking={chatThinking}
               onSend={handleAsk}
+              keyboardVerticalOffset={keyboardVerticalOffset}
             />
           ) : route === 'import' ? (
             <ImportScreen
@@ -755,9 +770,14 @@ export default function App() {
   );
 }
 
-function AppHeader(props: { title: string; onOpenMenu: () => void }) {
+function AppHeader(props: { title: string; onOpenMenu: () => void; onMeasuredHeight?: (height: number) => void }) {
   return (
-    <View style={styles.header}>
+    <View
+      style={styles.header}
+      onLayout={(e) => {
+        props.onMeasuredHeight?.(e.nativeEvent.layout.height);
+      }}
+    >
       <View style={styles.brand}>
         <View style={styles.brandIcon}>
           <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
@@ -778,9 +798,14 @@ function AppHeader(props: { title: string; onOpenMenu: () => void }) {
   );
 }
 
-function TopBar(props: { title: string }) {
+function TopBar(props: { title: string; onMeasuredHeight?: (height: number) => void }) {
   return (
-    <View style={styles.topBar}>
+    <View
+      style={styles.topBar}
+      onLayout={(e) => {
+        props.onMeasuredHeight?.(e.nativeEvent.layout.height);
+      }}
+    >
       <Text style={styles.topBarTitle}>{props.title}</Text>
     </View>
   );
@@ -916,18 +941,20 @@ function ChatScreen(props: {
   onChangeChatInput: (text: string) => void;
   chatThinking: boolean;
   onSend: () => void;
+  keyboardVerticalOffset: number;
 }) {
   return (
     <KeyboardAvoidingView
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       style={styles.screen}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 6 : 0}
+      keyboardVerticalOffset={props.keyboardVerticalOffset}
     >
       <FlatList
         data={props.chatHistory}
         inverted
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.chatList}
+        keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
         ListHeaderComponent={null}
         renderItem={({ item }) => {
