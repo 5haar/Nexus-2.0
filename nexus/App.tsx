@@ -1007,37 +1007,39 @@ function ChatScreen(props: {
           setComposerHeight((prev) => (prev === next ? prev : next));
         }}
       >
-        <View style={styles.composerInner}>
+        <View style={styles.composerRow}>
           <Pressable
             onPress={props.onPressPlus}
-            style={({ pressed }) => [styles.composerIconButton, pressed && styles.pressed]}
+            style={({ pressed }) => [styles.plusButton, pressed && styles.pressed]}
             hitSlop={10}
           >
-            <Ionicons name="add" size={20} color={COLORS.text} />
+            <Ionicons name="add" size={26} color={COLORS.muted} />
           </Pressable>
 
-          <TextInput
-            placeholder="Ask anything"
-            placeholderTextColor={COLORS.muted2}
-            value={props.chatInput}
-            onChangeText={props.onChangeChatInput}
-            style={styles.composerInput}
-            multiline={false}
-            returnKeyType="send"
-            onSubmitEditing={props.onSend}
-          />
+          <View style={styles.composerPill}>
+            <TextInput
+              placeholder="Ask anything"
+              placeholderTextColor={COLORS.muted2}
+              value={props.chatInput}
+              onChangeText={props.onChangeChatInput}
+              style={styles.composerInput}
+              multiline={false}
+              returnKeyType="send"
+              onSubmitEditing={props.onSend}
+            />
 
-          <Pressable
-            onPress={props.onSend}
-            style={({ pressed }) => [
-              styles.sendButton,
-              (props.chatThinking || !props.chatInput.trim()) && styles.disabled,
-              pressed && styles.pressed,
-            ]}
-            hitSlop={10}
-          >
-            <Ionicons name="arrow-up" size={18} color={COLORS.accentText} />
-          </Pressable>
+            <Pressable
+              onPress={props.onSend}
+              style={({ pressed }) => [
+                styles.sendButton,
+                (props.chatThinking || !props.chatInput.trim()) && styles.disabled,
+                pressed && styles.pressed,
+              ]}
+              hitSlop={10}
+            >
+              <Ionicons name="arrow-up" size={18} color={COLORS.text} />
+            </Pressable>
+          </View>
         </View>
       </Animated.View>
     </View>
@@ -2012,36 +2014,42 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     backgroundColor: 'transparent',
   },
-  composerInner: {
+  composerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  plusButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.pill,
+  },
+  composerPill: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: COLORS.pill,
     borderRadius: 999,
-    paddingHorizontal: 18,
-    height: 48,
-    gap: 10,
-  },
-  composerIconButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(15, 23, 42, 0.06)',
+    height: 44,
+    paddingLeft: 14,
+    paddingRight: 4,
   },
   composerInput: {
     flex: 1,
     color: COLORS.text,
     fontSize: 15,
     fontFamily: FONT_SANS,
-    paddingHorizontal: 10,
+    paddingHorizontal: 0,
     paddingVertical: 0,
   },
   sendButton: {
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: COLORS.accent,
+    backgroundColor: 'rgba(15, 23, 42, 0.14)',
     alignItems: 'center',
     justifyContent: 'center',
   },
