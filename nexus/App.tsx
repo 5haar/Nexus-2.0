@@ -100,6 +100,7 @@ const COLORS = {
   bg: '#ffffff',
   surface: '#ffffff',
   surfaceAlt: '#f8fafc',
+  pill: '#f1f5f9',
   text: '#0f172a',
   muted: '#64748b',
   muted2: '#94a3b8',
@@ -637,6 +638,8 @@ export default function App() {
               chatThinking={chatThinking}
               onSend={handleAsk}
               keyboardVerticalOffset={keyboardVerticalOffset}
+              onPressImages={() => setRoute('import')}
+              onPressMic={() => Alert.alert('Voice', 'Voice input is coming soon.')}
             />
           ) : route === 'import' ? (
             <ImportScreen
@@ -942,6 +945,8 @@ function ChatScreen(props: {
   chatThinking: boolean;
   onSend: () => void;
   keyboardVerticalOffset: number;
+  onPressImages: () => void;
+  onPressMic: () => void;
 }) {
   return (
     <KeyboardAvoidingView
@@ -978,19 +983,34 @@ function ChatScreen(props: {
         }}
       />
       <View style={styles.composerOuter}>
-        <View style={styles.composerGlow} pointerEvents="none" />
         <View style={styles.composerInner}>
-          <Pressable style={({ pressed }) => [styles.composerIconButton, pressed && styles.pressed]} hitSlop={8}>
-            <Ionicons name="image-outline" size={20} color={COLORS.muted} />
+          <Pressable
+            onPress={props.onPressImages}
+            style={({ pressed }) => [styles.composerIconButton, pressed && styles.pressed]}
+            hitSlop={10}
+          >
+            <Ionicons name="add" size={20} color={COLORS.text} />
           </Pressable>
+
           <TextInput
-            placeholder="Ask about your screenshots…"
+            placeholder="Ask anything"
             placeholderTextColor={COLORS.muted2}
             value={props.chatInput}
             onChangeText={props.onChangeChatInput}
             style={styles.composerInput}
-            multiline
+            multiline={false}
+            returnKeyType="send"
+            onSubmitEditing={props.onSend}
           />
+
+          <Pressable
+            onPress={props.onPressMic}
+            style={({ pressed }) => [styles.composerIconButton, pressed && styles.pressed]}
+            hitSlop={10}
+          >
+            <Ionicons name="mic-outline" size={20} color={COLORS.text} />
+          </Pressable>
+
           <Pressable
             onPress={props.onSend}
             style={({ pressed }) => [
@@ -998,9 +1018,9 @@ function ChatScreen(props: {
               (props.chatThinking || !props.chatInput.trim()) && styles.disabled,
               pressed && styles.pressed,
             ]}
-            hitSlop={8}
+            hitSlop={10}
           >
-            <Ionicons name="send" size={18} color={COLORS.accentText} />
+            <Ionicons name="arrow-up" size={18} color={COLORS.accentText} />
           </Pressable>
         </View>
       </View>
@@ -1970,35 +1990,24 @@ const styles = StyleSheet.create({
     opacity: 0.45,
   },
   composerOuter: {
-    padding: 14,
-    borderTopColor: COLORS.border,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    backgroundColor: COLORS.surface,
-  },
-  composerGlow: {
-    position: 'absolute',
-    left: 14,
-    right: 14,
-    top: 10,
-    bottom: 10,
-    borderRadius: 20,
-    backgroundColor: COLORS.overlay,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 10,
+    backgroundColor: 'transparent',
   },
   composerInner: {
     flexDirection: 'row',
-    alignItems: 'flex-end',
-    backgroundColor: COLORS.surfaceAlt,
-    borderColor: COLORS.border,
-    borderWidth: 1,
-    borderRadius: 20,
-    paddingHorizontal: 8,
-    paddingVertical: 6,
-    gap: 6,
+    alignItems: 'center',
+    backgroundColor: COLORS.pill,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    height: 48,
+    gap: 8,
   },
   composerIconButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 14,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -2007,15 +2016,13 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontSize: 15,
     fontFamily: FONT_SANS,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
-    minHeight: 42,
-    maxHeight: 120,
+    paddingHorizontal: 8,
+    paddingVertical: 0,
   },
   sendButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 14,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: COLORS.accent,
     alignItems: 'center',
     justifyContent: 'center',
