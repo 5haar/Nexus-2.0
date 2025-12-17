@@ -11,6 +11,7 @@ import {
   FlatList,
   Image,
   KeyboardAvoidingView,
+  Linking,
   Modal,
   Platform,
   Pressable,
@@ -111,6 +112,13 @@ const toWsUrl = (base: string) => {
   return url.toString();
 };
 
+const getAccessPrivileges = (p: MediaLibrary.PermissionResponse | null) =>
+  (p as any)?.accessPrivileges as 'all' | 'limited' | 'none' | undefined;
+const hasMediaLibraryReadAccess = (p: MediaLibrary.PermissionResponse | null) =>
+  !!p && p.status === 'granted' && getAccessPrivileges(p) !== 'none';
+const hasMediaLibraryAllAccess = (p: MediaLibrary.PermissionResponse | null) =>
+  hasMediaLibraryReadAccess(p) && (getAccessPrivileges(p) ?? 'all') === 'all';
+
 const ensureAssetUri = async (asset: MediaLibrary.Asset) => {
   const info = await MediaLibrary.getAssetInfoAsync(asset);
   const legacyLocalUri = (asset as any).localUri as string | undefined;
@@ -168,7 +176,7 @@ export default function App() {
   const [viewerUri, setViewerUri] = useState<string | null>(null);
 
   useEffect(() => {
-    MediaLibrary.getPermissionsAsync().then((p) => setPermission(p));
+    MediaLibrary.getPermissionsAsync(false).then((p) => setPermission(p));
     refreshDocs();
   }, []);
 
@@ -187,9 +195,9 @@ export default function App() {
   };
 
   const handleRequestAccess = async () => {
-    const response = await MediaLibrary.requestPermissionsAsync();
+    const response = await MediaLibrary.requestPermissionsAsync(false);
     setPermission(response);
-    return response.status === 'granted';
+    return hasMediaLibraryReadAccess(response);
   };
 
   const loadScreenshots = async () => {
@@ -197,13 +205,42 @@ export default function App() {
     setLoadingScreenshots(true);
     setUiError(null);
     try {
-      const hasAccess = permission?.status === 'granted' ? true : await handleRequestAccess();
-      if (!hasAccess) return;
+      let currentPermission = permission ?? (await MediaLibrary.getPermissionsAsync(false));
+      if (currentPermission.status !== 'granted' || getAccessPrivileges(currentPermission) === 'none') {
+        const hasAccess = await handleRequestAccess();
+        if (!hasAccess) return;
+        currentPermission = (await MediaLibrary.getPermissionsAsync(false)) ?? currentPermission;
+      }
 
-      const album = await MediaLibrary.getAlbumAsync('Screenshots');
-      const searchSource = album ? { album } : {};
+      if (!hasMediaLibraryReadAccess(currentPermission)) {
+        Alert.alert(
+          'Photo access required',
+          'Please allow Photos access to import screenshots.',
+          [{ text: 'OK' }],
+        );
+        return;
+      }
+
+      let album: MediaLibrary.Album | null = null;
+      if (hasMediaLibraryAllAccess(currentPermission)) {
+        try {
+          album = await MediaLibrary.getAlbumAsync('Screenshots');
+        } catch {
+          album = null;
+        }
+      } else {
+        Alert.alert(
+          'Limited Photos access',
+          'Your Photos access is limited, so Nexus will show your allowed photos instead of the Screenshots album. To import all screenshots, enable Full Access in iOS Settings.',
+          [
+            { text: 'OK' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings() },
+          ],
+        );
+      }
+
       const result = await MediaLibrary.getAssetsAsync({
-        ...searchSource,
+        ...(album ? { album } : {}),
         first: 60,
         sortBy: [MediaLibrary.SortBy.creationTime],
         mediaType: [MediaLibrary.MediaType.photo, MediaLibrary.MediaType.video],
