@@ -93,8 +93,6 @@ const resolveApiBase = (configured: string) => {
 
 const DEFAULT_API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
 const API_BASE_STORAGE_KEY = 'nexus.apiBase';
-const FALLBACK_HEADER_HEIGHT = 56;
-const FALLBACK_TOPBAR_HEIGHT = 56;
 
 const COLORS = {
   bg: '#ffffff',
@@ -193,8 +191,6 @@ export default function App() {
 
   const [route, setRoute] = useState<RouteKey>('chat');
   const [menuOpen, setMenuOpen] = useState(false);
-  const [headerHeight, setHeaderHeight] = useState(0);
-  const [topBarHeight, setTopBarHeight] = useState(0);
 
   const [permission, setPermission] = useState<MediaLibrary.PermissionResponse | null>(null);
   const [loadingScreenshots, setLoadingScreenshots] = useState(false);
@@ -571,12 +567,7 @@ export default function App() {
   };
 
   const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : 'Categories';
-  const keyboardVerticalOffset =
-    Platform.OS === 'ios'
-      ? isWide
-        ? topBarHeight || FALLBACK_TOPBAR_HEIGHT
-        : headerHeight || FALLBACK_HEADER_HEIGHT
-      : 0;
+  const keyboardVerticalOffset = 0;
 
   useEffect(() => {
     if (!fontsLoaded) return;
@@ -621,15 +612,11 @@ export default function App() {
             onPressApi={openApiModal}
           />
         ) : (
-          <AppHeader
-            title={headerTitle}
-            onOpenMenu={() => setMenuOpen(true)}
-            onMeasuredHeight={(h) => setHeaderHeight(h)}
-          />
+          <AppHeader title={headerTitle} onOpenMenu={() => setMenuOpen(true)} />
         )}
 
         <View style={styles.main}>
-          {isWide && <TopBar title={headerTitle} onMeasuredHeight={(h) => setTopBarHeight(h)} />}
+          {isWide && <TopBar title={headerTitle} />}
           {route === 'chat' ? (
             <ChatScreen
               chatHistory={chatHistory}
@@ -638,8 +625,6 @@ export default function App() {
               chatThinking={chatThinking}
               onSend={handleAsk}
               keyboardVerticalOffset={keyboardVerticalOffset}
-              onPressImages={() => setRoute('import')}
-              onPressMic={() => Alert.alert('Voice', 'Voice input is coming soon.')}
             />
           ) : route === 'import' ? (
             <ImportScreen
@@ -773,14 +758,9 @@ export default function App() {
   );
 }
 
-function AppHeader(props: { title: string; onOpenMenu: () => void; onMeasuredHeight?: (height: number) => void }) {
+function AppHeader(props: { title: string; onOpenMenu: () => void }) {
   return (
-    <View
-      style={styles.header}
-      onLayout={(e) => {
-        props.onMeasuredHeight?.(e.nativeEvent.layout.height);
-      }}
-    >
+    <View style={styles.header}>
       <View style={styles.brand}>
         <View style={styles.brandIcon}>
           <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
@@ -801,14 +781,9 @@ function AppHeader(props: { title: string; onOpenMenu: () => void; onMeasuredHei
   );
 }
 
-function TopBar(props: { title: string; onMeasuredHeight?: (height: number) => void }) {
+function TopBar(props: { title: string }) {
   return (
-    <View
-      style={styles.topBar}
-      onLayout={(e) => {
-        props.onMeasuredHeight?.(e.nativeEvent.layout.height);
-      }}
-    >
+    <View style={styles.topBar}>
       <Text style={styles.topBarTitle}>{props.title}</Text>
     </View>
   );
@@ -945,8 +920,6 @@ function ChatScreen(props: {
   chatThinking: boolean;
   onSend: () => void;
   keyboardVerticalOffset: number;
-  onPressImages: () => void;
-  onPressMic: () => void;
 }) {
   return (
     <KeyboardAvoidingView
@@ -984,14 +957,6 @@ function ChatScreen(props: {
       />
       <View style={styles.composerOuter}>
         <View style={styles.composerInner}>
-          <Pressable
-            onPress={props.onPressImages}
-            style={({ pressed }) => [styles.composerIconButton, pressed && styles.pressed]}
-            hitSlop={10}
-          >
-            <Ionicons name="add" size={20} color={COLORS.text} />
-          </Pressable>
-
           <TextInput
             placeholder="Ask anything"
             placeholderTextColor={COLORS.muted2}
@@ -1002,14 +967,6 @@ function ChatScreen(props: {
             returnKeyType="send"
             onSubmitEditing={props.onSend}
           />
-
-          <Pressable
-            onPress={props.onPressMic}
-            style={({ pressed }) => [styles.composerIconButton, pressed && styles.pressed]}
-            hitSlop={10}
-          >
-            <Ionicons name="mic-outline" size={20} color={COLORS.text} />
-          </Pressable>
 
           <Pressable
             onPress={props.onSend}
@@ -1992,7 +1949,8 @@ const styles = StyleSheet.create({
   composerOuter: {
     paddingHorizontal: 14,
     paddingTop: 10,
-    paddingBottom: 10,
+    paddingBottom: 16,
+    marginBottom: 10,
     backgroundColor: 'transparent',
   },
   composerInner: {
@@ -2000,8 +1958,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: COLORS.pill,
     borderRadius: 999,
-    paddingHorizontal: 10,
-    height: 48,
+    paddingHorizontal: 12,
+    height: 44,
     gap: 8,
   },
   composerIconButton: {
@@ -2016,13 +1974,13 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontSize: 15,
     fontFamily: FONT_SANS,
-    paddingHorizontal: 8,
+    paddingHorizontal: 10,
     paddingVertical: 0,
   },
   sendButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
     backgroundColor: COLORS.accent,
     alignItems: 'center',
     justifyContent: 'center',
