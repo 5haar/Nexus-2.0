@@ -627,6 +627,10 @@ export default function App() {
               onChangeChatInput={setChatInput}
               chatThinking={chatThinking}
               onSend={handleAsk}
+              onPressPlus={() => {
+                Keyboard.dismiss();
+                setRoute('import');
+              }}
             />
           ) : route === 'import' ? (
             <ImportScreen
@@ -922,6 +926,7 @@ function ChatScreen(props: {
   onChangeChatInput: (text: string) => void;
   chatThinking: boolean;
   onSend: () => void;
+  onPressPlus: () => void;
 }) {
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
@@ -1003,6 +1008,14 @@ function ChatScreen(props: {
         }}
       >
         <View style={styles.composerInner}>
+          <Pressable
+            onPress={props.onPressPlus}
+            style={({ pressed }) => [styles.composerIconButton, pressed && styles.pressed]}
+            hitSlop={10}
+          >
+            <Ionicons name="add" size={20} color={COLORS.text} />
+          </Pressable>
+
           <TextInput
             placeholder="Ask anything"
             placeholderTextColor={COLORS.muted2}
@@ -2004,16 +2017,17 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: COLORS.pill,
     borderRadius: 999,
-    paddingHorizontal: 12,
-    height: 44,
-    gap: 8,
+    paddingHorizontal: 18,
+    height: 48,
+    gap: 10,
   },
   composerIconButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
+    backgroundColor: 'rgba(15, 23, 42, 0.06)',
   },
   composerInput: {
     flex: 1,
@@ -2024,9 +2038,9 @@ const styles = StyleSheet.create({
     paddingVertical: 0,
   },
   sendButton: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     backgroundColor: COLORS.accent,
     alignItems: 'center',
     justifyContent: 'center',
