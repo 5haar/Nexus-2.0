@@ -3,6 +3,7 @@ import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as MediaLibrary from 'expo-media-library';
 import { useFonts } from 'expo-font';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ActivityIndicator,
   Alert,
@@ -90,7 +91,8 @@ const resolveApiBase = (configured: string) => {
   return trimmed;
 };
 
-const API_BASE = resolveApiBase(process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000');
+const DEFAULT_API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+const API_BASE_STORAGE_KEY = 'nexus.apiBase';
 
 const COLORS = {
   bg: '#ffffff',
@@ -121,10 +123,10 @@ const FONT_HEADING_EXTRABOLD = 'PlusJakartaSans_800ExtraBold';
 
 const randomId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-const resolveDocUri = (doc: ServerDoc) => {
+const resolveDocUri = (apiBase: string, doc: ServerDoc) => {
   if (!doc.uri) return null;
   if (doc.uri.startsWith('http')) return doc.uri;
-  return `${API_BASE}${doc.uri}`;
+  return `${apiBase}${doc.uri}`;
 };
 
 const toWsUrl = (base: string) => {
@@ -149,13 +151,13 @@ const ensureAssetUri = async (asset: MediaLibrary.Asset) => {
   return info.localUri ?? legacyLocalUri ?? asset.uri;
 };
 
-const apiFetch = async <T,>(path: string, init?: RequestInit): Promise<T> => {
+const apiFetch = async <T,>(apiBase: string, path: string, init?: RequestInit): Promise<T> => {
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}${path}`, init);
+    res = await fetch(`${apiBase}${path}`, init);
   } catch (err: any) {
     const detail = String(err?.message ?? err ?? '');
-    throw new Error(`Network request failed (API: ${API_BASE}).\n${detail}`.trim());
+    throw new Error(`Network request failed (API: ${apiBase}).\n${detail}`.trim());
   }
   if (!res.ok) {
     const detail = await res.text();
@@ -178,6 +180,10 @@ export default function App() {
 
   const [bootSplashVisible, setBootSplashVisible] = useState(true);
   const bootOpacity = useRef(new Animated.Value(1)).current;
+
+  const [apiBase, setApiBase] = useState(() => resolveApiBase(DEFAULT_API_BASE));
+  const [apiModalOpen, setApiModalOpen] = useState(false);
+  const [apiDraft, setApiDraft] = useState('');
 
   const { width } = useWindowDimensions();
   const isWide = width >= 860;
@@ -215,9 +221,38 @@ export default function App() {
     if (route !== 'categories') setActiveCategory(null);
   }, [route]);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stored = await AsyncStorage.getItem(API_BASE_STORAGE_KEY);
+        const resolved = resolveApiBase(stored || DEFAULT_API_BASE);
+        if (!cancelled) setApiBase(resolved);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const openApiModal = () => {
+    setApiDraft(apiBase);
+    setApiModalOpen(true);
+  };
+
+  const saveApiBase = async () => {
+    const next = apiDraft.trim().replace(/\/+$/, '');
+    if (!next) return;
+    setApiBase(next);
+    await AsyncStorage.setItem(API_BASE_STORAGE_KEY, next);
+    setApiModalOpen(false);
+  };
+
   const refreshDocs = async () => {
     try {
-      const data = await apiFetch<{ docs: ServerDoc[] }>('/api/docs');
+      const data = await apiFetch<{ docs: ServerDoc[] }>(apiBase, '/api/docs');
       setDocs(data.docs ?? []);
     } catch (err: any) {
       setUiError(err?.message ?? 'Failed to load stored documents');
@@ -323,11 +358,15 @@ export default function App() {
 
     let res: Response;
     try {
-      res = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: form });
+      res = await fetch(`${apiBase}/api/upload`, { method: 'POST', body: form });
     } catch (err: any) {
       const detail = String(err?.message ?? err ?? '');
+      Alert.alert('Network error', `Can’t reach your server at:\n${apiBase}`, [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Set API URL', onPress: openApiModal },
+      ]);
       throw new Error(
-        `Network request failed (API: ${API_BASE}). Make sure the server is reachable from your phone.\n${detail}`.trim(),
+        `Network request failed (API: ${apiBase}). Make sure the server is reachable from your phone.\n${detail}`.trim(),
       );
     }
     if (!res.ok) {
@@ -414,7 +453,7 @@ export default function App() {
 
     try {
       wsRef.current?.close();
-      const ws = new WebSocket(toWsUrl(API_BASE));
+      const ws = new WebSocket(toWsUrl(apiBase));
       wsRef.current = ws;
 
       await new Promise<void>((resolve, reject) => {
@@ -512,12 +551,13 @@ export default function App() {
   }, [docs, activeCategory]);
 
   const deleteDoc = async (docId: string) => {
-    await apiFetch<{ ok: boolean }>(`/api/docs/${encodeURIComponent(docId)}`, { method: 'DELETE' });
+    await apiFetch<{ ok: boolean }>(apiBase, `/api/docs/${encodeURIComponent(docId)}`, { method: 'DELETE' });
     setDocs((prev) => prev.filter((d) => d.id !== docId));
   };
 
   const deleteCategory = async (name: string, mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => {
     await apiFetch<{ ok: boolean }>(
+      apiBase,
       `/api/categories/${encodeURIComponent(name)}?mode=${encodeURIComponent(mode)}`,
       { method: 'DELETE' },
     );
@@ -561,12 +601,13 @@ export default function App() {
       <View style={[styles.shell, !isWide && styles.shellMobile]}>
         {isWide ? (
           <Sidebar
-            apiBase={API_BASE}
+            apiBase={apiBase}
             route={route}
             onNavigate={(next) => {
               setRoute(next);
               setMenuOpen(false);
             }}
+            onPressApi={openApiModal}
           />
         ) : (
           <AppHeader title={headerTitle} onOpenMenu={() => setMenuOpen(true)} />
@@ -599,6 +640,7 @@ export default function App() {
           ) : (
             <CategoriesScreen
               uiError={uiError}
+              apiBase={apiBase}
               categories={categories}
               activeCategory={activeCategory}
               onSetActiveCategory={setActiveCategory}
@@ -615,6 +657,7 @@ export default function App() {
                 try {
                   for (const name of names) {
                     await apiFetch<{ ok: boolean }>(
+                      apiBase,
                       `/api/categories/${encodeURIComponent(name)}?mode=${encodeURIComponent(mode)}`,
                       { method: 'DELETE' },
                     );
@@ -627,7 +670,7 @@ export default function App() {
                 }
               }}
               onRenameCategory={async (from, to) => {
-                await apiFetch<{ ok: boolean }>(`/api/categories/${encodeURIComponent(from)}`, {
+                await apiFetch<{ ok: boolean }>(apiBase, `/api/categories/${encodeURIComponent(from)}`, {
                   method: 'PATCH',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ to }),
@@ -650,7 +693,7 @@ export default function App() {
 
       {!isWide && (
         <HamburgerMenu
-          apiBase={API_BASE}
+          apiBase={apiBase}
           visible={menuOpen}
           route={route}
           onClose={() => setMenuOpen(false)}
@@ -658,6 +701,7 @@ export default function App() {
             setRoute(next);
             setMenuOpen(false);
           }}
+          onPressApi={openApiModal}
         />
       )}
 
@@ -678,6 +722,35 @@ export default function App() {
           <Text style={styles.bootTitle}>Nexus</Text>
         </Animated.View>
       )}
+
+      <Modal visible={apiModalOpen} transparent animationType="fade" onRequestClose={() => setApiModalOpen(false)}>
+        <View style={styles.renameBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setApiModalOpen(false)} />
+          <View style={styles.renameCard}>
+            <Text style={styles.renameTitle}>API base URL</Text>
+            <TextInput
+              value={apiDraft}
+              onChangeText={setApiDraft}
+              placeholder="http://192.168.0.5:4000"
+              placeholderTextColor={COLORS.muted2}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={styles.renameInput}
+            />
+            <View style={styles.renameActions}>
+              <Pressable
+                onPress={() => setApiModalOpen(false)}
+                style={({ pressed }) => [styles.renameButton, pressed && styles.pressed]}
+              >
+                <Text style={styles.renameButtonText}>Cancel</Text>
+              </Pressable>
+              <Pressable onPress={saveApiBase} style={({ pressed }) => [styles.renameButtonPrimary, pressed && styles.pressed]}>
+                <Text style={styles.renameButtonPrimaryText}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -713,7 +786,12 @@ function TopBar(props: { title: string }) {
   );
 }
 
-function Sidebar(props: { apiBase: string; route: RouteKey; onNavigate: (route: RouteKey) => void }) {
+function Sidebar(props: {
+  apiBase: string;
+  route: RouteKey;
+  onNavigate: (route: RouteKey) => void;
+  onPressApi?: () => void;
+}) {
   const items: { key: RouteKey; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
     { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' },
     { key: 'import', label: 'Import', icon: 'image-outline' },
@@ -757,9 +835,11 @@ function Sidebar(props: { apiBase: string; route: RouteKey; onNavigate: (route: 
 
       <View style={styles.sidebarFooter}>
         <Text style={styles.sidebarFooterLabel}>API</Text>
-        <Text style={styles.sidebarFooterValue} numberOfLines={2}>
-          {props.apiBase}
-        </Text>
+        <Pressable onPress={props.onPressApi} disabled={!props.onPressApi} style={({ pressed }) => pressed && styles.pressed}>
+          <Text style={styles.sidebarFooterValue} numberOfLines={2}>
+            {props.apiBase}
+          </Text>
+        </Pressable>
       </View>
     </View>
   );
@@ -771,6 +851,7 @@ function HamburgerMenu(props: {
   route: RouteKey;
   onClose: () => void;
   onNavigate: (route: RouteKey) => void;
+  onPressApi?: () => void;
 }) {
   return (
     <Modal visible={props.visible} transparent animationType="fade" onRequestClose={props.onClose}>
@@ -816,9 +897,11 @@ function HamburgerMenu(props: {
 
             <View style={styles.menuFooter}>
               <Text style={styles.menuFooterLabel}>API</Text>
-              <Text style={styles.menuFooterValue} numberOfLines={2}>
-                {props.apiBase}
-              </Text>
+              <Pressable onPress={props.onPressApi} disabled={!props.onPressApi} style={({ pressed }) => pressed && styles.pressed}>
+                <Text style={styles.menuFooterValue} numberOfLines={2}>
+                  {props.apiBase}
+                </Text>
+              </Pressable>
             </View>
           </View>
         </SafeAreaView>
@@ -1144,6 +1227,7 @@ function CategoriesEmptyState(props: { onRefresh: () => void }) {
 
 function CategoriesScreen(props: {
   uiError: string | null;
+  apiBase: string;
   categories: { name: string; count: number }[];
   activeCategory: string | null;
   onSetActiveCategory: (name: string | null) => void;
@@ -1266,7 +1350,7 @@ function CategoriesScreen(props: {
       }).start();
     }, [anim, p.index]);
     const scale = anim.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1] });
-    const uri = resolveDocUri(p.doc);
+    const uri = resolveDocUri(props.apiBase, p.doc);
 
     return (
       <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ scale }] }]}>
