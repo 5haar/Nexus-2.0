@@ -567,7 +567,7 @@ export default function App() {
   };
 
   const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : 'Categories';
-  const keyboardVerticalOffset = 0;
+  const keyboardVerticalOffset = Platform.OS === 'ios' ? -18 : 0;
 
   useEffect(() => {
     if (!fontsLoaded) return;
