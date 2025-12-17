@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "node --enable-source-maps dist/server.js",
+    "postinstall": "npm run build",
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
