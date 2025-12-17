@@ -236,6 +236,7 @@ export default function App() {
   const [apiBase, setApiBase] = useState(() => resolveApiBase(DEFAULT_API_BASE));
   const [apiModalOpen, setApiModalOpen] = useState(false);
   const [apiDraft, setApiDraft] = useState('');
+  const apiInputRef = useRef<TextInput | null>(null);
   const [userId, setUserId] = useState('');
 
   const { width } = useWindowDimensions();
@@ -314,6 +315,12 @@ export default function App() {
     setApiDraft(apiBase);
     setApiModalOpen(true);
   };
+
+  useEffect(() => {
+    if (!apiModalOpen) return;
+    const t = setTimeout(() => apiInputRef.current?.focus(), 50);
+    return () => clearTimeout(t);
+  }, [apiModalOpen]);
 
   const saveApiBase = async () => {
     const next = apiDraft.trim().replace(/\/+$/, '');
@@ -806,7 +813,10 @@ export default function App() {
             setRoute(next);
             setMenuOpen(false);
           }}
-          onPressApi={openApiModal}
+          onPressApi={() => {
+            setMenuOpen(false);
+            requestAnimationFrame(openApiModal);
+          }}
         />
       )}
 
@@ -834,12 +844,14 @@ export default function App() {
           <View style={styles.renameCard}>
             <Text style={styles.renameTitle}>API base URL</Text>
             <TextInput
+              ref={apiInputRef}
               value={apiDraft}
               onChangeText={setApiDraft}
               placeholder="http://192.168.0.5:4000"
               placeholderTextColor={COLORS.muted2}
               autoCapitalize="none"
               autoCorrect={false}
+              autoFocus
               style={styles.renameInput}
             />
             <View style={styles.renameActions}>
@@ -1003,10 +1015,15 @@ function HamburgerMenu(props: {
 
             <View style={styles.menuFooter}>
               <Text style={styles.menuFooterLabel}>API</Text>
-              <Pressable onPress={props.onPressApi} disabled={!props.onPressApi} style={({ pressed }) => pressed && styles.pressed}>
+              <Pressable
+                onPress={props.onPressApi}
+                style={({ pressed }) => [styles.menuFooterButton, pressed && styles.pressed]}
+                hitSlop={10}
+              >
                 <Text style={styles.menuFooterValue} numberOfLines={2}>
                   {props.apiBase}
                 </Text>
+                <Ionicons name="chevron-forward" size={16} color={COLORS.muted} />
               </Pressable>
             </View>
           </View>
@@ -1997,6 +2014,18 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     gap: 4,
   },
+  menuFooterButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    backgroundColor: COLORS.surfaceAlt,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
   menuFooterLabel: {
     color: COLORS.muted,
     fontSize: 11,
@@ -2009,6 +2038,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 16,
     fontFamily: FONT_SANS,
+    flex: 1,
   },
   screen: {
     flex: 1,
