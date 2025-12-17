@@ -11,7 +11,7 @@ import {
   Easing,
   FlatList,
   Image,
-  KeyboardAvoidingView,
+  Keyboard,
   Linking,
   Modal,
   NativeModules,
@@ -26,6 +26,7 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   Inter_400Regular,
   Inter_500Medium,
@@ -567,7 +568,6 @@ export default function App() {
   };
 
   const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : 'Categories';
-  const keyboardVerticalOffset = Platform.OS === 'ios' ? -18 : 0;
 
   useEffect(() => {
     if (!fontsLoaded) return;
@@ -586,19 +586,22 @@ export default function App() {
 
   if (!fontsLoaded) {
     return (
-      <SafeAreaView style={styles.safeArea}>
-        <StatusBar style="dark" />
-        <View style={styles.bootSplash}>
-          <Image source={require('./assets/icon.png')} style={styles.bootIcon} />
-          <Text style={styles.bootTitle}>Nexus</Text>
-        </View>
-      </SafeAreaView>
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.safeArea}>
+          <StatusBar style="dark" />
+          <View style={styles.bootSplash}>
+            <Image source={require('./assets/icon.png')} style={styles.bootIcon} />
+            <Text style={styles.bootTitle}>Nexus</Text>
+          </View>
+        </SafeAreaView>
+      </SafeAreaProvider>
     );
   }
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar style="dark" />
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar style="dark" />
 
       <View style={[styles.shell, !isWide && styles.shellMobile]}>
         {isWide ? (
@@ -624,7 +627,6 @@ export default function App() {
               onChangeChatInput={setChatInput}
               chatThinking={chatThinking}
               onSend={handleAsk}
-              keyboardVerticalOffset={keyboardVerticalOffset}
             />
           ) : route === 'import' ? (
             <ImportScreen
@@ -754,7 +756,8 @@ export default function App() {
           </View>
         </View>
       </Modal>
-    </SafeAreaView>
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 
@@ -919,14 +922,51 @@ function ChatScreen(props: {
   onChangeChatInput: (text: string) => void;
   chatThinking: boolean;
   onSend: () => void;
-  keyboardVerticalOffset: number;
 }) {
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
+  const keyboardAnim = useRef(new Animated.Value(0)).current;
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [composerHeight, setComposerHeight] = useState(0);
+
+  useEffect(() => {
+    const animateTo = (nextHeight: number, duration: number) => {
+      setKeyboardHeight(nextHeight);
+      Animated.timing(keyboardAnim, {
+        toValue: nextHeight,
+        duration,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    };
+
+    if (Platform.OS === 'ios') {
+      const sub = Keyboard.addListener('keyboardWillChangeFrame', (e) => {
+        const endScreenY = e.endCoordinates?.screenY ?? windowHeight;
+        const raw = Math.max(0, windowHeight - endScreenY);
+        const adjusted = Math.max(0, raw - insets.bottom);
+        animateTo(adjusted, e.duration ?? 250);
+      });
+      return () => sub.remove();
+    }
+
+    const show = Keyboard.addListener('keyboardDidShow', (e) => {
+      const raw = Math.max(0, e.endCoordinates?.height ?? 0);
+      const adjusted = Math.max(0, raw - insets.bottom);
+      animateTo(adjusted, 180);
+    });
+    const hide = Keyboard.addListener('keyboardDidHide', () => animateTo(0, 180));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, [insets.bottom, keyboardAnim, windowHeight]);
+
+  const translateY = Animated.multiply(keyboardAnim, -1);
+  const spacerHeight = Math.max(0, composerHeight + 8 + keyboardHeight);
+
   return (
-    <KeyboardAvoidingView
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      style={styles.screen}
-      keyboardVerticalOffset={props.keyboardVerticalOffset}
-    >
+    <View style={styles.screen}>
       <FlatList
         data={props.chatHistory}
         inverted
@@ -934,7 +974,7 @@ function ChatScreen(props: {
         contentContainerStyle={styles.chatList}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
-        ListHeaderComponent={null}
+        ListHeaderComponent={<View style={{ height: spacerHeight }} />}
         renderItem={({ item }) => {
           const isUser = item.role === 'user';
           return (
@@ -955,7 +995,13 @@ function ChatScreen(props: {
           );
         }}
       />
-      <View style={styles.composerOuter}>
+      <Animated.View
+        style={[styles.composerOuter, { transform: [{ translateY }] }]}
+        onLayout={(e) => {
+          const next = Math.round(e.nativeEvent.layout.height);
+          setComposerHeight((prev) => (prev === next ? prev : next));
+        }}
+      >
         <View style={styles.composerInner}>
           <TextInput
             placeholder="Ask anything"
@@ -980,8 +1026,8 @@ function ChatScreen(props: {
             <Ionicons name="arrow-up" size={18} color={COLORS.accentText} />
           </Pressable>
         </View>
-      </View>
-    </KeyboardAvoidingView>
+      </Animated.View>
+    </View>
   );
 }
 
