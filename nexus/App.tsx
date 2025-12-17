@@ -70,7 +70,13 @@ type ResolvedAsset = {
 const inferDevServerHost = () => {
   const scriptURL: string | undefined = (NativeModules as any)?.SourceCode?.scriptURL;
   if (!scriptURL) return null;
-  const match = scriptURL.match(/^https?:\/\/([^/:]+)(?::\d+)?\//);
+  try {
+    const url = new URL(scriptURL);
+    if (url.hostname) return url.hostname;
+  } catch {
+    // ignore
+  }
+  const match = scriptURL.match(/^(?:https?|exp|exps):\/\/([^/:]+)(?::\d+)?\//);
   return match?.[1] ?? null;
 };
 
