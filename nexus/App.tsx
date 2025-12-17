@@ -27,6 +27,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+import Markdown from 'react-native-markdown-display';
 import {
   Inter_400Regular,
   Inter_500Medium,
@@ -122,6 +123,52 @@ const FONT_SANS_EXTRABOLD = 'Inter_800ExtraBold';
 const FONT_HEADING_SEMIBOLD = 'PlusJakartaSans_600SemiBold';
 const FONT_HEADING_BOLD = 'PlusJakartaSans_700Bold';
 const FONT_HEADING_EXTRABOLD = 'PlusJakartaSans_800ExtraBold';
+
+const MONO_FONT = Platform.select({ ios: 'Menlo', android: 'monospace', default: 'monospace' });
+
+const MARKDOWN_STYLES = {
+  body: {
+    color: COLORS.text,
+    fontSize: 14,
+    lineHeight: 19,
+    fontFamily: FONT_SANS,
+  },
+  paragraph: {
+    marginTop: 0,
+    marginBottom: 10,
+  },
+  strong: {
+    fontFamily: FONT_SANS_BOLD,
+  },
+  em: {
+    fontStyle: 'italic',
+  },
+  bullet_list: {
+    marginVertical: 0,
+  },
+  ordered_list: {
+    marginVertical: 0,
+  },
+  list_item: {
+    marginBottom: 4,
+  },
+  bullet_list_icon: {
+    color: COLORS.text,
+  },
+  code_inline: {
+    fontFamily: MONO_FONT,
+    backgroundColor: 'rgba(15, 23, 42, 0.06)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+  },
+  fence: {
+    fontFamily: MONO_FONT,
+    backgroundColor: 'rgba(15, 23, 42, 0.06)',
+    padding: 10,
+    borderRadius: 12,
+  },
+} as const;
 
 const randomId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
@@ -768,15 +815,6 @@ export default function App() {
 function AppHeader(props: { title: string; onOpenMenu: () => void }) {
   return (
     <View style={styles.header}>
-      <View style={styles.brand}>
-        <View style={styles.brandIcon}>
-          <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
-        </View>
-        <Text style={styles.brandText}>Nexus</Text>
-      </View>
-      <Text pointerEvents="none" style={styles.headerTitle} numberOfLines={1}>
-        {props.title}
-      </Text>
       <Pressable
         onPress={props.onOpenMenu}
         style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
@@ -784,6 +822,15 @@ function AppHeader(props: { title: string; onOpenMenu: () => void }) {
       >
         <Ionicons name="menu" size={22} color={COLORS.text} />
       </Pressable>
+      <Text pointerEvents="none" style={styles.headerTitle} numberOfLines={1}>
+        {props.title}
+      </Text>
+      <View style={styles.brand}>
+        <View style={styles.brandIcon}>
+          <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
+        </View>
+        <Text style={styles.brandText}>Nexus</Text>
+      </View>
     </View>
   );
 }
@@ -933,6 +980,7 @@ function ChatScreen(props: {
   const keyboardAnim = useRef(new Animated.Value(0)).current;
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const [composerHeight, setComposerHeight] = useState(0);
+  const canSend = !!props.chatInput.trim() && !props.chatThinking;
 
   useEffect(() => {
     const animateTo = (nextHeight: number, duration: number) => {
@@ -994,7 +1042,13 @@ function ChatScreen(props: {
                 )}
               </View>
               <View style={[styles.messageBubble, isUser ? styles.messageBubbleUser : styles.messageBubbleAi]}>
-                <Text style={[styles.messageText, isUser && styles.messageTextUser]}>{item.text}</Text>
+                {isUser ? (
+                  <Text style={[styles.messageText, styles.messageTextUser]}>{item.text}</Text>
+                ) : (
+                  <Markdown style={MARKDOWN_STYLES} mergeStyle>
+                    {item.text}
+                  </Markdown>
+                )}
               </View>
             </View>
           );
@@ -1023,21 +1077,24 @@ function ChatScreen(props: {
               value={props.chatInput}
               onChangeText={props.onChangeChatInput}
               style={styles.composerInput}
-              multiline={false}
-              returnKeyType="send"
-              onSubmitEditing={props.onSend}
+              multiline
+              submitBehavior="newline"
+              returnKeyType="default"
+              blurOnSubmit={false}
             />
 
             <Pressable
               onPress={props.onSend}
               style={({ pressed }) => [
                 styles.sendButton,
-                (props.chatThinking || !props.chatInput.trim()) && styles.disabled,
+                canSend ? styles.sendButtonActive : styles.sendButtonInactive,
+                !canSend && styles.disabled,
                 pressed && styles.pressed,
               ]}
               hitSlop={10}
+              disabled={!canSend}
             >
-              <Ionicons name="arrow-up" size={18} color={COLORS.text} />
+              <Ionicons name="arrow-up" size={16} color={canSend ? COLORS.accentText : COLORS.muted} />
             </Pressable>
           </View>
         </View>
@@ -1780,7 +1837,7 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     textAlign: 'center',
-    paddingHorizontal: 92,
+    paddingHorizontal: 112,
   },
   brand: {
     flexDirection: 'row',
@@ -2046,12 +2103,17 @@ const styles = StyleSheet.create({
     paddingVertical: 0,
   },
   sendButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: 'rgba(15, 23, 42, 0.14)',
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  sendButtonInactive: {
+    backgroundColor: 'rgba(15, 23, 42, 0.12)',
+  },
+  sendButtonActive: {
+    backgroundColor: COLORS.accent,
   },
   row: {
     flexDirection: 'row',
