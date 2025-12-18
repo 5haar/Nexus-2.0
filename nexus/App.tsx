@@ -1803,7 +1803,7 @@ function ChatScreen(props: {
   return (
     <View style={styles.screen}>
       <Modal visible={scopeOpen} transparent animationType="fade" onRequestClose={() => setScopeOpen(false)}>
-        <View style={styles.scopeBackdrop}>
+        <View style={[styles.scopeBackdrop, { paddingBottom: 32 + insets.bottom }]}>
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setScopeOpen(false)} />
           <View style={styles.scopeCard}>
             <Text style={styles.scopeTitle}>Chat scope</Text>
