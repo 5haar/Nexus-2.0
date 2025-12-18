@@ -234,7 +234,7 @@ const ensureUploadUri = async (item: ResolvedAsset) => {
       const filename =
         info.filename ||
         item.filename ||
-        `${item.id}${item.mediaType === MediaLibrary.MediaType.video ? '.mp4' : '.jpg'}`;
+        `${item.id}.jpg`;
       const safeName = filename.replace(/[^\w.\-]/g, '_').slice(-80);
       const dest = `${cacheDir}/${item.id}-${safeName}`;
       if (candidate) {
@@ -249,6 +249,14 @@ const ensureUploadUri = async (item: ResolvedAsset) => {
   throw new Error(
     "This photo isn't available as a local file on the device. If it's in iCloud, open it in Photos to download it, then try again.",
   );
+};
+
+const inferImageContentType = (filename: string | null | undefined) => {
+  const name = String(filename ?? '').toLowerCase();
+  if (name.endsWith('.png')) return 'image/png';
+  if (name.endsWith('.heic') || name.endsWith('.heif')) return 'image/heic';
+  if (name.endsWith('.webp')) return 'image/webp';
+  return 'image/jpeg';
 };
 
 const apiFetch = async <T,>(apiBase: string, userId: string, path: string, init?: RequestInit): Promise<T> => {
@@ -550,6 +558,13 @@ export default function App() {
   }, [route, userId]);
 
   useEffect(() => {
+    if (route !== 'import') return;
+    if (screenshots.length) return;
+    if (loadingScreenshots) return;
+    void loadScreenshots();
+  }, [loadingScreenshots, route, screenshots.length]);
+
+  useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
@@ -655,29 +670,11 @@ export default function App() {
         return;
       }
 
-      let album: MediaLibrary.Album | null = null;
-      if (hasMediaLibraryAllAccess(currentPermission)) {
-        try {
-          album = await MediaLibrary.getAlbumAsync('Screenshots');
-        } catch {
-          album = null;
-        }
-      } else {
-        Alert.alert(
-          'Limited Photos access',
-          'Your Photos access is limited, so Nexus will show your allowed photos instead of the Screenshots album. To import all screenshots, enable Full Access in iOS Settings.',
-          [
-            { text: 'OK' },
-            { text: 'Open Settings', onPress: () => Linking.openSettings() },
-          ],
-        );
-      }
-
       const result = await MediaLibrary.getAssetsAsync({
-        ...(album ? { album } : {}),
         first: 60,
         sortBy: [MediaLibrary.SortBy.creationTime],
-        mediaType: [MediaLibrary.MediaType.photo, MediaLibrary.MediaType.video],
+        mediaType: [MediaLibrary.MediaType.photo],
+        mediaSubtypes: ['screenshot'],
       });
 
       const resolved = await Promise.all(
@@ -716,12 +713,14 @@ export default function App() {
   const uploadAssetToServer = async (item: ResolvedAsset) => {
     if (!userId) throw new Error('Missing user id');
     const uri = await ensureUploadUri(item);
+    const filename = item.filename || `${item.id}.jpg`;
+    const contentType = inferImageContentType(filename);
 
     const form = new FormData();
     form.append('file', {
       uri,
-      name: item.filename || `${item.id}.jpg`,
-      type: item.mediaType === MediaLibrary.MediaType.video ? 'video/mp4' : 'image/jpeg',
+      name: filename,
+      type: contentType,
     } as any);
     form.append('createdAt', String(item.createdAt ?? Date.now()));
 
@@ -1899,7 +1898,7 @@ function ImportScreen(props: {
             style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
           >
             <Ionicons name="image-outline" size={16} color={COLORS.text} />
-            <Text style={styles.pillButtonText}>{props.loadingScreenshots ? 'Loading…' : 'Import'}</Text>
+            <Text style={styles.pillButtonText}>{props.loadingScreenshots ? 'Loading…' : 'Load screenshots'}</Text>
           </Pressable>
         </View>
 
@@ -1938,7 +1937,7 @@ function ImportScreen(props: {
               <View style={styles.emptyCard}>
                 <Ionicons name="images-outline" size={26} color={COLORS.muted} />
                 <Text style={styles.emptyTitle}>No screenshots loaded</Text>
-                <Text style={styles.emptySubtitle}>Tap Import to load your latest screenshots.</Text>
+                <Text style={styles.emptySubtitle}>Tap Load screenshots to fetch your latest screenshots.</Text>
               </View>
             )}
           </View>
@@ -1964,11 +1963,6 @@ function ImportScreen(props: {
                   {stage === 'error' && (
                     <View style={[styles.assetLoader, styles.assetLoaderError]}>
                       <Ionicons name="alert-circle" size={16} color={COLORS.accentText} />
-                    </View>
-                  )}
-                  {item.mediaType === MediaLibrary.MediaType.video && (
-                    <View style={styles.videoBadge}>
-                      <Text style={styles.videoBadgeText}>VIDEO</Text>
                     </View>
                   )}
                 </Pressable>
@@ -3489,23 +3483,6 @@ const styles = StyleSheet.create({
   assetLoaderError: {
     backgroundColor: COLORS.danger,
     borderColor: 'rgba(185, 28, 28, 0.25)',
-  },
-  videoBadge: {
-    position: 'absolute',
-    bottom: 8,
-    left: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 10,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    borderColor: 'rgba(255,255,255,0.10)',
-    borderWidth: 1,
-  },
-  videoBadgeText: {
-    color: COLORS.accentText,
-    fontSize: 10,
-    fontFamily: FONT_SANS_EXTRABOLD,
-    letterSpacing: 0.6,
   },
   floatingBar: {
     position: 'absolute',

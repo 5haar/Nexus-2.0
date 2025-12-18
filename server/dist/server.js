@@ -952,6 +952,16 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const fileMime = req.file.mimetype || 'application/octet-stream';
     const isImage = fileMime.startsWith('image/');
     const isVideo = fileMime.startsWith('video/');
+    if (isVideo) {
+        try {
+            if (fs.existsSync(req.file.path))
+                fs.unlinkSync(req.file.path);
+        }
+        catch {
+            // ignore
+        }
+        return res.status(400).json({ error: 'Videos are not supported. Please upload screenshots (photos) only.' });
+    }
     try {
         let doc;
         if (isImage) {
@@ -977,38 +987,15 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
                 createdAt,
             };
         }
-        else if (isVideo) {
-            // Store video without analysis; categorize as "video" to keep it visible in folders.
-            const id = randomId();
-            doc = {
-                id,
-                userId,
-                filePath: req.file.path,
-                originalName: req.file.originalname,
-                fileMime,
-                mediaType: 'video',
-                caption: req.file.originalname,
-                categories: ['video'],
-                text: '',
-                embedding: [],
-                createdAt,
-            };
-        }
         else {
-            const id = randomId();
-            doc = {
-                id,
-                userId,
-                filePath: req.file.path,
-                originalName: req.file.originalname,
-                fileMime,
-                mediaType: 'other',
-                caption: req.file.originalname,
-                categories: ['other'],
-                text: '',
-                embedding: [],
-                createdAt,
-            };
+            try {
+                if (fs.existsSync(req.file.path))
+                    fs.unlinkSync(req.file.path);
+            }
+            catch {
+                // ignore
+            }
+            return res.status(400).json({ error: 'Only photos are supported. Please upload screenshots.' });
         }
         doc.storage = 'local';
         if (s3 && S3_BUCKET && doc.filePath) {
