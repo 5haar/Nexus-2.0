@@ -311,6 +311,7 @@ export default function App() {
   const [permission, setPermission] = useState<MediaLibrary.PermissionResponse | null>(null);
   const [loadingScreenshots, setLoadingScreenshots] = useState(false);
   const [screenshots, setScreenshots] = useState<ResolvedAsset[]>([]);
+  const importAutoLoadAttemptedRef = useRef(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [assetStageById, setAssetStageById] = useState<Record<string, 'uploading' | 'indexing' | 'done' | 'error'>>(
     {},
@@ -404,6 +405,16 @@ export default function App() {
   useEffect(() => {
     MediaLibrary.getPermissionsAsync(false).then((p) => setPermission(p));
   }, []);
+
+  useEffect(() => {
+    if (route !== 'import') {
+      importAutoLoadAttemptedRef.current = false;
+      return;
+    }
+    MediaLibrary.getPermissionsAsync(false)
+      .then((p) => setPermission(p))
+      .catch(() => {});
+  }, [route]);
 
   useEffect(() => {
     let cancelled = false;
@@ -559,10 +570,13 @@ export default function App() {
 
   useEffect(() => {
     if (route !== 'import') return;
+    if (importAutoLoadAttemptedRef.current) return;
     if (screenshots.length) return;
     if (loadingScreenshots) return;
+    if (!hasMediaLibraryReadAccess(permission)) return;
+    importAutoLoadAttemptedRef.current = true;
     void loadScreenshots();
-  }, [loadingScreenshots, route, screenshots.length]);
+  }, [loadingScreenshots, permission, route, screenshots.length]);
 
   useEffect(() => {
     let cancelled = false;
