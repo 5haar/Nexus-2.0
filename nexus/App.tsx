@@ -3319,7 +3319,7 @@ const styles = StyleSheet.create({
     opacity: 0.45,
   },
   composerOuter: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingTop: 8,
     paddingBottom: 8,
     marginBottom: 0,
@@ -3328,7 +3328,7 @@ const styles = StyleSheet.create({
   composerRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: 10,
   },
   plusButton: {
     width: 44,
