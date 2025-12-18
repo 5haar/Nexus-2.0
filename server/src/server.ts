@@ -60,7 +60,7 @@ const PORT = process.env.PORT || 4000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const VISION_MODEL = 'gpt-5.2';
 const EMBED_MODEL = 'text-embedding-3-small';
-const MAX_CATEGORIES_PER_DOC = Number(process.env.MAX_CATEGORIES_PER_DOC || 2);
+const MAX_CATEGORIES_PER_DOC = Number(process.env.MAX_CATEGORIES_PER_DOC || 1);
 const MAX_EXISTING_CATEGORIES_CONTEXT = Number(process.env.MAX_EXISTING_CATEGORIES_CONTEXT || 50);
 const RAG_TOPK_MAX = Number(process.env.RAG_TOPK_MAX || 6);
 const RAG_MIN_COSINE = Number(process.env.RAG_MIN_COSINE || 0.18);
@@ -628,8 +628,8 @@ const analyzeScreenshot = async (filePath: string, mime: string, existingCategor
           type: 'object',
           properties: {
             caption: { type: 'string' },
-            existingCategories: { type: 'array', items: { type: 'string' } },
-            newCategories: { type: 'array', items: { type: 'string' } },
+            existingCategories: { type: 'array', items: { type: 'string' }, maxItems: 1 },
+            newCategories: { type: 'array', items: { type: 'string' }, maxItems: 1 },
             text: { type: 'array', items: { type: 'string' } },
           },
           required: ['caption', 'existingCategories', 'newCategories', 'text'],
@@ -642,7 +642,7 @@ const analyzeScreenshot = async (filePath: string, mime: string, existingCategor
       {
         role: 'system',
         content:
-          'You summarize screenshots and categorize them. Extract on-screen text accurately. Choose at most 2 categories total, preferring existing categories when they fit.',
+          'You summarize screenshots and categorize them. Extract on-screen text accurately. Choose exactly 1 category per screenshot, preferring an existing category when it fits.',
       },
       {
         role: 'user',
@@ -653,9 +653,10 @@ const analyzeScreenshot = async (filePath: string, mime: string, existingCategor
               'Return JSON with caption, existingCategories, newCategories, text array.\n' +
               'Rules:\n' +
               '- Prefer the provided existing categories when a screenshot fits.\n' +
-              '- Output 1–2 categories total.\n' +
-              '- existingCategories must be picked verbatim from the provided list.\n' +
-              '- If none fit, put exactly 1 short, lowercase, thematic category in newCategories.\n' +
+              '- Output exactly 1 category total.\n' +
+              '- If a provided category fits, set existingCategories to a 1-item array (picked verbatim) and set newCategories to an empty array.\n' +
+              '- If none fit, set existingCategories to an empty array and set newCategories to a 1-item array.\n' +
+              '- The chosen category should be stable and reusable (not overly specific).\n' +
               '- Never include numbers, ids, timestamps, or list indices in categories.\n' +
               `Existing categories: ${JSON.stringify(safeExisting)}\n`,
           },
@@ -1157,10 +1158,8 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 	      const pickedNew = (analysis.newCategories ?? [])
 	        .map((c) => canonicalizeCategory(c))
 	        .filter((c) => !!c && !existingSet.has(c));
-	      const categories = Array.from(new Set([...pickedExisting, ...pickedNew])).slice(
-	        0,
-	        Math.max(1, Math.min(10, MAX_CATEGORIES_PER_DOC)),
-	      );
+	      const chosen = pickedExisting[0] || pickedNew[0] || 'unsorted';
+	      const categories = [chosen].slice(0, Math.max(1, Math.min(10, MAX_CATEGORIES_PER_DOC)));
 
 	      doc = {
 	        id,
