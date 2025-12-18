@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as Haptics from 'expo-haptics';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system';
 import { useFonts } from 'expo-font';
@@ -524,6 +525,20 @@ export default function App() {
     const active = nextThreads.find((t) => t.id === nextActive);
     setChatHistory(active?.messages ?? []);
     await persistThreads(nextThreads, nextActive);
+  };
+
+  const renameThreadById = async (threadId: string, nextTitle: string) => {
+    const title = nextTitle.trim();
+    if (!title) return;
+    const now = Date.now();
+    const current = threadsRef.current;
+    const exists = current.some((t) => t.id === threadId);
+    if (!exists) return;
+    const nextThreads = current.map((t) => (t.id === threadId ? { ...t, title, updatedAt: now } : t));
+    threadsRef.current = nextThreads;
+    setThreads(nextThreads);
+    const snapId = activeThreadIdRef.current || activeThreadId;
+    await persistThreads(nextThreads, snapId);
   };
 
   useEffect(() => {
@@ -1185,6 +1200,9 @@ export default function App() {
 	          onDeleteThread={async (threadId) => {
 	            await deleteThreadById(threadId);
 	          }}
+	          onRenameThread={async (threadId, nextTitle) => {
+	            await renameThreadById(threadId, nextTitle);
+	          }}
 	          onPressApi={() => {
 	            setMenuOpen(false);
 	            requestAnimationFrame(openApiModal);
@@ -1386,11 +1404,65 @@ function HamburgerMenu(props: {
   onSelectThread: (threadId: string) => void | Promise<void>;
   onNewThread?: () => void | Promise<void>;
   onDeleteThread?: (threadId: string) => void | Promise<void>;
+  onRenameThread?: (threadId: string, nextTitle: string) => void | Promise<void>;
   onPressApi?: () => void;
 }) {
   const [scrollViewportHeight, setScrollViewportHeight] = useState(0);
   const [scrollContentHeight, setScrollContentHeight] = useState(0);
   const scrollable = scrollContentHeight > scrollViewportHeight + 4;
+  const [threadMenuOpen, setThreadMenuOpen] = useState(false);
+  const [menuThreadId, setMenuThreadId] = useState<string>('');
+  const [renameThreadId, setRenameThreadId] = useState<string>('');
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameText, setRenameText] = useState('');
+  const renaming = useRef(false);
+  const currentThread = useMemo(() => props.threads.find((t) => t.id === menuThreadId) ?? null, [menuThreadId, props.threads]);
+
+  const openThreadMenu = useCallback(
+    async (threadId: string) => {
+      setMenuThreadId(threadId);
+      setThreadMenuOpen(true);
+      try {
+        await Haptics.selectionAsync();
+      } catch {
+        // ignore
+      }
+    },
+    [setMenuThreadId, setThreadMenuOpen],
+  );
+
+  const closeThreadMenu = useCallback(() => {
+    setThreadMenuOpen(false);
+    setMenuThreadId('');
+  }, []);
+
+  const openRename = useCallback(() => {
+    if (!props.onRenameThread) return;
+    const initial = currentThread?.title?.trim() || 'New chat';
+    setRenameText(initial);
+    setRenameThreadId(menuThreadId);
+    setRenameOpen(true);
+  }, [currentThread?.title, menuThreadId, props.onRenameThread]);
+
+  const runRename = useCallback(async () => {
+    if (!props.onRenameThread) return;
+    if (renaming.current) return;
+    const nextTitle = renameText.trim();
+    if (!nextTitle) {
+      Alert.alert('Invalid name', 'Please enter a thread name.');
+      return;
+    }
+    const threadId = renameThreadId;
+    if (!threadId) return;
+    renaming.current = true;
+    try {
+      await props.onRenameThread(threadId, nextTitle);
+      setRenameOpen(false);
+      setRenameThreadId('');
+    } finally {
+      renaming.current = false;
+    }
+  }, [props, renameText, renameThreadId]);
 
   return (
     <Modal visible={props.visible} transparent animationType="fade" onRequestClose={props.onClose}>
@@ -1456,14 +1528,8 @@ function HamburgerMenu(props: {
                         <Pressable
                           key={t.id}
                           onPress={() => props.onSelectThread(t.id)}
-                          onLongPress={() => {
-                            if (!props.onDeleteThread) return;
-                            Alert.alert('Delete thread?', 'This removes the thread from this device.', [
-                              { text: 'Cancel', style: 'cancel' },
-                              { text: 'Delete', style: 'destructive', onPress: () => props.onDeleteThread?.(t.id) },
-                            ]);
-                          }}
-                          delayLongPress={250}
+                          onLongPress={() => void openThreadMenu(t.id)}
+                          delayLongPress={180}
                           style={({ pressed }) => [
                             styles.threadItem,
                             isActive && styles.threadItemActive,
@@ -1510,6 +1576,88 @@ function HamburgerMenu(props: {
           </View>
         </SafeAreaView>
       </View>
+
+      <Modal visible={threadMenuOpen} transparent animationType="fade" onRequestClose={closeThreadMenu}>
+        <View style={styles.threadMenuBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={closeThreadMenu} />
+          <View style={styles.threadMenuCard}>
+            <Text style={styles.threadMenuTitle} numberOfLines={1}>
+              {currentThread?.title || 'Thread'}
+            </Text>
+            {!!props.onRenameThread && (
+              <Pressable
+                onPress={() => {
+                  setThreadMenuOpen(false);
+                  openRename();
+                }}
+                style={({ pressed }) => [styles.threadMenuRow, pressed && styles.pressed]}
+              >
+                <Text style={styles.threadMenuRowText}>Rename</Text>
+              </Pressable>
+            )}
+            {!!props.onDeleteThread && (
+              <Pressable
+                onPress={() => {
+                  const threadId = menuThreadId;
+                  closeThreadMenu();
+                  Alert.alert('Delete thread?', 'This removes the thread from this device.', [
+                    { text: 'Cancel', style: 'cancel' },
+                    { text: 'Delete', style: 'destructive', onPress: () => props.onDeleteThread?.(threadId) },
+                  ]);
+                }}
+                style={({ pressed }) => [styles.threadMenuRow, pressed && styles.pressed]}
+              >
+                <Text style={[styles.threadMenuRowText, styles.threadMenuRowTextDestructive]}>Delete</Text>
+              </Pressable>
+            )}
+            <View style={styles.threadMenuDivider} />
+            <Pressable onPress={closeThreadMenu} style={({ pressed }) => [styles.threadMenuRow, pressed && styles.pressed]}>
+              <Text style={styles.threadMenuRowText}>Cancel</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={renameOpen} transparent animationType="fade" onRequestClose={() => setRenameOpen(false)}>
+        <View style={styles.renameBackdrop}>
+          <Pressable
+            style={StyleSheet.absoluteFill}
+            onPress={() => {
+              setRenameOpen(false);
+              setRenameThreadId('');
+            }}
+          />
+          <View style={styles.renameCard}>
+            <Text style={styles.renameTitle}>Rename thread</Text>
+            <TextInput
+              value={renameText}
+              onChangeText={setRenameText}
+              placeholder="New name"
+              placeholderTextColor={COLORS.muted2}
+              autoCapitalize="sentences"
+              autoCorrect={false}
+              style={styles.renameInput}
+              autoFocus
+              returnKeyType="done"
+              onSubmitEditing={() => void runRename()}
+            />
+            <View style={styles.renameActions}>
+              <Pressable
+                onPress={() => {
+                  setRenameOpen(false);
+                  setRenameThreadId('');
+                }}
+                style={({ pressed }) => [styles.renameButton, pressed && styles.pressed]}
+              >
+                <Text style={styles.renameButtonText}>Cancel</Text>
+              </Pressable>
+              <Pressable onPress={() => void runRename()} style={({ pressed }) => [styles.renameButtonPrimary, pressed && styles.pressed]}>
+                <Text style={styles.renameButtonPrimaryText}>Save</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </Modal>
   );
 }
@@ -2692,6 +2840,43 @@ const styles = StyleSheet.create({
     fontSize: 11,
     marginTop: 2,
     fontFamily: FONT_SANS,
+  },
+  threadMenuBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.22)',
+    justifyContent: 'flex-end',
+    padding: 16,
+  },
+  threadMenuCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    overflow: 'hidden',
+  },
+  threadMenuTitle: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 6,
+  },
+  threadMenuRow: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  threadMenuRowText: {
+    color: COLORS.text,
+    fontSize: 16,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  threadMenuRowTextDestructive: {
+    color: COLORS.danger,
+  },
+  threadMenuDivider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: COLORS.border,
   },
   menuItem: {
     flexDirection: 'row',
