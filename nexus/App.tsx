@@ -113,6 +113,7 @@ const API_BASE_STORAGE_KEY = 'nexus.apiBase';
 const USER_ID_STORAGE_KEY = 'nexus.userId';
 const THREADS_STORAGE_KEY_PREFIX = 'nexus.threads.';
 const ACTIVE_THREAD_STORAGE_KEY_PREFIX = 'nexus.thread.active.';
+const TUTORIAL_SEEN_STORAGE_KEY = 'nexus.tutorialSeen.v1';
 
 const COLORS = {
   bg: '#ffffff',
@@ -290,6 +291,8 @@ export default function App() {
   const [apiDraft, setApiDraft] = useState('');
   const apiInputRef = useRef<TextInput | null>(null);
   const [userId, setUserId] = useState('');
+  const [tutorialOpen, setTutorialOpen] = useState(false);
+  const tutorialCheckedRef = useRef(false);
 
   const { width, height: windowHeight } = useWindowDimensions();
   const isWide = width >= 860;
@@ -595,6 +598,35 @@ export default function App() {
     if (!userId) return;
     refreshDocs();
   }, [apiBase, userId]);
+
+  useEffect(() => {
+    if (!fontsLoaded) return;
+    if (!userId) return;
+    if (tutorialCheckedRef.current) return;
+    tutorialCheckedRef.current = true;
+    (async () => {
+      try {
+        const seen = (await AsyncStorage.getItem(TUTORIAL_SEEN_STORAGE_KEY)) === '1';
+        if (!seen) setTutorialOpen(true);
+      } catch {
+        setTutorialOpen(true);
+      }
+    })();
+  }, [fontsLoaded, userId]);
+
+  const dismissTutorial = useCallback(async () => {
+    setTutorialOpen(false);
+    try {
+      await AsyncStorage.setItem(TUTORIAL_SEEN_STORAGE_KEY, '1');
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const goToImportFromTutorial = useCallback(async () => {
+    setRoute('import');
+    await dismissTutorial();
+  }, [dismissTutorial]);
 
   const handleRequestAccess = async () => {
     const response = await MediaLibrary.requestPermissionsAsync(false);
@@ -1065,6 +1097,11 @@ export default function App() {
     <SafeAreaProvider>
       <SafeAreaView style={styles.safeArea}>
         <StatusBar style="dark" />
+        <TutorialModal
+          visible={tutorialOpen}
+          onClose={() => void dismissTutorial()}
+          onGoToImport={() => void goToImportFromTutorial()}
+        />
 
       <View style={[styles.shell, !isWide && styles.shellMobile]}>
 	        {isWide ? (
@@ -2567,6 +2604,66 @@ function CategoriesScreen(props: {
   );
 }
 
+function TutorialModal(props: { visible: boolean; onClose: () => void; onGoToImport: () => void }) {
+  return (
+    <Modal visible={props.visible} transparent animationType="fade" onRequestClose={props.onClose}>
+      <View style={styles.tutorialBackdrop}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={props.onClose} />
+        <View style={styles.tutorialCard}>
+          <View style={styles.tutorialHeader}>
+            <View style={styles.tutorialIcon}>
+              <Ionicons name="sparkles" size={18} color={COLORS.accentText} />
+            </View>
+            <Text style={styles.tutorialTitle}>Welcome to Nexus</Text>
+            <Text style={styles.tutorialSubtitle}>Index your screenshots, then chat with them.</Text>
+          </View>
+
+          <View style={styles.tutorialSteps}>
+            <View style={styles.tutorialStepRow}>
+              <View style={styles.tutorialStepDot}>
+                <Text style={styles.tutorialStepDotText}>1</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.tutorialStepTitle}>Import screenshots</Text>
+                <Text style={styles.tutorialStepBody}>Tap + in chat (or Import in the menu) to load your latest screenshots.</Text>
+              </View>
+            </View>
+
+            <View style={styles.tutorialStepRow}>
+              <View style={styles.tutorialStepDot}>
+                <Text style={styles.tutorialStepDotText}>2</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.tutorialStepTitle}>Index to your server</Text>
+                <Text style={styles.tutorialStepBody}>Select screenshots and index them so Nexus can search them.</Text>
+              </View>
+            </View>
+
+            <View style={styles.tutorialStepRow}>
+              <View style={styles.tutorialStepDot}>
+                <Text style={styles.tutorialStepDotText}>3</Text>
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.tutorialStepTitle}>Ask questions</Text>
+                <Text style={styles.tutorialStepBody}>Back in Chat, ask anything. Nexus will retrieve matching screenshots.</Text>
+              </View>
+            </View>
+          </View>
+
+          <View style={styles.tutorialActions}>
+            <Pressable onPress={props.onClose} style={({ pressed }) => [styles.renameButton, pressed && styles.pressed]}>
+              <Text style={styles.renameButtonText}>Got it</Text>
+            </Pressable>
+            <Pressable onPress={props.onGoToImport} style={({ pressed }) => [styles.renameButtonPrimary, pressed && styles.pressed]}>
+              <Text style={styles.renameButtonPrimaryText}>Go to Import</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
@@ -2596,6 +2693,86 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontFamily: FONT_HEADING_BOLD,
     letterSpacing: -0.2,
+  },
+  tutorialBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.26)',
+    padding: 18,
+    justifyContent: 'center',
+  },
+  tutorialCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    padding: 16,
+  },
+  tutorialHeader: {
+    alignItems: 'center',
+    gap: 6,
+    paddingBottom: 10,
+  },
+  tutorialIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.accent,
+  },
+  tutorialTitle: {
+    color: COLORS.text,
+    fontSize: 18,
+    fontFamily: FONT_HEADING_BOLD,
+  },
+  tutorialSubtitle: {
+    color: COLORS.muted,
+    fontSize: 13,
+    textAlign: 'center',
+    fontFamily: FONT_SANS,
+  },
+  tutorialSteps: {
+    gap: 12,
+    paddingVertical: 10,
+  },
+  tutorialStepRow: {
+    flexDirection: 'row',
+    gap: 12,
+    alignItems: 'flex-start',
+  },
+  tutorialStepDot: {
+    width: 26,
+    height: 26,
+    borderRadius: 10,
+    backgroundColor: COLORS.pill,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 1,
+  },
+  tutorialStepDotText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontFamily: FONT_SANS_BOLD,
+  },
+  tutorialStepTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  tutorialStepBody: {
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 2,
+    fontFamily: FONT_SANS,
+    lineHeight: 16,
+  },
+  tutorialActions: {
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'flex-end',
+    paddingTop: 6,
   },
   glowLayer: {
     ...StyleSheet.absoluteFillObject,
