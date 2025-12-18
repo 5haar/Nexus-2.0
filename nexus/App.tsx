@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as MediaLibrary from 'expo-media-library';
+import * as FileSystem from 'expo-file-system';
 import { useFonts } from 'expo-font';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
@@ -15,6 +16,7 @@ import {
   Linking,
   Modal,
   NativeModules,
+  PanResponder,
   Platform,
   Pressable,
   SafeAreaView,
@@ -26,6 +28,7 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import Svg, { Path } from 'react-native-svg';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import Markdown from 'react-native-markdown-display';
 import {
@@ -52,11 +55,22 @@ type ServerDoc = {
   mediaType?: string;
 };
 
+type CategorySummary = { name: string; count: number; updatedAt: number };
+
 type ChatEntry = {
   id: string;
   role: 'user' | 'assistant';
   text: string;
   streaming?: boolean;
+  sources?: ServerDoc[];
+};
+
+type ChatThread = {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  messages: ChatEntry[]; // newest-first (same order as chatHistory)
 };
 
 type RouteKey = 'chat' | 'import' | 'categories';
@@ -96,6 +110,8 @@ const resolveApiBase = (configured: string) => {
 const DEFAULT_API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
 const API_BASE_STORAGE_KEY = 'nexus.apiBase';
 const USER_ID_STORAGE_KEY = 'nexus.userId';
+const THREADS_STORAGE_KEY_PREFIX = 'nexus.threads.';
+const ACTIVE_THREAD_STORAGE_KEY_PREFIX = 'nexus.thread.active.';
 
 const COLORS = {
   bg: '#ffffff',
@@ -201,6 +217,38 @@ const ensureAssetUri = async (asset: MediaLibrary.Asset) => {
   return info.localUri ?? legacyLocalUri ?? asset.uri;
 };
 
+const ensureUploadUri = async (item: ResolvedAsset) => {
+  const info = await MediaLibrary.getAssetInfoAsync(item.asset);
+  const legacyLocalUri = (item.asset as any).localUri as string | undefined;
+  const candidate = info.localUri ?? legacyLocalUri ?? item.uri ?? info.uri ?? item.asset.uri;
+  if (candidate?.startsWith('file://')) return candidate;
+
+  // Best effort: copy to cache. (Some URI schemes like `ph://` may not be readable by FileSystem.)
+  try {
+    const base = FileSystem.Paths.cache.uri;
+    if (base) {
+      const cacheDir = `${base}nexus_uploads`;
+      await FileSystem.makeDirectoryAsync(cacheDir, { intermediates: true }).catch(() => {});
+      const filename =
+        info.filename ||
+        item.filename ||
+        `${item.id}${item.mediaType === MediaLibrary.MediaType.video ? '.mp4' : '.jpg'}`;
+      const safeName = filename.replace(/[^\w.\-]/g, '_').slice(-80);
+      const dest = `${cacheDir}/${item.id}-${safeName}`;
+      if (candidate) {
+        await FileSystem.copyAsync({ from: candidate, to: dest });
+        return dest;
+      }
+    }
+  } catch {
+    // ignore; fall through to error
+  }
+
+  throw new Error(
+    "This photo isn't available as a local file on the device. If it's in iCloud, open it in Photos to download it, then try again.",
+  );
+};
+
 const apiFetch = async <T,>(apiBase: string, userId: string, path: string, init?: RequestInit): Promise<T> => {
   let res: Response;
   try {
@@ -217,6 +265,9 @@ const apiFetch = async <T,>(apiBase: string, userId: string, path: string, init?
   }
   return (await res.json()) as T;
 };
+
+const threadsKey = (userId: string) => `${THREADS_STORAGE_KEY_PREFIX}${userId}`;
+const activeThreadKey = (userId: string) => `${ACTIVE_THREAD_STORAGE_KEY_PREFIX}${userId}`;
 
 export default function App() {
   const [fontsLoaded] = useFonts({
@@ -239,7 +290,7 @@ export default function App() {
   const apiInputRef = useRef<TextInput | null>(null);
   const [userId, setUserId] = useState('');
 
-  const { width } = useWindowDimensions();
+  const { width, height: windowHeight } = useWindowDimensions();
   const isWide = width >= 860;
 
   const [route, setRoute] = useState<RouteKey>('chat');
@@ -247,23 +298,96 @@ export default function App() {
 
   const [permission, setPermission] = useState<MediaLibrary.PermissionResponse | null>(null);
   const [loadingScreenshots, setLoadingScreenshots] = useState(false);
-  const [processing, setProcessing] = useState(false);
   const [screenshots, setScreenshots] = useState<ResolvedAsset[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [assetStageById, setAssetStageById] = useState<Record<string, 'uploading' | 'indexing' | 'done' | 'error'>>(
     {},
   );
+  const importQueueRef = useRef<ResolvedAsset[]>([]);
+  const importRunningRef = useRef(false);
+  const importSessionRef = useRef<{ total: number; done: number; failed: number } | null>(null);
+  const [importProgress, setImportProgress] = useState<{
+    running: boolean;
+    current: number;
+    total: number;
+    done: number;
+    failed: number;
+  }>({ running: false, current: 0, total: 0, done: 0, failed: 0 });
 
   const [docs, setDocs] = useState<ServerDoc[]>([]);
   const [uiError, setUiError] = useState<string | null>(null);
 
   const [chatInput, setChatInput] = useState('');
   const [chatHistory, setChatHistory] = useState<ChatEntry[]>([]);
+  const [threads, setThreads] = useState<ChatThread[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState('');
   const [chatThinking, setChatThinking] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const threadsRef = useRef<ChatThread[]>([]);
+  const activeThreadIdRef = useRef('');
 
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
   const [viewerUri, setViewerUri] = useState<string | null>(null);
+  const [viewerNatural, setViewerNatural] = useState<{ w: number; h: number } | null>(null);
+  const viewerPanY = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    threadsRef.current = threads;
+  }, [threads]);
+  useEffect(() => {
+    activeThreadIdRef.current = activeThreadId;
+  }, [activeThreadId]);
+
+  const closeViewer = useCallback(() => setViewerUri(null), []);
+
+  useEffect(() => {
+    viewerPanY.setValue(0);
+    setViewerNatural(null);
+  }, [viewerPanY, viewerUri]);
+
+  const dismissViewer = useCallback(() => {
+    Animated.timing(viewerPanY, {
+      toValue: windowHeight,
+      duration: 180,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start(() => {
+      viewerPanY.setValue(0);
+      closeViewer();
+    });
+  }, [closeViewer, viewerPanY, windowHeight]);
+
+  const viewerPanResponder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: (_evt, g) => Math.abs(g.dy) > 6 || Math.abs(g.dx) > 6,
+        onPanResponderMove: (_evt, g) => {
+          if (g.dy < 0) return;
+          viewerPanY.setValue(g.dy);
+        },
+        onPanResponderRelease: (_evt, g) => {
+          const isTap = Math.abs(g.dx) < 6 && Math.abs(g.dy) < 6;
+          if (isTap) return dismissViewer();
+          const shouldDismiss = g.dy > 120 || g.vy > 0.9;
+          if (shouldDismiss) return dismissViewer();
+          Animated.spring(viewerPanY, { toValue: 0, useNativeDriver: true }).start();
+        },
+        onPanResponderTerminate: () => {
+          Animated.spring(viewerPanY, { toValue: 0, useNativeDriver: true }).start();
+        },
+      }),
+    [dismissViewer, viewerPanY],
+  );
+
+  const viewerCardDims = useMemo(() => {
+    const maxW = Math.max(220, Math.min(width - 32, Math.round(width * 0.92)));
+    const maxH = Math.max(260, Math.min(windowHeight - 180, Math.round(windowHeight * 0.72)));
+    const w0 = Math.max(1, viewerNatural?.w ?? maxW);
+    const h0 = Math.max(1, viewerNatural?.h ?? maxH);
+    const scale = Math.min(maxW / w0, maxH / h0, 1);
+    return { w: Math.round(w0 * scale), h: Math.round(h0 * scale) };
+  }, [viewerNatural, width, windowHeight]);
 
   useEffect(() => {
     MediaLibrary.getPermissionsAsync(false).then((p) => setPermission(p));
@@ -289,6 +413,118 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const rawThreads = await AsyncStorage.getItem(threadsKey(userId));
+        const parsed = rawThreads ? (JSON.parse(rawThreads) as ChatThread[]) : [];
+        const safeThreads = Array.isArray(parsed)
+          ? parsed
+              .filter((t) => t && typeof (t as any).id === 'string')
+              .map((t) => ({
+                id: String((t as any).id),
+                title: String((t as any).title ?? 'New chat'),
+                createdAt: Number((t as any).createdAt ?? Date.now()),
+                updatedAt: Number((t as any).updatedAt ?? Date.now()),
+                messages: Array.isArray((t as any).messages) ? ((t as any).messages as ChatEntry[]) : [],
+              }))
+          : [];
+
+        const activeStored = (await AsyncStorage.getItem(activeThreadKey(userId)))?.trim() ?? '';
+        let nextActive = activeStored && safeThreads.some((t) => t.id === activeStored) ? activeStored : '';
+
+        let nextThreads = safeThreads;
+        if (!nextThreads.length) {
+          const now = Date.now();
+          const id = randomId();
+          nextThreads = [{ id, title: 'New chat', createdAt: now, updatedAt: now, messages: [] }];
+          nextActive = id;
+          await AsyncStorage.setItem(threadsKey(userId), JSON.stringify(nextThreads));
+          await AsyncStorage.setItem(activeThreadKey(userId), nextActive);
+        } else if (!nextActive) {
+          nextActive = nextThreads.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0]?.id ?? nextThreads[0]!.id;
+          await AsyncStorage.setItem(activeThreadKey(userId), nextActive);
+        }
+
+        if (cancelled) return;
+        setThreads(nextThreads);
+        setActiveThreadId(nextActive);
+        const active = nextThreads.find((t) => t.id === nextActive);
+        setChatHistory(active?.messages ?? []);
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+
+  const persistThreads = async (nextThreads: ChatThread[], nextActiveId: string) => {
+    if (!userId) return;
+    try {
+      await AsyncStorage.setItem(threadsKey(userId), JSON.stringify(nextThreads));
+      await AsyncStorage.setItem(activeThreadKey(userId), nextActiveId);
+    } catch {
+      // ignore
+    }
+  };
+
+  const selectThread = async (threadId: string) => {
+    const thread = threads.find((t) => t.id === threadId);
+    if (!thread) return;
+    setActiveThreadId(threadId);
+    setChatHistory(thread.messages ?? []);
+    await persistThreads(threads, threadId);
+  };
+
+  const createThread = async () => {
+    const now = Date.now();
+    const id = randomId();
+    const next: ChatThread = { id, title: 'New chat', createdAt: now, updatedAt: now, messages: [] };
+    const nextThreads = [next, ...threads];
+    setThreads(nextThreads);
+    setActiveThreadId(id);
+    setChatHistory([]);
+    await persistThreads(nextThreads, id);
+  };
+
+  const handleCreateThread = async () => {
+    try {
+      Keyboard.dismiss();
+    } catch {
+      // ignore
+    }
+    await createThread();
+  };
+
+  const deleteThreadById = async (threadId: string) => {
+    const nextThreads = threads.filter((t) => t.id !== threadId);
+    const nextActive =
+      threadId === activeThreadId
+        ? nextThreads.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0]?.id ?? ''
+        : activeThreadId;
+
+    if (!nextThreads.length) {
+      const now = Date.now();
+      const id = randomId();
+      const fresh: ChatThread = { id, title: 'New chat', createdAt: now, updatedAt: now, messages: [] };
+      setThreads([fresh]);
+      setActiveThreadId(id);
+      setChatHistory([]);
+      await persistThreads([fresh], id);
+      return;
+    }
+
+    setThreads(nextThreads);
+    setActiveThreadId(nextActive);
+    const active = nextThreads.find((t) => t.id === nextActive);
+    setChatHistory(active?.messages ?? []);
+    await persistThreads(nextThreads, nextActive);
+  };
 
   useEffect(() => {
     if (route === 'categories' && userId) refreshDocs();
@@ -432,8 +668,7 @@ export default function App() {
 
   const uploadAssetToServer = async (item: ResolvedAsset) => {
     if (!userId) throw new Error('Missing user id');
-    const uri = item.uri || (await ensureAssetUri(item.asset));
-    if (!uri) throw new Error('No local URI for asset');
+    const uri = await ensureUploadUri(item);
 
     const form = new FormData();
     form.append('file', {
@@ -445,20 +680,18 @@ export default function App() {
 
     let res: Response;
     try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3 * 60 * 1000);
       res = await fetch(`${apiBase}/api/upload`, {
         method: 'POST',
         headers: { 'x-nexus-user-id': userId },
         body: form,
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
     } catch (err: any) {
       const detail = String(err?.message ?? err ?? '');
-      Alert.alert('Network error', `Can’t reach your server at:\n${apiBase}`, [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Set API URL', onPress: openApiModal },
-      ]);
-      throw new Error(
-        `Network request failed (API: ${apiBase}). Make sure the server is reachable from your phone.\n${detail}`.trim(),
-      );
+      throw new Error(`Network request failed (API: ${apiBase}). Make sure the server is reachable from your phone.\n${detail}`.trim());
     }
     if (!res.ok) {
       const detail = await res.text();
@@ -468,39 +701,85 @@ export default function App() {
     return json.doc as ServerDoc;
   };
 
+  const startImportRunnerIfNeeded = () => {
+    if (importRunningRef.current) return;
+    importRunningRef.current = true;
+
+    void (async () => {
+      try {
+        if (!importSessionRef.current) {
+          importSessionRef.current = { total: importQueueRef.current.length, done: 0, failed: 0 };
+        }
+
+        while (importQueueRef.current.length) {
+          const session = importSessionRef.current!;
+          const nextIndex = session.done + session.failed + 1;
+          const item = importQueueRef.current.shift()!;
+
+          setImportProgress({ running: true, current: nextIndex, total: session.total, done: session.done, failed: session.failed });
+          setAssetStageById((prev) => ({ ...prev, [item.id]: 'uploading' }));
+
+          try {
+            const uploaded = await uploadAssetToServer(item);
+            setAssetStageById((prev) => ({ ...prev, [item.id]: 'done' }));
+            session.done += 1;
+            setDocs((prev) => [uploaded, ...prev]);
+          } catch (err: any) {
+            const message = err?.message ?? 'Upload failed';
+            setAssetStageById((prev) => ({ ...prev, [item.id]: 'error' }));
+            session.failed += 1;
+            if (typeof message === 'string' && /network request failed|can[’']?t reach|timed out|AbortError/i.test(message)) {
+              setUiError((prev) => prev ?? message);
+            }
+          }
+        }
+      } finally {
+        importRunningRef.current = false;
+        const session = importSessionRef.current;
+        if (!session) {
+          setImportProgress({ running: false, current: 0, total: 0, done: 0, failed: 0 });
+          return;
+        }
+
+        if (importQueueRef.current.length === 0) {
+          setImportProgress({ running: false, current: 0, total: session.total, done: session.done, failed: session.failed });
+          importSessionRef.current = null;
+        } else {
+          // Paused due to network error; keep session state for resume.
+          setImportProgress({ running: false, current: 0, total: session.total, done: session.done, failed: session.failed });
+        }
+      }
+    })();
+  };
+
+  const enqueueImport = (items: ResolvedAsset[]) => {
+    if (!items.length) return;
+    if (!importSessionRef.current) {
+      importSessionRef.current = { total: 0, done: 0, failed: 0 };
+      setImportProgress({ running: false, current: 0, total: 0, done: 0, failed: 0 });
+    }
+
+    const session = importSessionRef.current!;
+    const existing = new Set(importQueueRef.current.map((i) => i.id));
+    const deduped = items.filter((i) => !existing.has(i.id));
+    if (!deduped.length) return;
+
+    importQueueRef.current.push(...deduped);
+    session.total += deduped.length;
+    setImportProgress((prev) => ({ ...prev, total: session.total, done: session.done, failed: session.failed }));
+    startImportRunnerIfNeeded();
+  };
+
   const handleSendToAI = async () => {
-    if (!selected.size || processing) return;
+    if (!selected.size) return;
     if (!userId) {
       Alert.alert('Just a sec', 'Finishing setup… please try again.');
       return;
     }
-    setProcessing(true);
     setUiError(null);
-    try {
-      const targets = screenshots.filter((s) => selected.has(s.id)).slice(0, 10);
-      const uploaded: ServerDoc[] = [];
-      for (const asset of targets) {
-        setAssetStageById((prev) => ({ ...prev, [asset.id]: 'uploading' }));
-        const stageTimer = setTimeout(() => {
-          setAssetStageById((prev) => (prev[asset.id] === 'uploading' ? { ...prev, [asset.id]: 'indexing' } : prev));
-        }, 550);
-        try {
-          uploaded.push(await uploadAssetToServer(asset));
-          setAssetStageById((prev) => ({ ...prev, [asset.id]: 'done' }));
-        } catch (err) {
-          setAssetStageById((prev) => ({ ...prev, [asset.id]: 'error' }));
-          throw err;
-        } finally {
-          clearTimeout(stageTimer);
-        }
-      }
-      if (uploaded.length) setDocs((prev) => [...uploaded, ...prev]);
-      setSelected(new Set());
-    } catch (err: any) {
-      setUiError(err?.message ?? 'Failed to process screenshots');
-    } finally {
-      setProcessing(false);
-    }
+    const targets = screenshots.filter((s) => selected.has(s.id));
+    enqueueImport(targets);
+    setSelected(new Set());
   };
 
   const handleAsk = async () => {
@@ -516,7 +795,41 @@ export default function App() {
 
     const userEntry: ChatEntry = { id: randomId(), role: 'user', text: prompt };
     const assistantId = randomId();
-    setChatHistory((prev) => [{ id: assistantId, role: 'assistant', text: '', streaming: true }, userEntry, ...prev]);
+    const threadId = activeThreadIdRef.current || activeThreadId || randomId();
+    if (!activeThreadIdRef.current) {
+      activeThreadIdRef.current = threadId;
+      setActiveThreadId(threadId);
+    }
+
+    const assistantStub: ChatEntry = { id: assistantId, role: 'assistant', text: '', streaming: true };
+    setChatHistory((prev) => [assistantStub, userEntry, ...prev]);
+    setThreads((prev) => {
+      const now = Date.now();
+      const idx = prev.findIndex((t) => t.id === threadId);
+      const titleGuess = prompt.split(/\s+/).slice(0, 8).join(' ').slice(0, 42) || 'New chat';
+      if (idx === -1) {
+        const thread: ChatThread = {
+          id: threadId,
+          title: titleGuess,
+          createdAt: now,
+          updatedAt: now,
+          messages: [assistantStub, userEntry],
+        };
+        return [thread, ...prev];
+      }
+      const current = prev[idx]!;
+      const title =
+        current.title && current.title !== 'New chat' ? current.title : current.messages.length ? current.title : titleGuess;
+      const updated: ChatThread = {
+        ...current,
+        title,
+        updatedAt: now,
+        messages: [assistantStub, userEntry, ...(current.messages ?? [])],
+      };
+      const next = prev.slice();
+      next[idx] = updated;
+      return next;
+    });
 
     const updateAssistant = (text: string) => {
       setChatHistory((prev) => {
@@ -524,10 +837,39 @@ export default function App() {
         if (existing) return prev.map((e) => (e.id === assistantId ? { ...e, text } : e));
         return [{ id: assistantId, role: 'assistant', text, streaming: true }, ...prev];
       });
+      setThreads((prev) =>
+        prev.map((t) =>
+          t.id === threadId
+            ? { ...t, updatedAt: Date.now(), messages: (t.messages ?? []).map((m) => (m.id === assistantId ? { ...m, text } : m)) }
+            : t,
+        ),
+      );
     };
 
     const setAssistantStreaming = (streaming: boolean) => {
       setChatHistory((prev) => prev.map((e) => (e.id === assistantId ? { ...e, streaming } : e)));
+      setThreads((prev) =>
+        prev.map((t) =>
+          t.id === threadId
+            ? {
+                ...t,
+                updatedAt: Date.now(),
+                messages: (t.messages ?? []).map((m) => (m.id === assistantId ? { ...m, streaming } : m)),
+              }
+            : t,
+        ),
+      );
+    };
+
+    const setAssistantSources = (sources: ServerDoc[]) => {
+      setChatHistory((prev) => prev.map((e) => (e.id === assistantId ? { ...e, sources } : e)));
+      setThreads((prev) =>
+        prev.map((t) =>
+          t.id === threadId
+            ? { ...t, updatedAt: Date.now(), messages: (t.messages ?? []).map((m) => (m.id === assistantId ? { ...m, sources } : m)) }
+            : t,
+        ),
+      );
     };
 
     let assistantText = '';
@@ -560,17 +902,19 @@ export default function App() {
           ws.send(JSON.stringify({ type: 'search', query: prompt, userId }));
         };
 
-        ws.onmessage = (evt) => {
-          let parsed: any;
-          try {
-            parsed = JSON.parse(String(evt.data));
-          } catch {
-            return;
-          }
+	        ws.onmessage = (evt) => {
+	          let parsed: any;
+	          try {
+	            parsed = JSON.parse(String(evt.data));
+	          } catch {
+	            return;
+	          }
 
-          if (parsed.type === 'matches') {
-            return;
-          }
+	          if (parsed.type === 'matches') {
+	            const matches = Array.isArray(parsed.matches) ? (parsed.matches as ServerDoc[]) : [];
+	            if (matches.length) setAssistantSources(matches.slice(0, 8));
+	            return;
+	          }
 
           if (parsed.type === 'info') {
             const msg = String(parsed.message ?? '').trim();
@@ -581,11 +925,11 @@ export default function App() {
             return;
           }
 
-          if (parsed.type === 'chunk') {
-            assistantText += parsed.text ?? '';
-            scheduleFlush();
-          } else if (parsed.type === 'done') {
-            doneReceived = true;
+	          if (parsed.type === 'chunk') {
+	            assistantText += parsed.text ?? '';
+	            scheduleFlush();
+	          } else if (parsed.type === 'done') {
+	            doneReceived = true;
             scheduleFlush();
             finishOnce(() => {
               setAssistantStreaming(false);
@@ -619,28 +963,32 @@ export default function App() {
       setUiError(message);
       Alert.alert('Chat error', message);
       setAssistantStreaming(false);
-    } finally {
-      setChatThinking(false);
-      if (!assistantText) {
-        assistantText = 'No response (nothing indexed yet?). Go to Import and index screenshots first.';
-        scheduleFlush();
-        setAssistantStreaming(false);
-      }
-    }
-  };
+	    } finally {
+	      setChatThinking(false);
+	      if (!assistantText) {
+	        assistantText = 'No response (nothing indexed yet?). Go to Import and index screenshots first.';
+	        scheduleFlush();
+	        setAssistantStreaming(false);
+	      }
+	      const snapId = activeThreadIdRef.current || threadId;
+	      void persistThreads(threadsRef.current, snapId);
+	      setTimeout(() => void persistThreads(threadsRef.current, snapId), 250);
+	    }
+	  };
 
-  const categories = useMemo(() => {
-    const map: Record<string, number> = {};
+  const categories = useMemo((): CategorySummary[] => {
+    const map: Record<string, { count: number; updatedAt: number }> = {};
     for (const doc of docs) {
       for (const c of doc.categories ?? []) {
         const key = c.trim().toLowerCase();
         if (!key) continue;
-        map[key] = (map[key] ?? 0) + 1;
+        const entry = map[key] ?? { count: 0, updatedAt: 0 };
+        entry.count += 1;
+        entry.updatedAt = Math.max(entry.updatedAt, Number(doc.createdAt ?? 0) || 0);
+        map[key] = entry;
       }
     }
-    return Object.entries(map)
-      .sort((a, b) => b[1] - a[1])
-      .map(([name, count]) => ({ name, count }));
+    return Object.entries(map).map(([name, v]) => ({ name, count: v.count, updatedAt: v.updatedAt }));
   }, [docs]);
 
   const docsInActiveCategory = useMemo(() => {
@@ -704,24 +1052,29 @@ export default function App() {
         <StatusBar style="dark" />
 
       <View style={[styles.shell, !isWide && styles.shellMobile]}>
-        {isWide ? (
-          <Sidebar
-            apiBase={apiBase}
-            route={route}
-            onNavigate={(next) => {
-              setRoute(next);
-              setMenuOpen(false);
-            }}
-            onPressApi={openApiModal}
-          />
-        ) : (
-          <AppHeader title={headerTitle} onOpenMenu={() => setMenuOpen(true)} />
-        )}
+	        {isWide ? (
+	          <Sidebar
+	            apiBase={apiBase}
+	            route={route}
+	            onNavigate={(next) => {
+	              setRoute(next);
+	              setMenuOpen(false);
+	            }}
+	            onPressApi={openApiModal}
+	          />
+	        ) : (
+	          <AppHeader
+	            title={headerTitle}
+	            onOpenMenu={() => setMenuOpen(true)}
+	            onCreateThread={route === 'chat' ? handleCreateThread : undefined}
+	          />
+	        )}
 
-        <View style={styles.main}>
-          {isWide && <TopBar title={headerTitle} />}
+	        <View style={styles.main}>
+	          {isWide && <TopBar title={headerTitle} onCreateThread={route === 'chat' ? handleCreateThread : undefined} />}
           {route === 'chat' ? (
             <ChatScreen
+              apiBase={apiBase}
               chatHistory={chatHistory}
               chatInput={chatInput}
               onChangeChatInput={setChatInput}
@@ -731,22 +1084,26 @@ export default function App() {
                 Keyboard.dismiss();
                 setRoute('import');
               }}
+              onOpenSource={(uri) => {
+                if (!uri) return;
+                setViewerUri(uri);
+              }}
             />
           ) : route === 'import' ? (
-            <ImportScreen
-              uiError={uiError}
-              permissionStatus={permission?.status ?? null}
-              loadingScreenshots={loadingScreenshots}
-              selectedCount={selected.size}
-              processing={processing}
-              onLoadScreenshots={loadScreenshots}
-              onIndexSelected={handleSendToAI}
-              screenshots={screenshots}
-              selected={selected}
-              onToggleSelect={toggleSelect}
-              assetStageById={assetStageById}
-            />
-          ) : (
+	            <ImportScreen
+	              uiError={uiError}
+	              permissionStatus={permission?.status ?? null}
+	              loadingScreenshots={loadingScreenshots}
+	              selectedCount={selected.size}
+	              importProgress={importProgress}
+	              onLoadScreenshots={loadScreenshots}
+	              onIndexSelected={handleSendToAI}
+	              screenshots={screenshots}
+	              selected={selected}
+	              onToggleSelect={toggleSelect}
+	              assetStageById={assetStageById}
+	            />
+	          ) : (
             <CategoriesScreen
               uiError={uiError}
               apiBase={apiBase}
@@ -803,33 +1160,64 @@ export default function App() {
         </View>
       </View>
 
-      {!isWide && (
-        <HamburgerMenu
-          apiBase={apiBase}
-          visible={menuOpen}
-          route={route}
-          onClose={() => setMenuOpen(false)}
-          onNavigate={(next) => {
-            setRoute(next);
-            setMenuOpen(false);
-          }}
-          onPressApi={() => {
-            setMenuOpen(false);
-            requestAnimationFrame(openApiModal);
-          }}
-        />
-      )}
+	      {!isWide && (
+	        <HamburgerMenu
+	          apiBase={apiBase}
+	          visible={menuOpen}
+	          route={route}
+	          threads={threads}
+	          activeThreadId={activeThreadId}
+	          onClose={() => setMenuOpen(false)}
+	          onNavigate={(next) => {
+	            setRoute(next);
+	            setMenuOpen(false);
+	          }}
+	          onSelectThread={async (threadId) => {
+	            await selectThread(threadId);
+	            setRoute('chat');
+	            setMenuOpen(false);
+	          }}
+	          onNewThread={async () => {
+	            await createThread();
+	            setRoute('chat');
+	            setMenuOpen(false);
+	          }}
+	          onDeleteThread={async (threadId) => {
+	            await deleteThreadById(threadId);
+	          }}
+	          onPressApi={() => {
+	            setMenuOpen(false);
+	            requestAnimationFrame(openApiModal);
+	          }}
+	        />
+	      )}
 
-      <Modal visible={!!viewerUri} transparent animationType="fade" onRequestClose={() => setViewerUri(null)}>
-        <View style={styles.viewerBackdrop}>
-          <Pressable style={StyleSheet.absoluteFill} onPress={() => setViewerUri(null)} />
-          {viewerUri && (
-            <View style={styles.viewerCard}>
-              <Image source={{ uri: viewerUri }} style={styles.viewerImage} resizeMode="contain" />
-            </View>
-          )}
-        </View>
-      </Modal>
+	      <Modal visible={!!viewerUri} transparent animationType="fade" onRequestClose={closeViewer}>
+	        <View style={styles.viewerBackdrop}>
+	          <Pressable style={StyleSheet.absoluteFill} onPress={closeViewer} />
+	          {viewerUri && (
+	            <Animated.View
+	              {...viewerPanResponder.panHandlers}
+	              style={[
+	                styles.viewerCard,
+	                { width: viewerCardDims.w, height: viewerCardDims.h, transform: [{ translateY: viewerPanY }] },
+	              ]}
+	            >
+	              <Image
+	                source={{ uri: viewerUri }}
+	                style={styles.viewerImage}
+	                resizeMode="contain"
+	                onLoad={(e) => {
+	                  const src = (e.nativeEvent as any)?.source;
+	                  const w = Number(src?.width ?? 0);
+	                  const h = Number(src?.height ?? 0);
+	                  if (w > 0 && h > 0) setViewerNatural({ w, h });
+	                }}
+	              />
+	            </Animated.View>
+	          )}
+	        </View>
+	      </Modal>
 
       {bootSplashVisible && (
         <Animated.View pointerEvents="none" style={[styles.bootSplashOverlay, { opacity: bootOpacity }]}>
@@ -873,7 +1261,7 @@ export default function App() {
   );
 }
 
-function AppHeader(props: { title: string; onOpenMenu: () => void }) {
+function AppHeader(props: { title: string; onOpenMenu: () => void; onCreateThread?: () => void | Promise<void> }) {
   return (
     <View style={styles.header}>
       <Pressable
@@ -881,26 +1269,50 @@ function AppHeader(props: { title: string; onOpenMenu: () => void }) {
         style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
         hitSlop={10}
       >
-        <Ionicons name="menu" size={22} color={COLORS.text} />
+        <View style={styles.hamburgerIcon} pointerEvents="none">
+          <View style={styles.hamburgerLine} />
+          <View style={[styles.hamburgerLine, styles.hamburgerLineShort]} />
+        </View>
       </Pressable>
       <Text pointerEvents="none" style={styles.headerTitle} numberOfLines={1}>
         {props.title}
       </Text>
-      <View style={styles.brand}>
-        <View style={styles.brandIcon}>
-          <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
-        </View>
-        <Text style={styles.brandText}>Nexus</Text>
-      </View>
+      {props.onCreateThread ? (
+        <Pressable onPress={props.onCreateThread} hitSlop={10} style={({ pressed }) => [styles.headerAction, pressed && styles.pressed]}>
+          <NewThreadIcon size={22} color={COLORS.text} />
+        </Pressable>
+      ) : (
+        <View style={styles.headerRightSpacer} />
+      )}
     </View>
   );
 }
 
-function TopBar(props: { title: string }) {
+function TopBar(props: { title: string; onCreateThread?: () => void | Promise<void> }) {
   return (
     <View style={styles.topBar}>
       <Text style={styles.topBarTitle}>{props.title}</Text>
+      {!!props.onCreateThread && (
+        <Pressable onPress={props.onCreateThread} hitSlop={10} style={({ pressed }) => [styles.topBarAction, pressed && styles.pressed]}>
+          <NewThreadIcon size={22} color={COLORS.text} />
+        </Pressable>
+      )}
     </View>
+  );
+}
+
+function NewThreadIcon(props: { size?: number; color?: string }) {
+  const size = props.size ?? 20;
+  const color = props.color ?? COLORS.text;
+  return (
+    <Svg width={size} height={size} viewBox="0 0 18 18" fill="none">
+      <Path
+        d="M2.669 11.333V8.667c0-.922 0-1.655.048-2.244.048-.597.15-1.106.387-1.571l.155-.276a4 4 0 0 1 1.593-1.472l.177-.083c.418-.179.872-.263 1.395-.305.589-.048 1.32-.048 2.243-.048h.5a.665.665 0 0 1 0 1.33h-.5c-.944 0-1.613 0-2.135.043-.386.032-.66.085-.876.162l-.2.086a2.67 2.67 0 0 0-1.064.982l-.102.184c-.126.247-.206.562-.248 1.076-.043.523-.043 1.192-.043 2.136v2.666c0 .944 0 1.613.043 2.136.042.514.122.829.248 1.076l.102.184c.257.418.624.758 1.064.982l.2.086c.217.077.49.13.876.161.522.043 1.19.044 2.135.044h2.667c.944 0 1.612-.001 2.135-.044.514-.042.829-.121 1.076-.247l.184-.104c.418-.256.759-.623.983-1.062l.086-.2c.077-.217.13-.49.16-.876.043-.523.044-1.192.044-2.136v-.5a.665.665 0 0 1 1.33 0v.5c0 .922.001 1.655-.047 2.244-.043.522-.127.977-.306 1.395l-.083.176a4 4 0 0 1-1.471 1.593l-.276.154c-.466.238-.975.34-1.572.39-.59.047-1.321.047-2.243.047H8.667c-.923 0-1.654 0-2.243-.048-.523-.043-.977-.126-1.395-.305l-.177-.084a4 4 0 0 1-1.593-1.471l-.155-.276c-.237-.465-.339-.974-.387-1.57-.049-.59-.048-1.322-.048-2.245m10.796-8.22a2.43 2.43 0 0 1 3.255.167l.167.185c.727.892.727 2.18 0 3.071l-.168.185-5.046 5.048a4 4 0 0 1-1.945 1.072l-.317.058-1.817.26a.665.665 0 0 1-.752-.753l.26-1.816.058-.319a4 4 0 0 1 1.072-1.944L13.28 3.28zm2.314 1.108a1.103 1.103 0 0 0-1.476-.076l-.084.076-5.046 5.048a2.67 2.67 0 0 0-.716 1.296l-.04.212-.134.939.94-.134.211-.039a2.67 2.67 0 0 0 1.298-.716L15.78 5.78l.076-.084c.33-.404.33-.988 0-1.392z"
+        fill={color}
+        fillRule="evenodd"
+        clipRule="evenodd"
+      />
+    </Svg>
   );
 }
 
@@ -969,48 +1381,117 @@ function HamburgerMenu(props: {
   route: RouteKey;
   onClose: () => void;
   onNavigate: (route: RouteKey) => void;
+  threads: ChatThread[];
+  activeThreadId: string;
+  onSelectThread: (threadId: string) => void | Promise<void>;
+  onNewThread?: () => void | Promise<void>;
+  onDeleteThread?: (threadId: string) => void | Promise<void>;
   onPressApi?: () => void;
 }) {
+  const [scrollViewportHeight, setScrollViewportHeight] = useState(0);
+  const [scrollContentHeight, setScrollContentHeight] = useState(0);
+  const scrollable = scrollContentHeight > scrollViewportHeight + 4;
+
   return (
     <Modal visible={props.visible} transparent animationType="fade" onRequestClose={props.onClose}>
       <View style={styles.menuBackdrop}>
         <Pressable style={StyleSheet.absoluteFill} onPress={props.onClose} />
         <SafeAreaView style={styles.menuPanelSafe}>
           <View style={styles.menuPanelInner}>
-            <View style={styles.menuHeader}>
-              <View style={styles.brand}>
-                <View style={styles.brandIcon}>
-                  <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
+            <View
+              style={styles.menuScrollArea}
+              onLayout={(e) => setScrollViewportHeight(e.nativeEvent.layout.height)}
+            >
+              <ScrollView
+                style={styles.menuScroll}
+                contentContainerStyle={styles.menuScrollContent}
+                showsVerticalScrollIndicator={false}
+                onContentSizeChange={(_, h) => setScrollContentHeight(h)}
+              >
+                <View style={styles.menuHeader}>
+                  <View style={styles.brand}>
+                    <View style={styles.brandIcon}>
+                      <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
+                    </View>
+                    <Text style={styles.brandText}>Nexus</Text>
+                  </View>
                 </View>
-                <Text style={styles.brandText}>Nexus</Text>
-              </View>
-              <Pressable onPress={props.onClose} style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}>
-                <Ionicons name="close" size={20} color={COLORS.text} />
-              </Pressable>
-            </View>
 
-            <View style={styles.menuNav}>
-              {([
-                { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' as const },
-                { key: 'import', label: 'Import', icon: 'image-outline' as const },
-                { key: 'categories', label: 'Categories', icon: 'folder-open-outline' as const },
-              ] as const).map((item) => {
-                const isActive = props.route === item.key;
-                return (
-                  <Pressable
-                    key={item.key}
-                    onPress={() => props.onNavigate(item.key)}
-                    style={({ pressed }) => [
-                      styles.menuItem,
-                      isActive && styles.menuItemActive,
-                      pressed && styles.pressed,
-                    ]}
-                  >
-                    <Ionicons name={item.icon} size={18} color={isActive ? COLORS.text : COLORS.muted} />
-                    <Text style={[styles.menuItemText, isActive && styles.menuItemTextActive]}>{item.label}</Text>
-                  </Pressable>
-                );
-              })}
+                <View style={styles.menuNav}>
+                  {([
+                    { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' as const },
+                    { key: 'import', label: 'Import', icon: 'image-outline' as const },
+                    { key: 'categories', label: 'Categories', icon: 'folder-open-outline' as const },
+                  ] as const).map((item) => {
+                    const isActive = props.route === item.key;
+                    return (
+                      <Pressable
+                        key={item.key}
+                        onPress={() => props.onNavigate(item.key)}
+                        style={({ pressed }) => [
+                          styles.menuItem,
+                          isActive && styles.menuItemActive,
+                          pressed && styles.pressed,
+                        ]}
+                      >
+                        <Ionicons name={item.icon} size={18} color={isActive ? COLORS.text : COLORS.muted} />
+                        <Text style={[styles.menuItemText, isActive && styles.menuItemTextActive]}>{item.label}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+
+                <View style={styles.menuDivider} />
+                <View style={styles.threadsHeader}>
+                  <Text style={styles.threadsLabel}>Threads</Text>
+                </View>
+
+                <View style={styles.threadsListContent}>
+                  {props.threads
+                    .slice()
+                    .sort((a, b) => b.updatedAt - a.updatedAt)
+                    .map((t) => {
+                      const isActive = t.id === props.activeThreadId;
+                      return (
+                        <Pressable
+                          key={t.id}
+                          onPress={() => props.onSelectThread(t.id)}
+                          onLongPress={() => {
+                            if (!props.onDeleteThread) return;
+                            Alert.alert('Delete thread?', 'This removes the thread from this device.', [
+                              { text: 'Cancel', style: 'cancel' },
+                              { text: 'Delete', style: 'destructive', onPress: () => props.onDeleteThread?.(t.id) },
+                            ]);
+                          }}
+                          delayLongPress={250}
+                          style={({ pressed }) => [
+                            styles.threadItem,
+                            isActive && styles.threadItemActive,
+                            pressed && styles.pressed,
+                          ]}
+                        >
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.threadTitle} numberOfLines={1}>
+                              {t.title || 'New chat'}
+                            </Text>
+                            <Text style={styles.threadMeta} numberOfLines={1}>
+                              {new Date(t.updatedAt).toLocaleDateString()}
+                            </Text>
+                          </View>
+                        </Pressable>
+                      );
+                    })}
+                </View>
+              </ScrollView>
+
+              {scrollable && (
+                <LinearGradient
+                  pointerEvents="none"
+                  colors={['rgba(255,255,255,0)', COLORS.surface]}
+                  locations={[0, 1]}
+                  style={styles.menuFadeBottom}
+                />
+              )}
             </View>
 
             <View style={styles.menuFooter}>
@@ -1034,12 +1515,14 @@ function HamburgerMenu(props: {
 }
 
 function ChatScreen(props: {
+  apiBase: string;
   chatHistory: ChatEntry[];
   chatInput: string;
   onChangeChatInput: (text: string) => void;
   chatThinking: boolean;
   onSend: () => void;
   onPressPlus: () => void;
+  onOpenSource: (uri: string) => void;
 }) {
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
@@ -1111,9 +1594,33 @@ function ChatScreen(props: {
                 {isUser ? (
                   <Text style={[styles.messageText, styles.messageTextUser]}>{item.text}</Text>
                 ) : (
-                  <Markdown style={MARKDOWN_STYLES} mergeStyle>
-                    {item.text}
-                  </Markdown>
+                  <View style={{ gap: 10 }}>
+                    <Markdown style={MARKDOWN_STYLES} mergeStyle>
+                      {item.text}
+                    </Markdown>
+                    {!!item.sources?.length && (
+                      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.sourcesRow}>
+                        {item.sources.slice(0, 8).map((doc) => {
+                          const uri = resolveDocUri(props.apiBase, doc);
+                          return (
+                            <Pressable
+                              key={doc.id}
+                              onPress={() => uri && props.onOpenSource(uri)}
+                              style={({ pressed }) => [styles.sourceThumb, pressed && styles.pressed]}
+                            >
+                              {uri ? (
+                                <Image source={{ uri }} style={styles.sourceThumbImage} />
+                              ) : (
+                                <View style={[styles.sourceThumbImage, styles.assetMissing]}>
+                                  <Text style={styles.placeholderText}>No preview</Text>
+                                </View>
+                              )}
+                            </Pressable>
+                          );
+                        })}
+                      </ScrollView>
+                    )}
+                  </View>
                 )}
               </View>
             </View>
@@ -1174,7 +1681,7 @@ function ImportScreen(props: {
   permissionStatus: MediaLibrary.PermissionStatus | null;
   loadingScreenshots: boolean;
   selectedCount: number;
-  processing: boolean;
+  importProgress: { running: boolean; current: number; total: number; done: number; failed: number };
   onLoadScreenshots: () => void;
   onIndexSelected: () => void;
   screenshots: ResolvedAsset[];
@@ -1182,6 +1689,9 @@ function ImportScreen(props: {
   onToggleSelect: (id: string) => void;
   assetStageById: Record<string, 'uploading' | 'indexing' | 'done' | 'error'>;
 }) {
+  const showImporting =
+    props.importProgress.total > 0 &&
+    (props.importProgress.running || props.importProgress.done + props.importProgress.failed < props.importProgress.total);
   return (
     <View style={styles.screen}>
       <ScrollView contentContainerStyle={styles.scroll} style={styles.screen}>
@@ -1200,6 +1710,24 @@ function ImportScreen(props: {
         </View>
 
         {props.uiError && <Text style={styles.inlineError}>{props.uiError}</Text>}
+
+        {showImporting && (
+          <View style={styles.importBanner}>
+            <View style={styles.importBannerIcon}>
+              <ActivityIndicator size="small" color={COLORS.muted} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.importBannerTitle}>
+                Importing all images ({Math.min(props.importProgress.current, props.importProgress.total)} of {props.importProgress.total})
+              </Text>
+              <Text style={styles.importBannerSubtitle}>
+                {props.importProgress.failed
+                  ? `${props.importProgress.failed} failed`
+                  : 'You can keep using the app while this runs.'}
+              </Text>
+            </View>
+          </View>
+        )}
 
         {props.permissionStatus !== 'granted' && (
           <View style={styles.callout}>
@@ -1231,7 +1759,6 @@ function ImportScreen(props: {
             renderItem={({ item }) => {
               const isSelected = props.selected.has(item.id);
               const stage = props.assetStageById[item.id];
-              const showLoader = stage === 'uploading' || stage === 'indexing';
               return (
                 <Pressable onPress={() => props.onToggleSelect(item.id)} style={styles.assetWrapper}>
                   <Image source={{ uri: item.uri }} style={styles.asset} />
@@ -1240,11 +1767,6 @@ function ImportScreen(props: {
                   <View style={[styles.check, isSelected && styles.checkSelected]}>
                     {isSelected && <Ionicons name="checkmark" size={14} color="#fff" />}
                   </View>
-                  {showLoader && (
-                    <View style={styles.assetLoader}>
-                      <ActivityIndicator size="small" color={COLORS.accentText} />
-                    </View>
-                  )}
                   {stage === 'error' && (
                     <View style={[styles.assetLoader, styles.assetLoaderError]}>
                       <Ionicons name="alert-circle" size={16} color={COLORS.accentText} />
@@ -1273,17 +1795,17 @@ function ImportScreen(props: {
               onPress={props.onIndexSelected}
               style={({ pressed }) => [
                 styles.floatingBarButton,
-                props.processing && styles.disabled,
+                props.importProgress.running && styles.disabled,
                 pressed && styles.pressed,
               ]}
-              disabled={props.processing}
+              disabled={props.importProgress.running}
             >
               <Ionicons
-                name={props.processing ? 'hourglass-outline' : 'cloud-upload-outline'}
+                name={props.importProgress.running ? 'hourglass-outline' : 'cloud-upload-outline'}
                 size={16}
                 color={COLORS.accentText}
               />
-              <Text style={styles.floatingBarButtonText}>{props.processing ? 'Indexing…' : 'Index selected'}</Text>
+              <Text style={styles.floatingBarButtonText}>{props.importProgress.running ? 'Importing…' : 'Index selected'}</Text>
             </Pressable>
           </View>
         </View>
@@ -1295,6 +1817,7 @@ function ImportScreen(props: {
 function CategoriesCategoryCard(props: {
   name: string;
   count: number;
+  updatedAt: number;
   index: number;
   selectionMode: boolean;
   selected: boolean;
@@ -1313,6 +1836,18 @@ function CategoriesCategoryCard(props: {
   }, [anim, props.index]);
 
   const translateY = anim.interpolate({ inputRange: [0, 1], outputRange: [20, 0] });
+  const updatedLabel = useMemo(() => {
+    const ts = Number(props.updatedAt ?? 0);
+    if (!ts) return 'Updated —';
+    const date = new Date(ts);
+    const now = new Date();
+    const sameDay =
+      date.getFullYear() === now.getFullYear() &&
+      date.getMonth() === now.getMonth() &&
+      date.getDate() === now.getDate();
+    if (sameDay) return 'Updated today';
+    return `Updated ${date.toLocaleDateString()}`;
+  }, [props.updatedAt]);
 
   return (
     <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ translateY }] }]}>
@@ -1359,7 +1894,7 @@ function CategoriesCategoryCard(props: {
             <View style={styles.mcMetaDot} />
             <View style={styles.mcMetaRow}>
               <Ionicons name="time-outline" size={14} color={COLORS.muted} />
-              <Text style={styles.mcMetaText}>Updated today</Text>
+              <Text style={styles.mcMetaText}>{updatedLabel}</Text>
             </View>
           </View>
         </View>
@@ -1416,7 +1951,7 @@ function CategoriesEmptyState(props: { onRefresh: () => void }) {
 function CategoriesScreen(props: {
   uiError: string | null;
   apiBase: string;
-  categories: { name: string; count: number }[];
+  categories: CategorySummary[];
   activeCategory: string | null;
   onSetActiveCategory: (name: string | null) => void;
   docsInActiveCategory: ServerDoc[];
@@ -1438,6 +1973,11 @@ function CategoriesScreen(props: {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameText, setRenameText] = useState('');
   const [renaming, setRenaming] = useState(false);
+  const [sortOpen, setSortOpen] = useState(false);
+  const [categorySort, setCategorySort] = useState<{ key: 'name' | 'count' | 'updatedAt'; dir: 'asc' | 'desc' }>({
+    key: 'count',
+    dir: 'desc',
+  });
 
   const pageStyle = useMemo(() => [styles.mcPage, { padding: pagePadding }], [pagePadding]);
   const categoryRowStyle = categoryColumns > 1 ? styles.mcGridRow : undefined;
@@ -1447,11 +1987,27 @@ function CategoriesScreen(props: {
     if (!query) return props.categories;
     return props.categories.filter((c) => c.name.toLowerCase().includes(query));
   }, [categoryQuery, props.categories]);
+  const sortedVisibleCategories = useMemo(() => {
+    const dirMult = categorySort.dir === 'asc' ? 1 : -1;
+    const sorted = [...visibleCategories].sort((a, b) => {
+      if (categorySort.key === 'name') {
+        const cmp = a.name.localeCompare(b.name);
+        return cmp * dirMult;
+      }
+      if (categorySort.key === 'count') {
+        const cmp = (a.count - b.count) || a.name.localeCompare(b.name);
+        return cmp * dirMult;
+      }
+      const cmp = (a.updatedAt - b.updatedAt) || a.name.localeCompare(b.name);
+      return cmp * dirMult;
+    });
+    return sorted;
+  }, [categorySort.dir, categorySort.key, visibleCategories]);
   const listData = useMemo(() => {
     const query = categoryQuery.trim();
     if (props.categories.length === 0 && !query) return [];
-    return [...visibleCategories, { name: '__refresh__', count: 0 }];
-  }, [categoryQuery, props.categories.length, visibleCategories]);
+    return [...sortedVisibleCategories, { name: '__refresh__', count: 0, updatedAt: 0 } as any];
+  }, [categoryQuery, props.categories.length, sortedVisibleCategories]);
   const isSelecting = selectionMode;
   const selectedName = selectedCategories.size === 1 ? Array.from(selectedCategories)[0] : null;
   const toggleCategorySelected = (name: string) => {
@@ -1654,20 +2210,30 @@ function CategoriesScreen(props: {
   const empty = props.categories.length === 0 && !query;
   const noMatch = props.categories.length > 0 && !!query && shownCount === 0;
 
-  const categoriesHeader = (
-    <View style={styles.mcHeader}>
-      <View style={styles.mcHeaderTop}>
-        <View style={styles.mcHeaderTitles}>
-          <Text style={styles.mcH1}>Categories</Text>
-          <Text style={styles.mcMuted}>Your organized knowledge clusters.</Text>
-        </View>
-        <Pressable
-          onPress={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
-          style={({ pressed }) => [styles.mcHeaderMenu, pressed && styles.pressed]}
-        >
-          <Ionicons name={selectionMode ? 'close' : 'ellipsis-horizontal'} size={20} color={COLORS.text} />
-        </Pressable>
-      </View>
+	  const categoriesHeader = (
+	    <View style={styles.mcHeader}>
+	      <View style={styles.mcHeaderTop}>
+	        <View style={styles.mcHeaderTitles}>
+	          <Text style={styles.mcH1}>Categories</Text>
+	          <Text style={styles.mcMuted}>Your organized knowledge clusters.</Text>
+	        </View>
+	        <View style={styles.mcHeaderActions}>
+	          <Pressable
+	            onPress={() => setSortOpen(true)}
+	            style={({ pressed }) => [styles.mcHeaderMenu, pressed && styles.pressed]}
+	            hitSlop={8}
+	          >
+	            <Ionicons name="swap-vertical" size={18} color={COLORS.text} />
+	          </Pressable>
+	          <Pressable
+	            onPress={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
+	            style={({ pressed }) => [styles.mcHeaderMenu, pressed && styles.pressed]}
+	            hitSlop={8}
+	          >
+	            <Ionicons name={selectionMode ? 'close' : 'ellipsis-horizontal'} size={20} color={COLORS.text} />
+	          </Pressable>
+	        </View>
+	      </View>
 
       {selectionMode && (
         <View style={styles.mcSelectionBar}>
@@ -1752,25 +2318,60 @@ function CategoriesScreen(props: {
         ItemSeparatorComponent={categoryColumns === 1 ? () => <View style={{ height: 24 }} /> : undefined}
         ListHeaderComponent={categoriesHeader}
         ListEmptyComponent={empty ? <CategoriesEmptyState onRefresh={props.onRefresh} /> : null}
-        renderItem={({ item, index }) => {
-          if (item.name === '__refresh__') return <CategoriesRefreshCard index={index} onRefresh={props.onRefresh} />;
-          return (
-            <CategoriesCategoryCard
-              name={item.name}
-              count={item.count}
-              index={index}
-              selectionMode={selectionMode}
-              selected={selectedCategories.has(item.name)}
-              onOpen={props.onSetActiveCategory}
-              onToggle={toggleCategorySelected}
-            />
-          );
-        }}
-      />
+	        renderItem={({ item, index }) => {
+	          if (item.name === '__refresh__') return <CategoriesRefreshCard index={index} onRefresh={props.onRefresh} />;
+	          return (
+	            <CategoriesCategoryCard
+	              name={item.name}
+	              count={item.count}
+	              updatedAt={(item as any).updatedAt ?? 0}
+	              index={index}
+	              selectionMode={selectionMode}
+	              selected={selectedCategories.has(item.name)}
+	              onOpen={props.onSetActiveCategory}
+	              onToggle={toggleCategorySelected}
+	            />
+	          );
+	        }}
+	      />
 
-      <Modal visible={renameOpen} transparent animationType="fade" onRequestClose={() => setRenameOpen(false)}>
-        <View style={styles.renameBackdrop}>
-          <Pressable style={StyleSheet.absoluteFill} onPress={() => setRenameOpen(false)} />
+	      <Modal visible={sortOpen} transparent animationType="fade" onRequestClose={() => setSortOpen(false)}>
+	        <View style={styles.sortBackdrop}>
+	          <Pressable style={StyleSheet.absoluteFill} onPress={() => setSortOpen(false)} />
+	          <View style={styles.sortCard}>
+	            <Text style={styles.sortTitle}>Sort</Text>
+	            {(
+	              [
+	                { key: 'name', dir: 'asc', label: 'Alphabetical (A → Z)' },
+	                { key: 'name', dir: 'desc', label: 'Alphabetical (Z → A)' },
+	                { key: 'count', dir: 'desc', label: 'Items (high → low)' },
+	                { key: 'count', dir: 'asc', label: 'Items (low → high)' },
+	                { key: 'updatedAt', dir: 'desc', label: 'Updated (newest → oldest)' },
+	                { key: 'updatedAt', dir: 'asc', label: 'Updated (oldest → newest)' },
+	              ] as const
+	            ).map((opt) => {
+	              const selectedOpt = categorySort.key === opt.key && categorySort.dir === opt.dir;
+	              return (
+	                <Pressable
+	                  key={`${opt.key}-${opt.dir}`}
+	                  onPress={() => {
+	                    setCategorySort({ key: opt.key, dir: opt.dir });
+	                    setSortOpen(false);
+	                  }}
+	                  style={({ pressed }) => [styles.sortRow, pressed && styles.pressed]}
+	                >
+	                  <Text style={styles.sortRowText}>{opt.label}</Text>
+	                  {selectedOpt ? <Ionicons name="checkmark" size={18} color={COLORS.text} /> : null}
+	                </Pressable>
+	              );
+	            })}
+	          </View>
+	        </View>
+	      </Modal>
+	
+	      <Modal visible={renameOpen} transparent animationType="fade" onRequestClose={() => setRenameOpen(false)}>
+	        <View style={styles.renameBackdrop}>
+	          <Pressable style={StyleSheet.absoluteFill} onPress={() => setRenameOpen(false)} />
           <View style={styles.renameCard}>
             <Text style={styles.renameTitle}>Rename category</Text>
             <TextInput
@@ -1873,6 +2474,9 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   topBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     paddingHorizontal: 18,
     paddingVertical: 14,
     borderBottomColor: COLORS.border,
@@ -1903,7 +2507,37 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     textAlign: 'center',
-    paddingHorizontal: 112,
+    paddingHorizontal: 72,
+  },
+  headerAction: {
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerRightSpacer: {
+    width: 40,
+    height: 40,
+  },
+  topBarAction: {
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  hamburgerIcon: {
+    width: 22,
+    height: 18,
+    justifyContent: 'center',
+    gap: 6,
+  },
+  hamburgerLine: {
+    height: 2,
+    borderRadius: 2,
+    backgroundColor: COLORS.text,
+  },
+  hamburgerLineShort: {
+    width: '75%',
   },
   brand: {
     flexDirection: 'row',
@@ -1975,6 +2609,24 @@ const styles = StyleSheet.create({
     paddingTop: 10,
     gap: 12,
   },
+  menuScrollArea: {
+    flex: 1,
+    position: 'relative',
+  },
+  menuScroll: {
+    flex: 1,
+  },
+  menuScrollContent: {
+    flexGrow: 1,
+    paddingBottom: 16,
+  },
+  menuFadeBottom: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 36,
+  },
   menuHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1983,7 +2635,63 @@ const styles = StyleSheet.create({
   menuNav: {
     marginTop: 10,
     gap: 10,
-    flex: 1,
+  },
+  menuDivider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: COLORS.border,
+    marginTop: 4,
+    marginBottom: 2,
+  },
+  threadsHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 6,
+  },
+  threadsLabel: {
+    color: COLORS.muted,
+    fontSize: 11,
+    fontFamily: FONT_SANS_SEMIBOLD,
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+  },
+  threadsNew: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  threadsListContent: {
+    gap: 10,
+    paddingVertical: 10,
+    flexGrow: 1,
+  },
+  threadItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    backgroundColor: COLORS.surface,
+  },
+  threadItemActive: {
+    backgroundColor: COLORS.pill,
+  },
+  threadTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  threadMeta: {
+    color: COLORS.muted,
+    fontSize: 11,
+    marginTop: 2,
+    fontFamily: FONT_SANS,
   },
   menuItem: {
     flexDirection: 'row',
@@ -1992,13 +2700,10 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 12,
     borderRadius: 14,
-    backgroundColor: COLORS.surfaceAlt,
-    borderColor: COLORS.border,
-    borderWidth: 1,
+    backgroundColor: COLORS.surface,
   },
   menuItemActive: {
-    borderColor: COLORS.borderStrong,
-    backgroundColor: COLORS.overlay,
+    backgroundColor: COLORS.pill,
   },
   menuItemText: {
     color: COLORS.text,
@@ -2022,9 +2727,7 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     paddingHorizontal: 10,
     borderRadius: 12,
-    backgroundColor: COLORS.surfaceAlt,
-    borderWidth: 1,
-    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
   },
   menuFooterLabel: {
     color: COLORS.muted,
@@ -2123,6 +2826,23 @@ const styles = StyleSheet.create({
   },
   messageTextUser: {
     color: COLORS.accentText,
+  },
+  sourcesRow: {
+    gap: 10,
+    paddingRight: 6,
+  },
+  sourceThumb: {
+    width: 54,
+    height: 54,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    overflow: 'hidden',
+  },
+  sourceThumbImage: {
+    width: '100%',
+    height: '100%',
   },
   typingBubble: {
     flexDirection: 'row',
@@ -2250,6 +2970,35 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
     flex: 1,
+    fontFamily: FONT_SANS,
+  },
+  importBanner: {
+    borderRadius: 14,
+    borderColor: COLORS.border,
+    borderWidth: 1,
+    backgroundColor: COLORS.surfaceAlt,
+    padding: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  importBannerIcon: {
+    width: 22,
+    height: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  importBannerTitle: {
+    color: COLORS.text,
+    fontSize: 13,
+    lineHeight: 18,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  importBannerSubtitle: {
+    color: COLORS.muted,
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: 2,
     fontFamily: FONT_SANS,
   },
   placeholder: {
@@ -2446,6 +3195,11 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
     justifyContent: 'space-between',
     gap: 12,
+  },
+  mcHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
   },
   mcHeaderTitles: {
     flex: 1,
@@ -2801,6 +3555,50 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
     gap: 10,
   },
+  sortBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.18)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  sortCard: {
+    width: '100%',
+    maxWidth: 420,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    padding: 16,
+    shadowColor: COLORS.shadow,
+    shadowOpacity: 0.22,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 12 },
+    elevation: 4,
+  },
+  sortTitle: {
+    color: COLORS.text,
+    fontSize: 16,
+    fontFamily: FONT_SANS_SEMIBOLD,
+    marginBottom: 10,
+  },
+  sortRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+    marginTop: 10,
+  },
+  sortRowText: {
+    color: COLORS.text,
+    fontFamily: FONT_SANS,
+    fontSize: 13,
+  },
   renameButton: {
     height: 40,
     paddingHorizontal: 14,
@@ -3022,13 +3820,10 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 12,
     borderRadius: 16,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    backgroundColor: COLORS.surfaceAlt,
+    backgroundColor: COLORS.surface,
   },
   navItemActive: {
-    borderColor: COLORS.borderStrong,
-    backgroundColor: COLORS.overlay,
+    backgroundColor: COLORS.pill,
   },
   navIcon: {
     marginRight: 10,
@@ -3075,8 +3870,6 @@ const styles = StyleSheet.create({
     padding: 14,
   },
   viewerCard: {
-    width: '92%',
-    height: '92%',
     borderRadius: 24,
     overflow: 'hidden',
     borderWidth: 1,
