@@ -953,6 +953,22 @@ export default function App() {
       fn();
     };
 
+    const dedupeSources = (docs: ServerDoc[]) => {
+      const out: ServerDoc[] = [];
+      const seen = new Set<string>();
+      for (const doc of docs) {
+        const idKey = String(doc.id || '');
+        const uriKey = String(doc.uri || '');
+        if (idKey && seen.has(idKey)) continue;
+        if (uriKey && seen.has(uriKey)) continue;
+        if (idKey) seen.add(idKey);
+        if (uriKey) seen.add(uriKey);
+        out.push(doc);
+        if (out.length >= 8) break;
+      }
+      return out;
+    };
+
     try {
       wsRef.current?.close();
       const ws = new WebSocket(toWsUrl(apiBase));
@@ -973,7 +989,7 @@ export default function App() {
 
 	          if (parsed.type === 'matches') {
 	            const matches = Array.isArray(parsed.matches) ? (parsed.matches as ServerDoc[]) : [];
-	            if (matches.length) setAssistantSources(matches.slice(0, 8));
+	            if (matches.length) setAssistantSources(dedupeSources(matches));
 	            return;
 	          }
 

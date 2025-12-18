@@ -1155,10 +1155,11 @@ app.post('/api/search', async (req, res) => {
         });
         const answer = response.choices?.[0]?.message?.content ??
             'No response returned. Try again.';
-        const matches = await Promise.all(ranked.map(async ({ doc, score }) => ({
+        const matchesRaw = await Promise.all(ranked.map(async ({ doc, score }) => ({
             ...(await toPublicDoc(doc)),
             score,
         })));
+        const matches = dedupeMatches(matchesRaw);
         res.json({
             answer,
             matches,
@@ -1218,10 +1219,11 @@ app.post('/api/search-stream', async (req, res) => {
             return;
         }
         // Send matches upfront
-        const matches = await Promise.all(ranked.map(async ({ doc, score }) => ({
+        const matchesRaw = await Promise.all(ranked.map(async ({ doc, score }) => ({
             ...(await toPublicDoc(doc)),
             score,
         })));
+        const matches = dedupeMatches(matchesRaw);
         writeSse(res, { type: 'matches', matches });
         const openaiClient = requireOpenAI();
         const stream = await openaiClient.chat.completions.create({
@@ -1261,6 +1263,28 @@ const wsSend = (ws, data) => {
     if (ws.readyState !== ws.OPEN)
         return;
     ws.send(JSON.stringify(data));
+};
+const dedupeMatches = (items) => {
+    const bestByKey = new Map();
+    for (const item of items) {
+        const idKey = String(item?.id ?? '').trim();
+        const uriKey = String(item?.uri ?? '').trim();
+        const key = idKey || uriKey;
+        if (!key)
+            continue;
+        const prev = bestByKey.get(key);
+        if (!prev) {
+            bestByKey.set(key, item);
+            continue;
+        }
+        const prevScore = Number(prev.score ?? 0);
+        const nextScore = Number(item.score ?? 0);
+        if (nextScore > prevScore)
+            bestByKey.set(key, item);
+    }
+    const out = Array.from(bestByKey.values());
+    out.sort((a, b) => Number(b.score ?? 0) - Number(a.score ?? 0));
+    return out;
 };
 const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', (ws) => {
@@ -1308,7 +1332,7 @@ wss.on('connection', (ws) => {
                 ...(await toPublicDoc(doc)),
                 score,
             })));
-            wsSend(ws, { type: 'matches', matches });
+            wsSend(ws, { type: 'matches', matches: dedupeMatches(matches) });
             const openaiClient = requireOpenAI();
             const stream = await openaiClient.chat.completions.create({
                 model: VISION_MODEL,
