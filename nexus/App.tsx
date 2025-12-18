@@ -335,6 +335,7 @@ export default function App() {
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState('');
   const [chatThinking, setChatThinking] = useState(false);
+  const [chatScopeCategory, setChatScopeCategory] = useState<string>(''); // '' => all screenshots
   const wsRef = useRef<WebSocket | null>(null);
   const threadsRef = useRef<ChatThread[]>([]);
   const activeThreadIdRef = useRef('');
@@ -959,7 +960,7 @@ export default function App() {
 
       await new Promise<void>((resolve, reject) => {
         ws.onopen = () => {
-          ws.send(JSON.stringify({ type: 'search', query: prompt, userId }));
+          ws.send(JSON.stringify({ type: 'search', query: prompt, userId, category: chatScopeCategory || '' }));
         };
 
 	        ws.onmessage = (evt) => {
@@ -1145,6 +1146,9 @@ export default function App() {
               onChangeChatInput={setChatInput}
               chatThinking={chatThinking}
               onSend={handleAsk}
+              categories={categories}
+              scopeCategory={chatScopeCategory}
+              onChangeScopeCategory={setChatScopeCategory}
               onPressPlus={() => {
                 Keyboard.dismiss();
                 setRoute('import');
@@ -1728,6 +1732,9 @@ function ChatScreen(props: {
   onChangeChatInput: (text: string) => void;
   chatThinking: boolean;
   onSend: () => void;
+  categories: CategorySummary[];
+  scopeCategory: string; // '' => all screenshots
+  onChangeScopeCategory: (category: string) => void;
   onPressPlus: () => void;
   onOpenSource: (uri: string) => void;
 }) {
@@ -1738,6 +1745,8 @@ function ChatScreen(props: {
   const [composerHeight, setComposerHeight] = useState(0);
   const canSend = !!props.chatInput.trim() && !props.chatThinking;
   const empty = props.chatHistory.length === 0;
+  const [scopeOpen, setScopeOpen] = useState(false);
+  const scopeLabel = props.scopeCategory ? `Category: ${props.scopeCategory}` : 'All screenshots';
 
   useEffect(() => {
     const animateTo = (nextHeight: number, duration: number) => {
@@ -1777,6 +1786,49 @@ function ChatScreen(props: {
 
   return (
     <View style={styles.screen}>
+      <Modal visible={scopeOpen} transparent animationType="fade" onRequestClose={() => setScopeOpen(false)}>
+        <View style={styles.scopeBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setScopeOpen(false)} />
+          <View style={styles.scopeCard}>
+            <Text style={styles.scopeTitle}>Chat scope</Text>
+            <Pressable
+              onPress={() => {
+                props.onChangeScopeCategory('');
+                setScopeOpen(false);
+              }}
+              style={({ pressed }) => [styles.scopeRow, pressed && styles.pressed]}
+            >
+              <Text style={styles.scopeRowText}>All screenshots</Text>
+              {!props.scopeCategory ? <Ionicons name="checkmark" size={18} color={COLORS.text} /> : null}
+            </Pressable>
+            <View style={styles.scopeDivider} />
+            <ScrollView style={{ maxHeight: 320 }} showsVerticalScrollIndicator={false}>
+              {props.categories
+                .slice()
+                .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+                .map((c) => {
+                  const selected = c.name === props.scopeCategory;
+                  return (
+                    <Pressable
+                      key={c.name}
+                      onPress={() => {
+                        props.onChangeScopeCategory(c.name);
+                        setScopeOpen(false);
+                      }}
+                      style={({ pressed }) => [styles.scopeRow, pressed && styles.pressed]}
+                    >
+                      <Text style={styles.scopeRowText} numberOfLines={1}>
+                        {c.name}
+                      </Text>
+                      {selected ? <Ionicons name="checkmark" size={18} color={COLORS.text} /> : null}
+                    </Pressable>
+                  );
+                })}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
       <FlatList
         data={props.chatHistory}
         inverted
@@ -1857,6 +1909,15 @@ function ChatScreen(props: {
           setComposerHeight((prev) => (prev === next ? prev : next));
         }}
       >
+        <View style={styles.scopePillRow}>
+          <Pressable onPress={() => setScopeOpen(true)} style={({ pressed }) => [styles.scopePill, pressed && styles.pressed]}>
+            <Ionicons name="funnel-outline" size={14} color={COLORS.muted} />
+            <Text style={styles.scopePillText} numberOfLines={1}>
+              {scopeLabel}
+            </Text>
+            <Ionicons name="chevron-down" size={14} color={COLORS.muted} />
+          </Pressable>
+        </View>
         <View style={styles.composerRow}>
           <Pressable
             onPress={props.onPressPlus}
@@ -1868,7 +1929,7 @@ function ChatScreen(props: {
 
           <View style={styles.composerPill}>
             <TextInput
-              placeholder="Ask anything"
+              placeholder={props.scopeCategory ? `Ask about ${props.scopeCategory}` : 'Ask anything'}
               placeholderTextColor={COLORS.muted2}
               value={props.chatInput}
               onChangeText={props.onChangeChatInput}
@@ -3325,6 +3386,28 @@ const styles = StyleSheet.create({
     marginBottom: 0,
     backgroundColor: 'transparent',
   },
+  scopePillRow: {
+    flexDirection: 'row',
+    paddingBottom: 8,
+  },
+  scopePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: COLORS.pill,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    maxWidth: '100%',
+  },
+  scopePillText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+    maxWidth: 280,
+  },
   composerRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -3347,6 +3430,45 @@ const styles = StyleSheet.create({
     height: 44,
     paddingLeft: 14,
     paddingRight: 4,
+  },
+  scopeBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.22)',
+    justifyContent: 'flex-end',
+    padding: 16,
+  },
+  scopeCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    overflow: 'hidden',
+  },
+  scopeTitle: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 8,
+  },
+  scopeRow: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  scopeRowText: {
+    color: COLORS.text,
+    fontSize: 15,
+    fontFamily: FONT_SANS_SEMIBOLD,
+    flex: 1,
+  },
+  scopeDivider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: COLORS.border,
   },
   composerInput: {
     flex: 1,
