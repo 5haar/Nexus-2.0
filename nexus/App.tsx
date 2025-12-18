@@ -1838,7 +1838,7 @@ function ChatScreen(props: {
       {empty && (
         <Animated.View
           pointerEvents="none"
-          style={[styles.chatEmptyOverlay, { bottom: composerHeight + 56, transform: [{ translateY }] }]}
+          style={[styles.chatEmptyOverlay, { bottom: composerHeight + 22, transform: [{ translateY }] }]}
         >
           <View pointerEvents="none" style={styles.chatEmptyCard}>
             <View style={styles.chatEmptyIcon}>
@@ -3320,9 +3320,9 @@ const styles = StyleSheet.create({
   },
   composerOuter: {
     paddingHorizontal: 14,
-    paddingTop: 10,
-    paddingBottom: 16,
-    marginBottom: 10,
+    paddingTop: 8,
+    paddingBottom: 8,
+    marginBottom: 0,
     backgroundColor: 'transparent',
   },
   composerRow: {
