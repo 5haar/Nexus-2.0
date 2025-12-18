@@ -3319,7 +3319,7 @@ const styles = StyleSheet.create({
     opacity: 0.45,
   },
   composerOuter: {
-    paddingHorizontal: 12,
+    paddingHorizontal: 8,
     paddingTop: 8,
     paddingBottom: 8,
     marginBottom: 0,
@@ -3328,12 +3328,12 @@ const styles = StyleSheet.create({
   composerRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 8,
   },
   plusButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: COLORS.pill,
