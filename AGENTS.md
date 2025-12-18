@@ -72,6 +72,26 @@ Use this file as the source of truth for how to work safely and consistently in 
 - WebSocket endpoint is `/ws`; use `wss://` in production (derived from `EXPO_PUBLIC_API_BASE_URL`).
 - Set ALB idle timeout high enough for chat sessions (server pings periodically but don’t rely solely on pings).
 
+## CI/CD (Auto Deploy Server)
+
+This repo includes a GitHub Actions workflow to deploy `server/` to Elastic Beanstalk on push to `main`:
+
+- Workflow: `.github/workflows/deploy-server.yml`
+- Target: EB application `nexus`, environment `Nexus-env-1`, region `us-east-1`
+- Auth: AWS OIDC (no static AWS keys)
+
+**Required GitHub secret**
+
+- `AWS_ROLE_ARN`: IAM role ARN that GitHub Actions can assume via OIDC
+
+**AWS one-time setup (outline)**
+
+- Create/ensure the GitHub OIDC provider in IAM: `token.actions.githubusercontent.com`
+- Create an IAM role with a trust policy allowing your repo/branch to assume it (restrict to `repo:<owner>/<repo>:ref:refs/heads/main`).
+- Attach permissions for:
+  - `elasticbeanstalk:CreateApplicationVersion`, `elasticbeanstalk:UpdateEnvironment`, `elasticbeanstalk:DescribeEnvironments`, `elasticbeanstalk:DescribeEvents`, `elasticbeanstalk:DescribeEnvironmentHealth`, `elasticbeanstalk:DescribeEnvironmentResources`
+  - `s3:PutObject`, `s3:GetObject`, `s3:ListBucket` on the EB bucket (`elasticbeanstalk-us-east-1-<accountId>`)
+
 ## Security Notes (Current State)
 
 - The current “auth” header `x-nexus-user-id` is a temporary mechanism for local/dev and is not secure for public multi-user deployments.

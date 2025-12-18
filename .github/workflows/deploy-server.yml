@@ -1,0 +1,82 @@
+name: Deploy server to Elastic Beanstalk
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "server/**"
+      - ".github/workflows/deploy-server.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: "deploy-server-main"
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      EB_APPLICATION_NAME: nexus
+      EB_ENVIRONMENT_NAME: Nexus-env-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install deps
+        working-directory: server
+        run: npm ci
+
+      - name: Build
+        working-directory: server
+        run: npm run build
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd server
+          zip -r ../server-deploy.zip . \
+            -x "node_modules/*" \
+            -x "src/*" \
+            -x "storage/*" \
+            -x ".env" \
+            -x "*.tsbuildinfo"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Elastic Beanstalk
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET="elasticbeanstalk-${AWS_REGION}-${ACCOUNT_ID}"
+          KEY="deployments/server/${GITHUB_SHA}.zip"
+          VERSION_LABEL="server-${GITHUB_SHA}"
+
+          aws s3 cp server-deploy.zip "s3://${BUCKET}/${KEY}"
+
+          aws elasticbeanstalk create-application-version \
+            --application-name "${EB_APPLICATION_NAME}" \
+            --version-label "${VERSION_LABEL}" \
+            --source-bundle "S3Bucket=${BUCKET},S3Key=${KEY}" \
+            --process
+
+          aws elasticbeanstalk update-environment \
+            --environment-name "${EB_ENVIRONMENT_NAME}" \
+            --version-label "${VERSION_LABEL}"
+
+          aws elasticbeanstalk wait environment-updated --environment-name "${EB_ENVIRONMENT_NAME}"
+          aws elasticbeanstalk wait environment-ready --environment-name "${EB_ENVIRONMENT_NAME}"
+
