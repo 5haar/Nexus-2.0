@@ -316,6 +316,7 @@ export default function App() {
   const [assetStageById, setAssetStageById] = useState<Record<string, 'uploading' | 'indexing' | 'done' | 'error'>>(
     {},
   );
+  const [assetErrorById, setAssetErrorById] = useState<Record<string, string>>({});
   const importQueueRef = useRef<ResolvedAsset[]>([]);
   const importRunningRef = useRef(false);
   const importSessionRef = useRef<{ total: number; done: number; failed: number } | null>(null);
@@ -709,6 +710,7 @@ export default function App() {
       setScreenshots(resolved);
       setSelected(new Set());
       setAssetStageById({});
+      setAssetErrorById({});
     } catch (err: any) {
       setUiError(err?.message ?? 'Failed to load screenshots');
     } finally {
@@ -756,6 +758,13 @@ export default function App() {
     }
     if (!res.ok) {
       const detail = await res.text();
+      try {
+        const parsed = JSON.parse(detail);
+        const msg = String(parsed?.error ?? parsed?.message ?? '').trim();
+        if (msg) throw new Error(msg);
+      } catch {
+        // ignore
+      }
       throw new Error(detail || 'Upload failed');
     }
     const json = await res.json();
@@ -779,6 +788,12 @@ export default function App() {
 
           setImportProgress({ running: true, current: nextIndex, total: session.total, done: session.done, failed: session.failed });
           setAssetStageById((prev) => ({ ...prev, [item.id]: 'uploading' }));
+          setAssetErrorById((prev) => {
+            if (!prev[item.id]) return prev;
+            const next = { ...prev };
+            delete next[item.id];
+            return next;
+          });
 
           try {
             const uploaded = await uploadAssetToServer(item);
@@ -788,10 +803,9 @@ export default function App() {
           } catch (err: any) {
             const message = err?.message ?? 'Upload failed';
             setAssetStageById((prev) => ({ ...prev, [item.id]: 'error' }));
+            setAssetErrorById((prev) => ({ ...prev, [item.id]: String(message ?? 'Upload failed') }));
             session.failed += 1;
-            if (typeof message === 'string' && /network request failed|can[’']?t reach|timed out|AbortError/i.test(message)) {
-              setUiError((prev) => prev ?? message);
-            }
+            if (typeof message === 'string') setUiError((prev) => prev ?? message);
           }
         }
       } finally {
@@ -1187,6 +1201,7 @@ export default function App() {
 	              selected={selected}
 	              onToggleSelect={toggleSelect}
 	              assetStageById={assetStageById}
+	              assetErrorById={assetErrorById}
 	            />
 	          ) : (
             <CategoriesScreen
@@ -1988,6 +2003,7 @@ function ImportScreen(props: {
   selected: Set<string>;
   onToggleSelect: (id: string) => void;
   assetStageById: Record<string, 'uploading' | 'indexing' | 'done' | 'error'>;
+  assetErrorById?: Record<string, string>;
 }) {
   const showImporting =
     props.importProgress.total > 0 &&
@@ -2059,8 +2075,18 @@ function ImportScreen(props: {
             renderItem={({ item }) => {
               const isSelected = props.selected.has(item.id);
               const stage = props.assetStageById[item.id];
+              const errorMsg = props.assetErrorById?.[item.id] ?? '';
               return (
-                <Pressable onPress={() => props.onToggleSelect(item.id)} style={styles.assetWrapper}>
+                <Pressable
+                  onPress={() => props.onToggleSelect(item.id)}
+                  onLongPress={() => {
+                    if (stage !== 'error') return;
+                    if (!errorMsg) return;
+                    Alert.alert('Import failed', errorMsg);
+                  }}
+                  delayLongPress={220}
+                  style={styles.assetWrapper}
+                >
                   <Image source={{ uri: item.uri }} style={styles.asset} />
                   <View style={styles.assetGradient} pointerEvents="none" />
                   <View style={[styles.assetOverlay, isSelected && styles.assetOverlaySelected]} pointerEvents="none" />
