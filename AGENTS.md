@@ -23,7 +23,7 @@ Use this file as the source of truth for how to work safely and consistently in 
 - Run: `npm run ios` (or `npm run start`)
 - Set API base:
   - Dev: use the in-app “API base URL” setting (or `EXPO_PUBLIC_API_BASE_URL`).
-  - Prod: `EXPO_PUBLIC_API_BASE_URL=https://<your-domain>` (and WebSocket becomes `wss://` automatically).
+  - Prod: `EXPO_PUBLIC_API_BASE_URL=https://nexus.ragobble.com` (and WebSocket becomes `wss://` automatically).
 
 ## Repo Invariants (Don’t Break These)
 
@@ -67,6 +67,7 @@ Use this file as the source of truth for how to work safely and consistently in 
 
 ## Deployment Notes (AWS Elastic Beanstalk)
 
+- Production API base: `https://nexus.ragobble.com`
 - TLS terminates at the ALB; the server can run HTTP internally.
 - WebSocket endpoint is `/ws`; use `wss://` in production (derived from `EXPO_PUBLIC_API_BASE_URL`).
 - Set ALB idle timeout high enough for chat sessions (server pings periodically but don’t rely solely on pings).
@@ -83,4 +84,3 @@ Use this file as the source of truth for how to work safely and consistently in 
 
 - Make commits scoped and descriptive.
 - If asked by the user, commit after each logical change.
-
