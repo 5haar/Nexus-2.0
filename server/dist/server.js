@@ -496,7 +496,8 @@ const cosine = (a, b) => {
     return dot / (Math.sqrt(ma) * Math.sqrt(mb) || 1);
 };
 const listUserCategories = async (userId) => {
-    const limit = Math.max(0, Math.min(200, MAX_EXISTING_CATEGORIES_CONTEXT));
+    const limitRaw = Number.isFinite(MAX_EXISTING_CATEGORIES_CONTEXT) ? MAX_EXISTING_CATEGORIES_CONTEXT : 50;
+    const limit = Math.max(0, Math.min(200, Math.floor(limitRaw)));
     if (mysqlPool) {
         await ensureSchemaOnce();
         const [rows] = (await mysqlPool.execute(`SELECT c.name AS name, COUNT(dc.doc_id) AS cnt
@@ -505,7 +506,7 @@ const listUserCategories = async (userId) => {
        WHERE c.user_id=?
        GROUP BY c.id
        ORDER BY cnt DESC, c.name ASC
-       LIMIT ?`, [userId, limit]));
+       LIMIT ${limit}`, [userId]));
         return rows.map((r) => canonicalizeCategory(String(r?.name ?? ''))).filter(Boolean);
     }
     const counts = new Map();

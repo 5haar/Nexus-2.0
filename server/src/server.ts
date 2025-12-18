@@ -579,7 +579,8 @@ const cosine = (a: number[], b: number[]) => {
 };
 
 const listUserCategories = async (userId: string) => {
-  const limit = Math.max(0, Math.min(200, MAX_EXISTING_CATEGORIES_CONTEXT));
+  const limitRaw = Number.isFinite(MAX_EXISTING_CATEGORIES_CONTEXT) ? MAX_EXISTING_CATEGORIES_CONTEXT : 50;
+  const limit = Math.max(0, Math.min(200, Math.floor(limitRaw)));
   if (mysqlPool) {
     await ensureSchemaOnce();
     const [rows] = (await mysqlPool.execute(
@@ -589,8 +590,8 @@ const listUserCategories = async (userId: string) => {
        WHERE c.user_id=?
        GROUP BY c.id
        ORDER BY cnt DESC, c.name ASC
-       LIMIT ?`,
-      [userId, limit],
+       LIMIT ${limit}`,
+      [userId],
     )) as any[];
     return (rows as any[]).map((r) => canonicalizeCategory(String(r?.name ?? ''))).filter(Boolean);
   }
