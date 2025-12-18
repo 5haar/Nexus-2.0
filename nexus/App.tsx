@@ -1723,6 +1723,7 @@ function ChatScreen(props: {
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const [composerHeight, setComposerHeight] = useState(0);
   const canSend = !!props.chatInput.trim() && !props.chatThinking;
+  const empty = props.chatHistory.length === 0;
 
   useEffect(() => {
     const animateTo = (nextHeight: number, duration: number) => {
@@ -1766,10 +1767,22 @@ function ChatScreen(props: {
         data={props.chatHistory}
         inverted
         keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.chatList}
+        contentContainerStyle={[styles.chatList, empty && styles.chatListEmpty]}
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
-        ListHeaderComponent={<View style={{ height: spacerHeight }} />}
+        ListHeaderComponent={!empty ? <View style={{ height: spacerHeight }} /> : null}
+        ListEmptyComponent={
+          <View style={styles.chatEmptyWrap}>
+            <View style={styles.chatEmptyCard}>
+              <View style={styles.chatEmptyIcon}>
+                <Ionicons name="sparkles" size={18} color={COLORS.accentText} />
+              </View>
+              <Text style={styles.chatEmptyTitle}>Chat with your screenshots</Text>
+              <Text style={styles.chatEmptySubtitle}>Ask questions and find what’s inside your screenshots.</Text>
+              <Text style={styles.chatEmptyHint}>Tap + to import screenshots, then index them.</Text>
+            </View>
+          </View>
+        }
         renderItem={({ item }) => {
           const isUser = item.role === 'user';
           return (
@@ -3144,6 +3157,54 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 14,
     gap: 12,
+  },
+  chatListEmpty: {
+    flexGrow: 1,
+    justifyContent: 'center',
+    paddingVertical: 24,
+  },
+  chatEmptyWrap: {
+    alignItems: 'center',
+    paddingHorizontal: 12,
+  },
+  chatEmptyCard: {
+    width: '100%',
+    maxWidth: 420,
+    paddingVertical: 18,
+    paddingHorizontal: 16,
+    borderRadius: 18,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    alignItems: 'center',
+    gap: 8,
+  },
+  chatEmptyIcon: {
+    width: 38,
+    height: 38,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.accent,
+  },
+  chatEmptyTitle: {
+    color: COLORS.text,
+    fontSize: 16,
+    fontFamily: FONT_HEADING_BOLD,
+    textAlign: 'center',
+  },
+  chatEmptySubtitle: {
+    color: COLORS.muted,
+    fontSize: 13,
+    fontFamily: FONT_SANS,
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+  chatEmptyHint: {
+    color: COLORS.muted2,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+    textAlign: 'center',
   },
   messageRow: {
     flexDirection: 'row',
