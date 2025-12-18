@@ -205,7 +205,40 @@ const ensureSchemaOnce = async () => {
   await schemaEnsured;
 };
 
-const normalizeCategory = (value: string) => value.trim().toLowerCase();
+const normalizeCategoryDbKey = (value: string) => String(value ?? '').trim().toLowerCase();
+
+const canonicalizeCategory = (value: string) => {
+  let text = normalizeCategoryDbKey(value);
+  if (!text) return '';
+
+  // Remove common list/index prefixes like "0001 ", "1. ", "01) ", etc.
+  text = text.replace(/^(?:[#*•\-–—]+\s*)+/, '');
+  text = text.replace(/^(?:\(?\d{1,6}\)?[\].):\-–—]*\s+)+/, '');
+
+  // Remove delimiter artifacts from earlier category concatenation bugs.
+  text = text.replace(/\\u0001/gi, ' ');
+  text = text.replace(/\u0001/g, ' ');
+  text = text.replace(/\bu\s*0{3,}\d{1,3}\b/g, ' ');
+
+  // Remove standalone numeric tokens (often OCR artifacts).
+  text = text.replace(/\b\d{1,6}\b/g, ' ');
+
+  // Strip punctuation that commonly creeps into short tags.
+  text = text.replace(/[^\p{L}\p{N}\s_-]+/gu, ' ');
+
+  // Normalize whitespace.
+  text = text.replace(/\s+/g, ' ').trim();
+  text = text.replace(/^[-_]+|[-_]+$/g, '').trim();
+
+  // Avoid empty or non-informative tags.
+  if (!text) return '';
+  if (/^\d+$/.test(text)) return '';
+  if (!/[a-z]/.test(text)) return '';
+
+  // Keep tags reasonably short.
+  if (text.length > 64) text = text.slice(0, 64).trim();
+  return text;
+};
 
 const ensureUserRow = async (userId: string) => {
   if (!mysqlPool) return;
@@ -216,12 +249,48 @@ const ensureUserRow = async (userId: string) => {
 const upsertCategoryId = async (userId: string, name: string) => {
   if (!mysqlPool) throw new Error('DB not configured');
   await ensureSchemaOnce();
-  const normalized = normalizeCategory(name);
+  const normalized = canonicalizeCategory(name);
+  if (!normalized) throw new Error('Invalid category');
   const [result] = (await mysqlPool.execute(
     'INSERT INTO categories (user_id, name) VALUES (?, ?) ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)',
     [userId, normalized],
   )) as any;
   return Number(result.insertId) as number;
+};
+
+const resolveCategoryIdsInDb = async (userId: string, name: string) => {
+  if (!mysqlPool) throw new Error('DB not configured');
+  await ensureSchemaOnce();
+  const direct = normalizeCategoryDbKey(name);
+  const canonical = canonicalizeCategory(name);
+  if (!direct && !canonical) return [] as number[];
+
+  const ids = new Set<number>();
+
+  const candidates = Array.from(new Set([direct, canonical].filter(Boolean)));
+  if (candidates.length) {
+    const placeholders = candidates.map(() => '?').join(',');
+    const [rows] = (await mysqlPool.execute(
+      `SELECT id FROM categories WHERE user_id=? AND name IN (${placeholders})`,
+      [userId, ...candidates],
+    )) as any[];
+    for (const r of rows as any[]) {
+      const id = Number(r.id);
+      if (Number.isFinite(id)) ids.add(id);
+    }
+  }
+
+  if (canonical) {
+    // Scan user categories and match by canonicalization (covers older noisy names like "0001 reddit").
+    const [allRows] = (await mysqlPool.execute('SELECT id, name FROM categories WHERE user_id=?', [userId])) as any[];
+    for (const r of allRows as any[]) {
+      if (canonicalizeCategory(String(r.name ?? '')) !== canonical) continue;
+      const id = Number(r.id);
+      if (Number.isFinite(id)) ids.add(id);
+    }
+  }
+
+  return Array.from(ids);
 };
 
 const listDocsFromDb = async (userId: string, opts?: { includeEmbedding?: boolean }): Promise<ScreenshotDoc[]> => {
@@ -246,7 +315,7 @@ const listDocsFromDb = async (userId: string, opts?: { includeEmbedding?: boolea
       d.storage,
       d.file_path AS filePath,
       d.s3_key AS s3Key,
-      GROUP_CONCAT(c.name ORDER BY c.name SEPARATOR '\\u0001') AS categories
+      GROUP_CONCAT(c.name ORDER BY c.name SEPARATOR 0x01) AS categories
     FROM docs d
     LEFT JOIN doc_categories dc ON dc.doc_id = d.id
     LEFT JOIN categories c ON c.id = dc.category_id
@@ -257,13 +326,18 @@ const listDocsFromDb = async (userId: string, opts?: { includeEmbedding?: boolea
   )) as any[];
 
   return (rows as any[]).map((row) => {
-    const catsRaw: string =
+    const catsRawOriginal: string =
       typeof row.categories === 'string' ? row.categories : row.categories == null ? '' : String(row.categories);
-    const categories = catsRaw
-      ? catsRaw
-          .split('\u0001')
-          .map((c: string) => normalizeCategory(c))
-          .filter(Boolean)
+    const catsRaw = catsRawOriginal.split('\\u0001').join(String.fromCharCode(1));
+    const categories: string[] = catsRaw
+      ? Array.from(
+          new Set<string>(
+            catsRaw
+              .split('\u0001')
+              .map((c: string) => canonicalizeCategory(c))
+              .filter(Boolean),
+          ),
+        )
       : [];
     let embedding: number[] = [];
     if (includeEmbedding) {
@@ -315,7 +389,9 @@ const saveDocToDb = async (doc: ScreenshotDoc) => {
     ],
   );
 
-  const categories = (doc.categories ?? []).map(normalizeCategory).filter(Boolean).slice(0, 5);
+  const categories = Array.from(
+    new Set((doc.categories ?? []).map((c) => canonicalizeCategory(c)).filter(Boolean)),
+  ).slice(0, 5);
   for (const name of categories) {
     const categoryId = await upsertCategoryId(doc.userId, name);
     await mysqlPool.execute('INSERT IGNORE INTO doc_categories (doc_id, category_id) VALUES (?, ?)', [doc.id, categoryId]);
@@ -342,40 +418,27 @@ const deleteDocFromDb = async (userId: string, docId: string) => {
 const renameCategoryInDb = async (userId: string, from: string, to: string) => {
   if (!mysqlPool) throw new Error('DB not configured');
   await ensureSchemaOnce();
-  const fromName = normalizeCategory(from);
-  const toName = normalizeCategory(to);
+  const fromName = canonicalizeCategory(from);
+  const toName = canonicalizeCategory(to);
   if (!fromName || !toName || fromName === toName) return 0;
 
-  const [fromRows] = (await mysqlPool.execute('SELECT id FROM categories WHERE user_id=? AND name=?', [
-    userId,
-    fromName,
-  ])) as any[];
-  const fromRow = (fromRows as any[])[0];
-  if (!fromRow) return 0;
-  const fromId = Number(fromRow.id);
+  const fromIds = await resolveCategoryIdsInDb(userId, fromName);
+  if (!fromIds.length) return 0;
 
-  const [toRows] = (await mysqlPool.execute('SELECT id FROM categories WHERE user_id=? AND name=?', [
-    userId,
-    toName,
-  ])) as any[];
-  const toRow = (toRows as any[])[0];
-  if (!toRow) {
-    const [result] = (await mysqlPool.execute('UPDATE categories SET name=? WHERE id=? AND user_id=?', [
-      toName,
-      fromId,
-      userId,
-    ])) as any[];
-    return Number(result.affectedRows ?? 0);
+  const toId = await upsertCategoryId(userId, toName);
+
+  let changed = 0;
+  for (const fromId of fromIds) {
+    if (fromId === toId) continue;
+    await mysqlPool.execute(
+      'INSERT IGNORE INTO doc_categories (doc_id, category_id) SELECT doc_id, ? FROM doc_categories WHERE category_id=?',
+      [toId, fromId],
+    );
+    await mysqlPool.execute('DELETE FROM doc_categories WHERE category_id=?', [fromId]);
+    await mysqlPool.execute('DELETE FROM categories WHERE id=? AND user_id=?', [fromId, userId]);
+    changed += 1;
   }
-
-  const toId = Number(toRow.id);
-  await mysqlPool.execute(
-    'INSERT IGNORE INTO doc_categories (doc_id, category_id) SELECT doc_id, ? FROM doc_categories WHERE category_id=?',
-    [toId, fromId],
-  );
-  await mysqlPool.execute('DELETE FROM doc_categories WHERE category_id=?', [fromId]);
-  await mysqlPool.execute('DELETE FROM categories WHERE id=? AND user_id=?', [fromId, userId]);
-  return 1;
+  return changed ? 1 : 0;
 };
 
 const deleteCategoryInDb = async (
@@ -385,8 +448,13 @@ const deleteCategoryInDb = async (
 ) => {
   if (!mysqlPool) throw new Error('DB not configured');
   await ensureSchemaOnce();
-  const categoryName = normalizeCategory(name);
+  const categoryName = canonicalizeCategory(name);
   if (!categoryName) return { removedFrom: 0, deletedDocs: 0 };
+  const categoryIds = await resolveCategoryIdsInDb(userId, categoryName);
+  if (!categoryIds.length) {
+    await mysqlPool.execute('DELETE FROM categories WHERE user_id=? AND name=?', [userId, categoryName]);
+    return { removedFrom: 0, deletedDocs: 0 };
+  }
   const cleanupMeta = async (meta: null | { filePath?: string; s3Key?: string }) => {
     if (!meta) return;
     if (meta.s3Key) {
@@ -405,17 +473,18 @@ const deleteCategoryInDb = async (
     }
   };
 
+  const placeholders = categoryIds.map(() => '?').join(',');
   const [docRows] = (await mysqlPool.execute(
-    `SELECT dc.doc_id AS docId
+    `SELECT DISTINCT dc.doc_id AS docId
      FROM doc_categories dc
      JOIN categories c ON c.id = dc.category_id
-     WHERE c.user_id = ? AND c.name = ?`,
-    [userId, categoryName],
+     WHERE c.user_id = ? AND c.id IN (${placeholders})`,
+    [userId, ...categoryIds],
   )) as any[];
   const docIds = (docRows as any[]).map((r) => String(r.docId));
 
   if (docIds.length === 0) {
-    await mysqlPool.execute('DELETE FROM categories WHERE user_id=? AND name=?', [userId, categoryName]);
+    await mysqlPool.execute(`DELETE FROM categories WHERE user_id=? AND id IN (${placeholders})`, [userId, ...categoryIds]);
     return { removedFrom: 0, deletedDocs: 0 };
   }
 
@@ -430,11 +499,11 @@ const deleteCategoryInDb = async (
         await cleanupMeta(meta);
       }
     }
-    await mysqlPool.execute('DELETE FROM categories WHERE user_id=? AND name=?', [userId, categoryName]);
+    await mysqlPool.execute(`DELETE FROM categories WHERE user_id=? AND id IN (${placeholders})`, [userId, ...categoryIds]);
     return { removedFrom: 0, deletedDocs };
   }
 
-  await mysqlPool.execute('DELETE FROM categories WHERE user_id=? AND name=?', [userId, categoryName]);
+  await mysqlPool.execute(`DELETE FROM categories WHERE user_id=? AND id IN (${placeholders})`, [userId, ...categoryIds]);
 
   if (mode !== 'unlink-delete-orphans') {
     return { removedFrom, deletedDocs: 0 };
@@ -534,7 +603,7 @@ const analyzeScreenshot = async (filePath: string, mime: string): Promise<Analys
         content: [
           {
             type: 'text',
-            text: 'Return JSON with caption, categories, text array. Keep categories short, lowercase, and thematic.',
+            text: 'Return JSON with caption, categories, text array. Categories must be short, lowercase, thematic, and contain no numbers, ids, timestamps, or list indices.',
           },
           {
             type: 'image_url',
@@ -724,7 +793,7 @@ app.get('/api/categories', async (req, res) => {
     const docs = await listDocs(userId);
     docs.forEach((doc) => {
       doc.categories.forEach((c) => {
-        const key = c.trim().toLowerCase();
+        const key = canonicalizeCategory(c);
         if (!key) return;
         map[key] = (map[key] ?? 0) + 1;
       });
@@ -799,9 +868,9 @@ app.delete('/api/categories/:name', async (req, res) => {
     return res.status(400).json({ error: err?.message ?? 'Invalid request' });
   }
   const raw = req.params.name ?? '';
-  let name = raw.trim().toLowerCase();
+  let name = canonicalizeCategory(raw);
   try {
-    name = decodeURIComponent(raw).trim().toLowerCase();
+    name = canonicalizeCategory(decodeURIComponent(raw));
   } catch {
     // ignore malformed encoding; use raw param
   }
@@ -831,7 +900,7 @@ app.delete('/api/categories/:name', async (req, res) => {
       continue;
     }
     const before = doc.categories ?? [];
-    const has = before.some((c) => c.trim().toLowerCase() === name);
+    const has = before.some((c) => canonicalizeCategory(c) === name);
     if (!has) {
       keep.push(doc);
       continue;
@@ -856,7 +925,7 @@ app.delete('/api/categories/:name', async (req, res) => {
       continue;
     }
 
-    const nextCategories = before.filter((c) => c.trim().toLowerCase() !== name);
+    const nextCategories = before.filter((c) => canonicalizeCategory(c) !== name);
     removedFrom += 1;
 
     if (mode === 'unlink-delete-orphans' && nextCategories.length === 0) {
@@ -878,7 +947,10 @@ app.delete('/api/categories/:name', async (req, res) => {
       continue;
     }
 
-    keep.push({ ...doc, categories: nextCategories });
+    keep.push({
+      ...doc,
+      categories: Array.from(new Set(nextCategories.map((c) => canonicalizeCategory(c)).filter(Boolean))),
+    });
   }
 
   db.docs = keep;
@@ -899,15 +971,15 @@ app.patch('/api/categories/:name', async (req, res) => {
     return res.status(400).json({ error: err?.message ?? 'Invalid request' });
   }
   const raw = req.params.name ?? '';
-  let fromName = raw.trim().toLowerCase();
+  let fromName = canonicalizeCategory(raw);
   try {
-    fromName = decodeURIComponent(raw).trim().toLowerCase();
+    fromName = canonicalizeCategory(decodeURIComponent(raw));
   } catch {
     // ignore malformed encoding; use raw param
   }
 
   const toRaw = String((req.body as any)?.to ?? '').trim();
-  const toName = toRaw.trim().toLowerCase();
+  const toName = canonicalizeCategory(toRaw);
 
   if (!fromName) return res.status(400).json({ error: 'name is required' });
   if (!toName) return res.status(400).json({ error: 'to is required' });
@@ -927,14 +999,14 @@ app.patch('/api/categories/:name', async (req, res) => {
   db.docs = db.docs.map((doc) => {
     if (doc.userId !== userId) return doc;
     const before = doc.categories ?? [];
-    const has = before.some((c) => c.trim().toLowerCase() === fromName);
+    const has = before.some((c) => canonicalizeCategory(c) === fromName);
     if (!has) return doc;
 
-    const renamed = before.map((c) => (c.trim().toLowerCase() === fromName ? toName : c));
+    const renamed = before.map((c) => (canonicalizeCategory(c) === fromName ? toName : c));
     const deduped: string[] = [];
     const seen = new Set<string>();
     for (const c of renamed) {
-      const key = c.trim().toLowerCase();
+      const key = canonicalizeCategory(c);
       if (!key) continue;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -966,28 +1038,31 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
     let doc: ScreenshotDoc;
 
-    if (isImage) {
-      const { filePath: usablePath, converted } = await convertImageToPng(req.file.path, fileMime);
-      const analysis = await analyzeScreenshot(usablePath, converted ? 'image/png' : fileMime);
-      const combinedText = [analysis.caption, ...(analysis.text ?? [])].join('\n');
-      const embedding = await embedText(combinedText);
-      const id = randomId();
+	    if (isImage) {
+	      const { filePath: usablePath, converted } = await convertImageToPng(req.file.path, fileMime);
+	      const analysis = await analyzeScreenshot(usablePath, converted ? 'image/png' : fileMime);
+	      const combinedText = [analysis.caption, ...(analysis.text ?? [])].join('\n');
+	      const embedding = await embedText(combinedText);
+	      const id = randomId();
+	      const categories = Array.from(
+	        new Set((analysis.categories ?? []).map((c) => canonicalizeCategory(c)).filter(Boolean)),
+	      ).slice(0, 5);
 
-      doc = {
-        id,
-        userId,
-        filePath: usablePath,
+	      doc = {
+	        id,
+	        userId,
+	        filePath: usablePath,
         originalName: converted
           ? req.file.originalname.replace(/\.[^.]+$/i, '.png')
           : req.file.originalname,
-        fileMime: converted ? 'image/png' : fileMime,
-        mediaType: 'image',
-        caption: analysis.caption || 'Screenshot',
-        categories: analysis.categories?.slice(0, 5) ?? [],
-        text: (analysis.text ?? []).join(' '),
-        embedding,
-        createdAt,
-      };
+	        fileMime: converted ? 'image/png' : fileMime,
+	        mediaType: 'image',
+	        caption: analysis.caption || 'Screenshot',
+	        categories,
+	        text: (analysis.text ?? []).join(' '),
+	        embedding,
+	        createdAt,
+	      };
     } else if (isVideo) {
       // Store video without analysis; categorize as "video" to keep it visible in folders.
       const id = randomId();
