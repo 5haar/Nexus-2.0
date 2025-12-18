@@ -62,6 +62,12 @@ const VISION_MODEL = 'gpt-5.2';
 const EMBED_MODEL = 'text-embedding-3-small';
 const MAX_CATEGORIES_PER_DOC = Number(process.env.MAX_CATEGORIES_PER_DOC || 2);
 const MAX_EXISTING_CATEGORIES_CONTEXT = Number(process.env.MAX_EXISTING_CATEGORIES_CONTEXT || 50);
+const RAG_TOPK_MAX = Number(process.env.RAG_TOPK_MAX || 6);
+const RAG_MIN_COSINE = Number(process.env.RAG_MIN_COSINE || 0.18);
+const RAG_LEXICAL_WEIGHT = Number(process.env.RAG_LEXICAL_WEIGHT || 0.08);
+const RAG_MIN_HYBRID_SCORE = Number(process.env.RAG_MIN_HYBRID_SCORE || 0.19);
+const RAG_DOC_TEXT_MAX_CHARS = Number(process.env.RAG_DOC_TEXT_MAX_CHARS || 420);
+const RAG_DOC_CAPTION_MAX_CHARS = Number(process.env.RAG_DOC_CAPTION_MAX_CHARS || 120);
 
 if (!OPENAI_API_KEY) {
   console.warn('OPENAI_API_KEY is not set. Vision and search will fail.');
@@ -678,27 +684,69 @@ const embedText = async (text: string) => {
   return result.data?.[0]?.embedding ?? [];
 };
 
-const buildRetrievalContext = async (query: string, topK: number, userId: string) => {
-  const searchable = await listSearchableDocs(userId);
+const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+const clampInt = (n: unknown, min: number, max: number) => clamp(Number(n || 0) | 0, min, max);
+const truncate = (text: string, maxChars: number) => {
+  const s = String(text ?? '');
+  if (s.length <= maxChars) return s;
+  return s.slice(0, Math.max(0, maxChars - 1)).trimEnd() + '…';
+};
+const tokenize = (text: string) => {
+  const tokens = String(text ?? '')
+    .toLowerCase()
+    .match(/[a-z0-9]{3,}/g);
+  return Array.from(new Set(tokens ?? [])).slice(0, 40);
+};
+
+const buildRetrievalContext = async (query: string, topK: number, userId: string, category?: string | null) => {
+  const requestedTopK = clampInt(topK, 1, RAG_TOPK_MAX);
+  const categoryKey = category ? canonicalizeCategory(category) : '';
+  const searchableAll = await listSearchableDocs(userId);
+  if (!searchableAll.length) {
+    return { context: '', ranked: [] as { doc: ScreenshotDoc; score: number }[], reason: 'No screenshots indexed yet.' };
+  }
+  const searchable = categoryKey
+    ? searchableAll.filter((d) => (d.categories ?? []).some((c) => canonicalizeCategory(c) === categoryKey))
+    : searchableAll;
   if (!searchable.length) {
-    return { context: '', ranked: [] as { doc: ScreenshotDoc; score: number }[] };
+    return {
+      context: '',
+      ranked: [] as { doc: ScreenshotDoc; score: number }[],
+      reason: categoryKey ? `No screenshots found in “${categoryKey}”.` : 'No screenshots indexed yet.',
+    };
   }
   const queryEmbedding = await embedText(query);
+  const queryTokens = tokenize(query);
   const ranked = searchable
-    .map((doc) => ({
-      doc,
-      score: cosine(queryEmbedding, doc.embedding),
-    }))
+    .map((doc) => {
+      const cosineScore = cosine(queryEmbedding, doc.embedding);
+      const docBlob = `${doc.caption}\n${(doc.categories ?? []).join(' ')}\n${doc.text}`;
+      const docTokens = tokenize(docBlob);
+      const overlap =
+        queryTokens.length === 0 ? 0 : queryTokens.filter((t) => docTokens.includes(t)).length / queryTokens.length;
+      const hybrid = cosineScore + RAG_LEXICAL_WEIGHT * overlap;
+      return { doc, score: hybrid, cosine: cosineScore, overlap };
+    })
+    .filter((r) => r.cosine >= RAG_MIN_COSINE || r.overlap >= 0.34)
+    .filter((r) => r.score >= RAG_MIN_HYBRID_SCORE)
     .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
+    .slice(0, requestedTopK);
+
+  if (!ranked.length) {
+    return {
+      context: '',
+      ranked: [] as { doc: ScreenshotDoc; score: number }[],
+      reason: 'No relevant screenshots found for that question.',
+    };
+  }
 
   const context = ranked
-    .map(
-      ({ doc, score }) =>
-        `score:${score.toFixed(3)} | caption:${doc.caption} | categories:${doc.categories.join(
-          ', ',
-        )} | text:${doc.text}`,
-    )
+    .map(({ doc, score, cosine, overlap }) => {
+      const caption = truncate(doc.caption, RAG_DOC_CAPTION_MAX_CHARS);
+      const text = truncate(doc.text, RAG_DOC_TEXT_MAX_CHARS);
+      const cats = (doc.categories ?? []).map((c) => canonicalizeCategory(c)).filter(Boolean).join(', ');
+      return `score:${score.toFixed(3)} cos:${cosine.toFixed(3)} lex:${overlap.toFixed(2)} | caption:${caption} | categories:${cats} | text:${text}`;
+    })
     .join('\n');
 
   return { context, ranked };
@@ -1167,7 +1215,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 });
 
 app.post('/api/search', async (req, res) => {
-  const { query, topK = 5 } = req.body as { query?: string; topK?: number };
+  const { query, topK = 5, category } = req.body as { query?: string; topK?: number; category?: string };
   if (!query || !query.trim()) {
     return res.status(400).json({ error: 'query is required' });
   }
@@ -1178,8 +1226,8 @@ app.post('/api/search', async (req, res) => {
     return res.status(400).json({ error: err?.message ?? 'Invalid request' });
   }
   try {
-    const { context, ranked } = await buildRetrievalContext(query, topK, userId);
-    if (!ranked.length) return res.json({ answer: 'No documents indexed yet.', matches: [] });
+    const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, category);
+    if (!ranked.length) return res.json({ answer: reason || 'No screenshots indexed yet.', matches: [] });
     const openaiClient = requireOpenAI();
 
     const response = await openaiClient.chat.completions.create({
@@ -1188,7 +1236,7 @@ app.post('/api/search', async (req, res) => {
         {
           role: 'system',
           content:
-            'You are a retrieval assistant. Use the provided screenshot context to answer briefly. If unsure, say so.',
+            'You are a retrieval assistant. Use only the provided screenshot context to answer briefly. If context is irrelevant or insufficient, say so.',
         },
         { role: 'user', content: `Context:\n${context}\n\nQuestion: ${query}` },
       ],
@@ -1214,7 +1262,7 @@ app.post('/api/search', async (req, res) => {
 });
 
 app.post('/api/search-stream', async (req, res) => {
-  const { query, topK = 5 } = req.body as { query?: string; topK?: number };
+  const { query, topK = 5, category } = req.body as { query?: string; topK?: number; category?: string };
   if (!query || !query.trim()) {
     res.status(400).json({ error: 'query is required' });
     return;
@@ -1254,9 +1302,9 @@ app.post('/api/search-stream', async (req, res) => {
   res.on('finish', () => clearInterval(heartbeat));
 
   try {
-    const { context, ranked } = await buildRetrievalContext(query, topK, userId);
+    const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, category);
     if (!ranked.length) {
-      writeSse(res, { type: 'info', message: 'No documents indexed yet.' });
+      writeSse(res, { type: 'info', message: reason || 'No screenshots indexed yet.' });
       writeSse(res, { type: 'done' });
       res.end();
       return;
@@ -1280,7 +1328,7 @@ app.post('/api/search-stream', async (req, res) => {
           {
             role: 'system',
             content:
-              'You are a retrieval assistant. Use the provided screenshot context to answer briefly. If unsure, say so.',
+              'You are a retrieval assistant. Use only the provided screenshot context to answer briefly. If context is irrelevant or insufficient, say so.',
           },
           { role: 'user', content: `Context:\n${context}\n\nQuestion: ${query}` },
         ],
@@ -1346,6 +1394,8 @@ wss.on('connection', (ws) => {
 
     const query = typeof message?.query === 'string' ? message.query.trim() : '';
     const topK = typeof message?.topK === 'number' ? message.topK : 5;
+    const category =
+      typeof message?.category === 'string' && message.category.trim().length <= 80 ? message.category.trim() : '';
     const userIdRaw = typeof message?.userId === 'string' ? message.userId.trim() : '';
     const userId = userIdRaw && /^[a-zA-Z0-9_-]{3,128}$/.test(userIdRaw) ? userIdRaw : 'public';
     if (!query) {
@@ -1357,9 +1407,9 @@ wss.on('connection', (ws) => {
     activeController = new AbortController();
 
     try {
-      const { context, ranked } = await buildRetrievalContext(query, topK, userId);
+      const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, category);
       if (!ranked.length) {
-        wsSend(ws, { type: 'info', message: 'No documents indexed yet.' });
+        wsSend(ws, { type: 'info', message: reason || 'No screenshots indexed yet.' });
         wsSend(ws, { type: 'done' });
         return;
       }
@@ -1381,7 +1431,7 @@ wss.on('connection', (ws) => {
             {
               role: 'system',
               content:
-                'You are a retrieval assistant. Use the provided screenshot context to answer briefly. If unsure, say so.',
+                'You are a retrieval assistant. Use only the provided screenshot context to answer briefly. If context is irrelevant or insufficient, say so.',
             },
             { role: 'user', content: `Context:\n${context}\n\nQuestion: ${query}` },
           ],
