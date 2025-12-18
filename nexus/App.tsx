@@ -1785,18 +1785,6 @@ function ChatScreen(props: {
         keyboardShouldPersistTaps="handled"
         keyboardDismissMode="on-drag"
         ListHeaderComponent={!empty ? <View style={{ height: spacerHeight }} /> : null}
-        ListEmptyComponent={
-          <View style={styles.chatEmptyWrap}>
-            <View style={styles.chatEmptyCard}>
-              <View style={styles.chatEmptyIcon}>
-                <Ionicons name="sparkles" size={18} color={COLORS.accentText} />
-              </View>
-              <Text style={styles.chatEmptyTitle}>Chat with your screenshots</Text>
-              <Text style={styles.chatEmptySubtitle}>Ask questions and find what’s inside your screenshots.</Text>
-              <Text style={styles.chatEmptyHint}>Tap + to import screenshots, then index them.</Text>
-            </View>
-          </View>
-        }
         renderItem={({ item }) => {
           const isUser = item.role === 'user';
           return (
@@ -1847,6 +1835,21 @@ function ChatScreen(props: {
           );
         }}
       />
+      {empty && (
+        <Animated.View
+          pointerEvents="none"
+          style={[styles.chatEmptyOverlay, { bottom: composerHeight + 56, transform: [{ translateY }] }]}
+        >
+          <View pointerEvents="none" style={styles.chatEmptyCard}>
+            <View style={styles.chatEmptyIcon}>
+              <Ionicons name="sparkles" size={18} color={COLORS.accentText} />
+            </View>
+            <Text style={styles.chatEmptyTitle}>Chat with your screenshots</Text>
+            <Text style={styles.chatEmptySubtitle}>Ask questions and find what’s inside your screenshots.</Text>
+            <Text style={styles.chatEmptyHint}>Tap + to import screenshots, then index them.</Text>
+          </View>
+        </Animated.View>
+      )}
       <Animated.View
         style={[styles.composerOuter, { transform: [{ translateY }] }]}
         onLayout={(e) => {
@@ -3177,9 +3180,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingVertical: 24,
   },
-  chatEmptyWrap: {
+  chatEmptyOverlay: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
     alignItems: 'center',
     paddingHorizontal: 12,
+    justifyContent: 'center',
   },
   chatEmptyCard: {
     width: '100%',
