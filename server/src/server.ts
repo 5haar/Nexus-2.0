@@ -31,7 +31,8 @@ const writeSse = (res: express.Response, data: unknown) => {
 
 type Analysis = {
   caption: string;
-  categories: string[];
+  existingCategories: string[];
+  newCategories: string[];
   text: string[];
 };
 
@@ -59,6 +60,8 @@ const PORT = process.env.PORT || 4000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const VISION_MODEL = 'gpt-5.2';
 const EMBED_MODEL = 'text-embedding-3-small';
+const MAX_CATEGORIES_PER_DOC = Number(process.env.MAX_CATEGORIES_PER_DOC || 2);
+const MAX_EXISTING_CATEGORIES_CONTEXT = Number(process.env.MAX_EXISTING_CATEGORIES_CONTEXT || 50);
 
 if (!OPENAI_API_KEY) {
   console.warn('OPENAI_API_KEY is not set. Vision and search will fail.');
@@ -391,7 +394,7 @@ const saveDocToDb = async (doc: ScreenshotDoc) => {
 
   const categories = Array.from(
     new Set((doc.categories ?? []).map((c) => canonicalizeCategory(c)).filter(Boolean)),
-  ).slice(0, 5);
+  ).slice(0, Math.max(1, Math.min(10, MAX_CATEGORIES_PER_DOC)));
   for (const name of categories) {
     const categoryId = await upsertCategoryId(doc.userId, name);
     await mysqlPool.execute('INSERT IGNORE INTO doc_categories (doc_id, category_id) VALUES (?, ?)', [doc.id, categoryId]);
@@ -569,10 +572,46 @@ const cosine = (a: number[], b: number[]) => {
   return dot / (Math.sqrt(ma) * Math.sqrt(mb) || 1);
 };
 
-const analyzeScreenshot = async (filePath: string, mime: string): Promise<Analysis> => {
+const listUserCategories = async (userId: string) => {
+  const limit = Math.max(0, Math.min(200, MAX_EXISTING_CATEGORIES_CONTEXT));
+  if (mysqlPool) {
+    await ensureSchemaOnce();
+    const [rows] = (await mysqlPool.execute(
+      `SELECT c.name AS name, COUNT(dc.doc_id) AS cnt
+       FROM categories c
+       LEFT JOIN doc_categories dc ON dc.category_id = c.id
+       WHERE c.user_id=?
+       GROUP BY c.id
+       ORDER BY cnt DESC, c.name ASC
+       LIMIT ?`,
+      [userId, limit],
+    )) as any[];
+    return (rows as any[]).map((r) => canonicalizeCategory(String(r?.name ?? ''))).filter(Boolean);
+  }
+
+  const counts = new Map<string, number>();
+  for (const doc of db.docs) {
+    if (doc.userId !== userId) continue;
+    for (const c of doc.categories ?? []) {
+      const key = canonicalizeCategory(c);
+      if (!key) continue;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, limit)
+    .map(([name]) => name);
+};
+
+const analyzeScreenshot = async (filePath: string, mime: string, existingCategories: string[]): Promise<Analysis> => {
   if (!openai) throw new Error('Missing OPENAI_API_KEY');
   const base64 = fs.readFileSync(filePath, { encoding: 'base64' });
   const safeMime = mime?.startsWith('image/') ? mime : 'image/png';
+  const safeExisting = Array.from(new Set(existingCategories.map((c) => canonicalizeCategory(c)).filter(Boolean))).slice(
+    0,
+    Math.max(0, Math.min(200, MAX_EXISTING_CATEGORIES_CONTEXT)),
+  );
   const response = await openai.chat.completions.create({
     model: VISION_MODEL,
     response_format: {
@@ -583,10 +622,11 @@ const analyzeScreenshot = async (filePath: string, mime: string): Promise<Analys
           type: 'object',
           properties: {
             caption: { type: 'string' },
-            categories: { type: 'array', items: { type: 'string' } },
+            existingCategories: { type: 'array', items: { type: 'string' } },
+            newCategories: { type: 'array', items: { type: 'string' } },
             text: { type: 'array', items: { type: 'string' } },
           },
-          required: ['caption', 'categories', 'text'],
+          required: ['caption', 'existingCategories', 'newCategories', 'text'],
           additionalProperties: false,
         },
         strict: true,
@@ -596,14 +636,22 @@ const analyzeScreenshot = async (filePath: string, mime: string): Promise<Analys
       {
         role: 'system',
         content:
-          'You summarize and categorize screenshots. Extract on-screen text accurately and return concise categories (3-5).',
+          'You summarize screenshots and categorize them. Extract on-screen text accurately. Choose at most 2 categories total, preferring existing categories when they fit.',
       },
       {
         role: 'user',
         content: [
           {
             type: 'text',
-            text: 'Return JSON with caption, categories, text array. Categories must be short, lowercase, thematic, and contain no numbers, ids, timestamps, or list indices.',
+            text:
+              'Return JSON with caption, existingCategories, newCategories, text array.\n' +
+              'Rules:\n' +
+              '- Prefer the provided existing categories when a screenshot fits.\n' +
+              '- Output 1–2 categories total.\n' +
+              '- existingCategories must be picked verbatim from the provided list.\n' +
+              '- If none fit, put exactly 1 short, lowercase, thematic category in newCategories.\n' +
+              '- Never include numbers, ids, timestamps, or list indices in categories.\n' +
+              `Existing categories: ${JSON.stringify(safeExisting)}\n`,
           },
           {
             type: 'image_url',
@@ -1049,13 +1097,22 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 
 	    if (isImage) {
 	      const { filePath: usablePath, converted } = await convertImageToPng(req.file.path, fileMime);
-	      const analysis = await analyzeScreenshot(usablePath, converted ? 'image/png' : fileMime);
+	      const existingCategories = await listUserCategories(userId);
+	      const analysis = await analyzeScreenshot(usablePath, converted ? 'image/png' : fileMime, existingCategories);
 	      const combinedText = [analysis.caption, ...(analysis.text ?? [])].join('\n');
 	      const embedding = await embedText(combinedText);
 	      const id = randomId();
-	      const categories = Array.from(
-	        new Set((analysis.categories ?? []).map((c) => canonicalizeCategory(c)).filter(Boolean)),
-	      ).slice(0, 5);
+	      const existingSet = new Set(existingCategories.map((c) => canonicalizeCategory(c)).filter(Boolean));
+	      const pickedExisting = (analysis.existingCategories ?? [])
+	        .map((c) => canonicalizeCategory(c))
+	        .filter((c) => !!c && existingSet.has(c));
+	      const pickedNew = (analysis.newCategories ?? [])
+	        .map((c) => canonicalizeCategory(c))
+	        .filter((c) => !!c && !existingSet.has(c));
+	      const categories = Array.from(new Set([...pickedExisting, ...pickedNew])).slice(
+	        0,
+	        Math.max(1, Math.min(10, MAX_CATEGORIES_PER_DOC)),
+	      );
 
 	      doc = {
 	        id,
