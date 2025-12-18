@@ -628,8 +628,8 @@ const analyzeScreenshot = async (filePath: string, mime: string, existingCategor
           type: 'object',
           properties: {
             caption: { type: 'string' },
-            existingCategories: { type: 'array', items: { type: 'string' }, maxItems: 1 },
-            newCategories: { type: 'array', items: { type: 'string' }, maxItems: 1 },
+            existingCategories: { type: 'array', items: { type: 'string' } },
+            newCategories: { type: 'array', items: { type: 'string' } },
             text: { type: 'array', items: { type: 'string' } },
           },
           required: ['caption', 'existingCategories', 'newCategories', 'text'],
