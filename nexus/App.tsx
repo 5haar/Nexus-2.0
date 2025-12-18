@@ -1349,9 +1349,7 @@ function Sidebar(props: {
   return (
     <View style={styles.sidebar}>
       <View style={styles.sidebarHeader}>
-        <View style={styles.brandIconLarge}>
-          <Ionicons name="sparkles" size={18} color={COLORS.accentText} />
-        </View>
+        <BrandMark size={34} />
         <Text style={styles.sidebarTitle}>Nexus</Text>
       </View>
 
@@ -1389,6 +1387,19 @@ function Sidebar(props: {
           </Text>
         </Pressable>
       </View>
+    </View>
+  );
+}
+
+function BrandMark(props: { size?: number }) {
+  const size = props.size ?? 32;
+  return (
+    <View style={[styles.brandMarkWrap, { width: size, height: size, borderRadius: Math.round(size * 0.35) }]}>
+      <Image
+        source={require('./assets/icon.png')}
+        style={{ width: size - 8, height: size - 8, borderRadius: Math.round((size - 8) * 0.22) }}
+        resizeMode="contain"
+      />
     </View>
   );
 }
@@ -1482,9 +1493,7 @@ function HamburgerMenu(props: {
               >
                 <View style={styles.menuHeader}>
                   <View style={styles.brand}>
-                    <View style={styles.brandIcon}>
-                      <Ionicons name="sparkles" size={16} color={COLORS.accentText} />
-                    </View>
+                    <BrandMark size={32} />
                     <Text style={styles.brandText}>Nexus</Text>
                   </View>
                 </View>
@@ -2696,6 +2705,13 @@ const styles = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.accent,
+    borderColor: COLORS.border,
+    borderWidth: 1,
+  },
+  brandMarkWrap: {
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: COLORS.accent,
