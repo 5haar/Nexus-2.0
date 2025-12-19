@@ -109,11 +109,21 @@ const resolveApiBase = (configured: string) => {
 };
 
 const DEFAULT_API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+const DEFAULT_CHAT_MODEL = process.env.EXPO_PUBLIC_CHAT_MODEL ?? 'gpt-5.2';
 const API_BASE_STORAGE_KEY = 'nexus.apiBase';
+const CHAT_MODEL_STORAGE_KEY = 'nexus.chatModel';
 const USER_ID_STORAGE_KEY = 'nexus.userId';
 const THREADS_STORAGE_KEY_PREFIX = 'nexus.threads.';
 const ACTIVE_THREAD_STORAGE_KEY_PREFIX = 'nexus.thread.active.';
 const TUTORIAL_SEEN_STORAGE_KEY = 'nexus.tutorialSeen.v1';
+const CHAT_MODEL_OPTIONS = (() => {
+  const raw = process.env.EXPO_PUBLIC_CHAT_MODELS;
+  const parsed = raw
+    ? raw.split(',').map((model) => model.trim()).filter(Boolean)
+    : [];
+  const fallback = parsed.length ? parsed : [DEFAULT_CHAT_MODEL, 'gpt-4.1', 'gpt-4o-mini'];
+  return Array.from(new Set(fallback));
+})();
 
 const COLORS = {
   bg: '#ffffff',
@@ -338,6 +348,7 @@ export default function App() {
   const [activeThreadId, setActiveThreadId] = useState('');
   const [chatThinking, setChatThinking] = useState(false);
   const [chatScopeCategory, setChatScopeCategory] = useState<string>(''); // '' => all screenshots
+  const [chatModel, setChatModel] = useState(DEFAULT_CHAT_MODEL);
   const wsRef = useRef<WebSocket | null>(null);
   const threadsRef = useRef<ChatThread[]>([]);
   const activeThreadIdRef = useRef('');
@@ -597,6 +608,23 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stored = (await AsyncStorage.getItem(CHAT_MODEL_STORAGE_KEY))?.trim();
+        if (stored && CHAT_MODEL_OPTIONS.includes(stored)) {
+          if (!cancelled) setChatModel(stored);
+        }
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const openApiModal = () => {
     setApiDraft(apiBase);
     setApiModalOpen(true);
@@ -614,6 +642,17 @@ export default function App() {
     setApiBase(next);
     await AsyncStorage.setItem(API_BASE_STORAGE_KEY, next);
     setApiModalOpen(false);
+  };
+
+  const saveChatModel = async (next: string) => {
+    const trimmed = next.trim();
+    if (!trimmed || !CHAT_MODEL_OPTIONS.includes(trimmed)) return;
+    setChatModel(trimmed);
+    try {
+      await AsyncStorage.setItem(CHAT_MODEL_STORAGE_KEY, trimmed);
+    } catch {
+      // ignore
+    }
   };
 
   const refreshDocs = async () => {
@@ -991,7 +1030,15 @@ export default function App() {
 
       await new Promise<void>((resolve, reject) => {
         ws.onopen = () => {
-          ws.send(JSON.stringify({ type: 'search', query: prompt, userId, category: chatScopeCategory || '' }));
+          ws.send(
+            JSON.stringify({
+              type: 'search',
+              query: prompt,
+              userId,
+              category: chatScopeCategory || '',
+              model: chatModel,
+            }),
+          );
         };
 
 	        ws.onmessage = (evt) => {
@@ -1180,6 +1227,9 @@ export default function App() {
               categories={categories}
               scopeCategory={chatScopeCategory}
               onChangeScopeCategory={setChatScopeCategory}
+              chatModel={chatModel}
+              chatModels={CHAT_MODEL_OPTIONS}
+              onChangeChatModel={saveChatModel}
               onPressPlus={() => {
                 Keyboard.dismiss();
                 setRoute('import');
@@ -1801,6 +1851,9 @@ function ChatScreen(props: {
   categories: CategorySummary[];
   scopeCategory: string; // '' => all screenshots
   onChangeScopeCategory: (category: string) => void;
+  chatModel: string;
+  chatModels: string[];
+  onChangeChatModel: (model: string) => void;
   onPressPlus: () => void;
   onOpenSource: (uri: string) => void;
 }) {
@@ -1813,7 +1866,9 @@ function ChatScreen(props: {
   const canSend = !!props.chatInput.trim() && !props.chatThinking;
   const empty = props.chatHistory.length === 0;
   const [scopeOpen, setScopeOpen] = useState(false);
+  const [modelOpen, setModelOpen] = useState(false);
   const scopeLabel = props.scopeCategory ? `Category: ${props.scopeCategory}` : 'All screenshots';
+  const modelLabel = `Model: ${props.chatModel}`;
 
   useEffect(() => {
     const animateTo = (nextHeight: number, duration: number) => {
@@ -1892,6 +1947,35 @@ function ChatScreen(props: {
                   );
                 })}
             </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={modelOpen} transparent animationType="fade" onRequestClose={() => setModelOpen(false)}>
+        <View style={[styles.scopeBackdrop, { paddingBottom: 32 + insets.bottom }]}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setModelOpen(false)} />
+          <View style={styles.scopeCard}>
+            <Text style={styles.scopeTitle}>GPT model</Text>
+            {props.chatModels.map((model, index) => {
+              const selected = model === props.chatModel;
+              return (
+                <View key={model}>
+                  <Pressable
+                    onPress={() => {
+                      props.onChangeChatModel(model);
+                      setModelOpen(false);
+                    }}
+                    style={({ pressed }) => [styles.scopeRow, pressed && styles.pressed]}
+                  >
+                    <Text style={styles.scopeRowText} numberOfLines={1}>
+                      {model}
+                    </Text>
+                    {selected ? <Ionicons name="checkmark" size={18} color={COLORS.text} /> : null}
+                  </Pressable>
+                  {index < props.chatModels.length - 1 && <View style={styles.scopeDivider} />}
+                </View>
+              );
+            })}
           </View>
         </View>
       </Modal>
@@ -1981,6 +2065,13 @@ function ChatScreen(props: {
             <Ionicons name="funnel-outline" size={14} color={COLORS.muted} />
             <Text style={styles.scopePillText} numberOfLines={1}>
               {scopeLabel}
+            </Text>
+            <Ionicons name="chevron-down" size={14} color={COLORS.muted} />
+          </Pressable>
+          <Pressable onPress={() => setModelOpen(true)} style={({ pressed }) => [styles.scopePill, pressed && styles.pressed]}>
+            <Ionicons name="hardware-chip-outline" size={14} color={COLORS.muted} />
+            <Text style={styles.scopePillText} numberOfLines={1}>
+              {modelLabel}
             </Text>
             <Ionicons name="chevron-down" size={14} color={COLORS.muted} />
           </Pressable>
@@ -3857,6 +3948,8 @@ const styles = StyleSheet.create({
   scopePillRow: {
     flexDirection: 'row',
     paddingBottom: 8,
+    gap: 8,
+    flexWrap: 'wrap',
   },
   scopePill: {
     flexDirection: 'row',

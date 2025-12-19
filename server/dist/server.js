@@ -32,6 +32,15 @@ const writeSse = (res, data) => {
 const PORT = process.env.PORT || 4000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const VISION_MODEL = 'gpt-5.2';
+const CHAT_MODEL_DEFAULT = process.env.CHAT_MODEL || VISION_MODEL;
+const CHAT_MODEL_ALLOWLIST = (() => {
+    const raw = String(process.env.CHAT_MODELS || '').trim();
+    const parsed = raw
+        ? raw.split(',').map((model) => model.trim()).filter(Boolean)
+        : [];
+    const fallback = parsed.length ? parsed : [CHAT_MODEL_DEFAULT];
+    return Array.from(new Set([...fallback, CHAT_MODEL_DEFAULT]));
+})();
 const EMBED_MODEL = 'text-embedding-3-small';
 const MAX_CATEGORIES_PER_DOC = Number(process.env.MAX_CATEGORIES_PER_DOC || 1);
 const MAX_EXISTING_CATEGORIES_CONTEXT = Number(process.env.MAX_EXISTING_CATEGORIES_CONTEXT || 50);
@@ -49,6 +58,20 @@ const requireOpenAI = () => {
     if (!openai)
         throw new Error('Missing OPENAI_API_KEY');
     return openai;
+};
+const sanitizeModelName = (value) => {
+    const text = String(value ?? '').trim();
+    if (!text)
+        return '';
+    if (!/^[a-zA-Z0-9._:-]{1,64}$/.test(text))
+        return '';
+    return text;
+};
+const resolveChatModel = (value) => {
+    const cleaned = sanitizeModelName(value);
+    if (cleaned && CHAT_MODEL_ALLOWLIST.includes(cleaned))
+        return cleaned;
+    return CHAT_MODEL_DEFAULT;
 };
 const AWS_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
 const S3_BUCKET = process.env.S3_BUCKET;
@@ -1131,7 +1154,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     }
 });
 app.post('/api/search', async (req, res) => {
-    const { query, topK = 5, category } = req.body;
+    const { query, topK = 5, category, model } = req.body;
     if (!query || !query.trim()) {
         return res.status(400).json({ error: 'query is required' });
     }
@@ -1148,7 +1171,7 @@ app.post('/api/search', async (req, res) => {
             return res.json({ answer: reason || 'No screenshots indexed yet.', matches: [] });
         const openaiClient = requireOpenAI();
         const response = await openaiClient.chat.completions.create({
-            model: VISION_MODEL,
+            model: resolveChatModel(model),
             messages: [
                 {
                     role: 'system',
@@ -1175,7 +1198,7 @@ app.post('/api/search', async (req, res) => {
     }
 });
 app.post('/api/search-stream', async (req, res) => {
-    const { query, topK = 5, category } = req.body;
+    const { query, topK = 5, category, model } = req.body;
     if (!query || !query.trim()) {
         res.status(400).json({ error: 'query is required' });
         return;
@@ -1231,7 +1254,7 @@ app.post('/api/search-stream', async (req, res) => {
         writeSse(res, { type: 'matches', matches });
         const openaiClient = requireOpenAI();
         const stream = await openaiClient.chat.completions.create({
-            model: VISION_MODEL,
+            model: resolveChatModel(model),
             stream: true,
             messages: [
                 {
@@ -1317,6 +1340,7 @@ wss.on('connection', (ws) => {
         const query = typeof message?.query === 'string' ? message.query.trim() : '';
         const topK = typeof message?.topK === 'number' ? message.topK : 5;
         const category = typeof message?.category === 'string' && message.category.trim().length <= 80 ? message.category.trim() : '';
+        const model = resolveChatModel(message?.model);
         const userIdRaw = typeof message?.userId === 'string' ? message.userId.trim() : '';
         const userId = userIdRaw && /^[a-zA-Z0-9_-]{3,128}$/.test(userIdRaw) ? userIdRaw : 'public';
         if (!query) {
@@ -1339,7 +1363,7 @@ wss.on('connection', (ws) => {
             wsSend(ws, { type: 'matches', matches: dedupeMatches(matches) });
             const openaiClient = requireOpenAI();
             const stream = await openaiClient.chat.completions.create({
-                model: VISION_MODEL,
+                model,
                 stream: true,
                 messages: [
                     {
