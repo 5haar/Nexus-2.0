@@ -74,7 +74,7 @@ type ChatThread = {
   messages: ChatEntry[]; // newest-first (same order as chatHistory)
 };
 
-type RouteKey = 'chat' | 'import' | 'categories';
+type RouteKey = 'chat' | 'import' | 'categories' | 'documents';
 
 type ResolvedAsset = {
   id: string;
@@ -132,6 +132,7 @@ const COLORS = {
   accentText: '#ffffff',
   danger: '#b91c1c',
   dangerSoft: 'rgba(185, 28, 28, 0.08)',
+  link: '#3b82f6',
 } as const;
 
 const FONT_SANS = 'Inter_400Regular';
@@ -566,7 +567,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (route === 'categories' && userId) refreshDocs();
+    if ((route === 'categories' || route === 'documents') && userId) refreshDocs();
     if (route !== 'categories') setActiveCategory(null);
   }, [route, userId]);
 
@@ -1106,7 +1107,7 @@ export default function App() {
     refreshDocs();
   };
 
-  const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : 'Categories';
+  const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : route === 'categories' ? 'Categories' : 'Documents';
 
   useEffect(() => {
     if (!fontsLoaded) return;
@@ -1203,7 +1204,7 @@ export default function App() {
 	              assetStageById={assetStageById}
 	              assetErrorById={assetErrorById}
 	            />
-	          ) : (
+	          ) : route === 'categories' ? (
             <CategoriesScreen
               uiError={uiError}
               apiBase={apiBase}
@@ -1252,6 +1253,38 @@ export default function App() {
                   await deleteDoc(docId);
                 } catch (err: any) {
                   setUiError(err?.message ?? 'Failed to delete photo');
+                }
+              }}
+              onView={(uri) => setViewerUri(uri)}
+            />
+          ) : (
+            <DocumentsScreen
+              uiError={uiError}
+              apiBase={apiBase}
+              docs={docs}
+              onRefresh={refreshDocs}
+              onDeleteDoc={async (docId) => {
+                try {
+                  await deleteDoc(docId);
+                } catch (err: any) {
+                  setUiError(err?.message ?? 'Failed to delete document');
+                }
+              }}
+              onDeleteDocs={async (docIds) => {
+                try {
+                  if (!userId) throw new Error('Missing user id');
+                  for (const docId of docIds) {
+                    await apiFetch<{ ok: boolean }>(
+                      apiBase,
+                      userId,
+                      `/api/docs/${encodeURIComponent(docId)}`,
+                      { method: 'DELETE' },
+                    );
+                  }
+                  await refreshDocs();
+                } catch (err: any) {
+                  setUiError(err?.message ?? 'Failed to delete documents');
+                  throw err;
                 }
               }}
               onView={(uri) => setViewerUri(uri)}
@@ -1429,6 +1462,7 @@ function Sidebar(props: {
     { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' },
     { key: 'import', label: 'Import', icon: 'image-outline' },
     { key: 'categories', label: 'Categories', icon: 'folder-open-outline' },
+    { key: 'documents', label: 'Documents', icon: 'documents-outline' },
   ];
 
   return (
@@ -1588,6 +1622,7 @@ function HamburgerMenu(props: {
                     { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' as const },
                     { key: 'import', label: 'Import', icon: 'image-outline' as const },
                     { key: 'categories', label: 'Categories', icon: 'folder-open-outline' as const },
+                    { key: 'documents', label: 'Documents', icon: 'documents-outline' as const },
                   ] as const).map((item) => {
                     const isActive = props.route === item.key;
                     return (
@@ -2788,6 +2823,389 @@ function TutorialModal(props: { visible: boolean; onClose: () => void; onGoToImp
         </View>
       </View>
     </Modal>
+  );
+}
+
+function DocumentsScreen(props: {
+  uiError: string | null;
+  apiBase: string;
+  docs: ServerDoc[];
+  onRefresh: () => void;
+  onDeleteDoc: (docId: string) => void;
+  onDeleteDocs?: (docIds: string[]) => Promise<void> | void;
+  onView: (uri: string) => void;
+}) {
+  const { width } = useWindowDimensions();
+  const columns = width >= 1280 ? 5 : width >= 1024 ? 4 : width >= 768 ? 3 : 2;
+  const pagePadding = width >= 768 ? 32 : 24;
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedDocs, setSelectedDocs] = useState<Set<string>>(new Set());
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [deletingSelected, setDeletingSelected] = useState(false);
+  const [sortKey, setSortKey] = useState<'date' | 'name' | 'categories'>('date');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [sortOpen, setSortOpen] = useState(false);
+  const [filterOrphans, setFilterOrphans] = useState(false);
+
+  const pageStyle = useMemo(() => [styles.mcPage, { padding: pagePadding }], [pagePadding]);
+  const rowStyle = columns > 1 ? styles.mcGridRowTight : undefined;
+
+  const orphanDocs = useMemo(() => props.docs.filter((d) => !d.categories?.length), [props.docs]);
+  const orphanCount = orphanDocs.length;
+
+  const filteredDocs = useMemo(() => {
+    let result = filterOrphans ? orphanDocs : props.docs;
+    const query = searchQuery.trim().toLowerCase();
+    if (query) {
+      result = result.filter(
+        (d) =>
+          d.caption?.toLowerCase().includes(query) ||
+          d.categories?.some((c) => c.toLowerCase().includes(query)) ||
+          d.text?.toLowerCase().includes(query),
+      );
+    }
+    return result;
+  }, [filterOrphans, orphanDocs, props.docs, searchQuery]);
+
+  const sortedDocs = useMemo(() => {
+    const dirMult = sortDir === 'asc' ? 1 : -1;
+    return [...filteredDocs].sort((a, b) => {
+      if (sortKey === 'date') {
+        return ((a.createdAt ?? 0) - (b.createdAt ?? 0)) * dirMult;
+      }
+      if (sortKey === 'name') {
+        return (a.caption ?? '').localeCompare(b.caption ?? '') * dirMult;
+      }
+      const aCats = a.categories?.join(', ') ?? '';
+      const bCats = b.categories?.join(', ') ?? '';
+      return aCats.localeCompare(bCats) * dirMult;
+    });
+  }, [filteredDocs, sortDir, sortKey]);
+
+  const toggleDocSelected = (docId: string) => {
+    setSelectionMode(true);
+    setSelectedDocs((prev) => {
+      const next = new Set(prev);
+      if (next.has(docId)) next.delete(docId);
+      else next.add(docId);
+      return next;
+    });
+  };
+
+  const exitSelectionMode = () => {
+    setSelectionMode(false);
+    setSelectedDocs(new Set());
+  };
+
+  const selectAllVisible = () => {
+    setSelectionMode(true);
+    setSelectedDocs(new Set(sortedDocs.map((d) => d.id)));
+  };
+
+  const runDeleteSelected = async () => {
+    const ids = Array.from(selectedDocs);
+    if (!ids.length || deletingSelected) return;
+    setDeletingSelected(true);
+    try {
+      if (props.onDeleteDocs) {
+        await props.onDeleteDocs(ids);
+      } else {
+        for (const id of ids) props.onDeleteDoc(id);
+      }
+      exitSelectionMode();
+    } catch (err: any) {
+      Alert.alert('Delete failed', err?.message ?? 'Failed to delete selected documents.');
+    } finally {
+      setDeletingSelected(false);
+    }
+  };
+
+  const confirmDeleteSelected = () => {
+    if (selectedDocs.size === 0) return;
+    Alert.alert(
+      `Delete ${selectedDocs.size} document${selectedDocs.size === 1 ? '' : 's'}?`,
+      'This will permanently remove the documents and their files from the server.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: runDeleteSelected },
+      ],
+    );
+  };
+
+  const confirmDeleteAllOrphans = () => {
+    if (orphanCount === 0) return;
+    Alert.alert(
+      `Delete ${orphanCount} orphan document${orphanCount === 1 ? '' : 's'}?`,
+      'These documents have no categories and are not searchable. This will permanently delete them.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete All Orphans',
+          style: 'destructive',
+          onPress: async () => {
+            const ids = orphanDocs.map((d) => d.id);
+            if (props.onDeleteDocs) {
+              try {
+                await props.onDeleteDocs(ids);
+              } catch (err: any) {
+                Alert.alert('Delete failed', err?.message ?? 'Failed to delete orphan documents.');
+              }
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const DocCard = (p: { doc: ServerDoc; index: number }) => {
+    const anim = useRef(new Animated.Value(0)).current;
+    useEffect(() => {
+      Animated.timing(anim, {
+        toValue: 1,
+        duration: 360,
+        delay: Math.min(p.index * 30, 360),
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    }, [anim, p.index]);
+    const scale = anim.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1] });
+    const uri = resolveDocUri(props.apiBase, p.doc);
+    const isSelected = selectedDocs.has(p.doc.id);
+    const isOrphan = !p.doc.categories?.length;
+
+    return (
+      <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ scale }] }]}>
+        <Pressable
+          onPress={() => (selectionMode ? toggleDocSelected(p.doc.id) : uri && props.onView(uri))}
+          onLongPress={() => toggleDocSelected(p.doc.id)}
+          style={[styles.mcMediaCard, isSelected && styles.docCardSelected]}
+        >
+          <View style={styles.assetPressable}>
+            {uri ? (
+              <Image source={{ uri }} style={styles.mcMediaImage} />
+            ) : (
+              <View style={[styles.mcMediaImage, styles.assetMissing]}>
+                <Text style={styles.placeholderText}>No preview</Text>
+              </View>
+            )}
+            <LinearGradient
+              pointerEvents="none"
+              colors={['rgba(0,0,0,0)', 'rgba(0,0,0,0.78)']}
+              locations={[0.35, 1]}
+              style={styles.mcMediaGradient}
+            />
+          </View>
+
+          {isOrphan && (
+            <View style={styles.orphanBadge}>
+              <Text style={styles.orphanBadgeText}>Orphan</Text>
+            </View>
+          )}
+
+          {selectionMode && (
+            <View style={[styles.docCheckbox, isSelected && styles.docCheckboxSelected]}>
+              {isSelected && <Ionicons name="checkmark" size={14} color="#fff" />}
+            </View>
+          )}
+
+          <Pressable
+            hitSlop={10}
+            onPress={() => {
+              Alert.alert('Delete document?', 'This removes it from the server.', [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Delete', style: 'destructive', onPress: () => props.onDeleteDoc(p.doc.id) },
+              ]);
+            }}
+            style={({ pressed }) => [styles.mcMediaDelete, pressed && styles.pressed]}
+          >
+            <Ionicons name="trash-outline" size={16} color="#fff" />
+          </Pressable>
+
+          <View style={styles.mcMediaFooter} pointerEvents="none">
+            <Text style={styles.mcMediaCaption} numberOfLines={1}>
+              {p.doc.caption || 'Screenshot'}
+            </Text>
+            <Text style={styles.mcMediaDate} numberOfLines={1}>
+              {p.doc.categories?.length ? p.doc.categories.join(', ') : 'No category'}
+            </Text>
+          </View>
+        </Pressable>
+      </Animated.View>
+    );
+  };
+
+  const renderDoc = ({ item, index }: { item: ServerDoc; index: number }) => {
+    if (item.id === '__refresh__') {
+      return (
+        <View style={styles.mcGridItem}>
+          <Pressable onPress={props.onRefresh} style={({ pressed }) => [styles.mcDashedCard, pressed && styles.mcDashedCardPressed]}>
+            <Ionicons name="refresh-outline" size={24} color={COLORS.muted} />
+            <Text style={styles.mcDashedText}>Refresh</Text>
+          </Pressable>
+        </View>
+      );
+    }
+    return <DocCard doc={item} index={index} />;
+  };
+
+  const listData = useMemo(() => {
+    if (props.docs.length === 0) return [];
+    return [...sortedDocs, { id: '__refresh__' } as any];
+  }, [props.docs.length, sortedDocs]);
+
+  if (props.docs.length === 0) {
+    return (
+      <View style={styles.mcEmptyWrap}>
+        <Pressable onPress={props.onRefresh} style={({ pressed }) => [styles.mcEmptyCard, pressed && styles.mcDashedCardPressed]}>
+          <View style={styles.mcDashedIcon}>
+            <Ionicons name="documents-outline" size={28} color={COLORS.muted} />
+          </View>
+          <Text style={styles.mcEmptyTitle}>No documents yet</Text>
+          <Text style={styles.mcEmptySubtitle}>Import and index some screenshots first.</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  return (
+    <View style={pageStyle}>
+      <View style={styles.docsHeader}>
+        <View style={styles.docsSearchFull}>
+          <Ionicons name="search-outline" size={18} color={COLORS.muted} style={styles.mcSearchIcon} />
+          <TextInput
+            style={styles.mcSearchInput}
+            placeholder="Search documents..."
+            placeholderTextColor={COLORS.muted}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            returnKeyType="search"
+          />
+          {searchQuery.length > 0 && (
+            <Pressable onPress={() => setSearchQuery('')} hitSlop={8}>
+              <Ionicons name="close-circle" size={18} color={COLORS.muted} />
+            </Pressable>
+          )}
+        </View>
+
+        <View style={styles.docsToolbar}>
+          <View style={styles.docsStats}>
+            <Text style={styles.docsStatsText}>
+              {filteredDocs.length} document{filteredDocs.length !== 1 ? 's' : ''}
+              {orphanCount > 0 && !filterOrphans && (
+                <Text style={styles.orphanCountText}> ({orphanCount} orphan{orphanCount !== 1 ? 's' : ''})</Text>
+              )}
+            </Text>
+          </View>
+
+          <View style={styles.docsActions}>
+            {orphanCount > 0 && (
+              <Pressable
+                onPress={() => setFilterOrphans(!filterOrphans)}
+                style={({ pressed }) => [styles.docsFilterBtn, filterOrphans && styles.docsFilterBtnActive, pressed && styles.pressed]}
+              >
+                <Ionicons name="warning-outline" size={16} color={filterOrphans ? '#fff' : COLORS.text} />
+                <Text style={[styles.docsFilterBtnText, filterOrphans && styles.docsFilterBtnTextActive]}>Orphans</Text>
+              </Pressable>
+            )}
+
+            <Pressable
+              onPress={() => setSortOpen(true)}
+              style={({ pressed }) => [styles.docsSortBtn, pressed && styles.pressed]}
+            >
+              <Ionicons name="swap-vertical" size={16} color={COLORS.text} />
+            </Pressable>
+
+            <Pressable
+              onPress={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
+              style={({ pressed }) => [styles.docsSortBtn, pressed && styles.pressed]}
+            >
+              <Ionicons name={selectionMode ? 'close' : 'checkbox-outline'} size={16} color={COLORS.text} />
+            </Pressable>
+          </View>
+        </View>
+
+        {selectionMode && (
+          <View style={styles.docsSelectionBar}>
+            <Text style={styles.docsSelectionText}>{selectedDocs.size} selected</Text>
+            <View style={styles.docsSelectionActions}>
+              <Pressable onPress={selectAllVisible} style={({ pressed }) => [styles.docsSelectionBtn, pressed && styles.pressed]}>
+                <Text style={styles.docsSelectionBtnText}>Select All</Text>
+              </Pressable>
+              <Pressable onPress={confirmDeleteSelected} style={({ pressed }) => [styles.docsSelectionBtnDanger, pressed && styles.pressed]}>
+                {deletingSelected ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.docsSelectionBtnDangerText}>Delete</Text>
+                )}
+              </Pressable>
+              <Pressable onPress={exitSelectionMode} style={({ pressed }) => [styles.docsSelectionBtn, pressed && styles.pressed]}>
+                <Text style={styles.docsSelectionBtnText}>Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+
+        {orphanCount > 0 && filterOrphans && (
+          <View style={styles.orphanWarning}>
+            <Ionicons name="warning" size={18} color="#f59e0b" />
+            <Text style={styles.orphanWarningText}>
+              These {orphanCount} document{orphanCount !== 1 ? 's have' : ' has'} no categories and won't appear in search results.
+            </Text>
+            <Pressable onPress={confirmDeleteAllOrphans} style={({ pressed }) => [styles.orphanDeleteBtn, pressed && styles.pressed]}>
+              <Text style={styles.orphanDeleteBtnText}>Delete All</Text>
+            </Pressable>
+          </View>
+        )}
+      </View>
+
+      {props.uiError && <Text style={[styles.inlineError, { marginBottom: 10 }]}>{props.uiError}</Text>}
+
+      <FlatList
+        data={listData}
+        renderItem={renderDoc}
+        keyExtractor={(item) => item.id}
+        numColumns={columns}
+        key={columns}
+        columnWrapperStyle={rowStyle}
+        contentContainerStyle={styles.mcGrid}
+        showsVerticalScrollIndicator={false}
+      />
+
+      <Modal visible={sortOpen} transparent animationType="fade" onRequestClose={() => setSortOpen(false)}>
+        <View style={styles.sortBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setSortOpen(false)} />
+          <View style={styles.sortCard}>
+            <Text style={styles.sortTitle}>Sort</Text>
+            {(
+              [
+                { key: 'date', dir: 'desc', label: 'Date (newest → oldest)' },
+                { key: 'date', dir: 'asc', label: 'Date (oldest → newest)' },
+                { key: 'name', dir: 'asc', label: 'Name (A → Z)' },
+                { key: 'name', dir: 'desc', label: 'Name (Z → A)' },
+                { key: 'categories', dir: 'asc', label: 'Category (A → Z)' },
+                { key: 'categories', dir: 'desc', label: 'Category (Z → A)' },
+              ] as const
+            ).map((opt) => {
+              const selectedOpt = sortKey === opt.key && sortDir === opt.dir;
+              return (
+                <Pressable
+                  key={`${opt.key}-${opt.dir}`}
+                  onPress={() => {
+                    setSortKey(opt.key);
+                    setSortDir(opt.dir);
+                    setSortOpen(false);
+                  }}
+                  style={({ pressed }) => [styles.sortRow, pressed && styles.pressed]}
+                >
+                  <Text style={styles.sortRowText}>{opt.label}</Text>
+                  {selectedOpt ? <Ionicons name="checkmark" size={18} color={COLORS.text} /> : null}
+                </Pressable>
+              );
+            })}
+          </View>
+        </View>
+      </Modal>
+    </View>
   );
 }
 
@@ -4486,5 +4904,196 @@ const styles = StyleSheet.create({
   viewerImage: {
     width: '100%',
     height: '100%',
+  },
+  // DocumentsScreen styles
+  docsHeader: {
+    gap: 12,
+    marginBottom: 16,
+  },
+  docsSearchRow: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  docsSearchFull: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    height: 48,
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  docsToolbar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  docsStats: {
+    flex: 1,
+  },
+  docsStatsText: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  orphanCountText: {
+    color: '#f59e0b',
+  },
+  docsActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  docsFilterBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    height: 36,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+  },
+  docsFilterBtnActive: {
+    backgroundColor: '#f59e0b',
+    borderColor: '#f59e0b',
+  },
+  docsFilterBtnText: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  docsFilterBtnTextActive: {
+    color: '#fff',
+  },
+  docsSortBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: 36,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+  },
+  docsSortBtnText: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  docsSelectionBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 12,
+    borderRadius: 14,
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  docsSelectionText: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  docsSelectionActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  docsSelectionBtn: {
+    height: 36,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: COLORS.surfaceAlt,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  docsSelectionBtnText: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  docsSelectionBtnDanger: {
+    height: 36,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: COLORS.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  docsSelectionBtnDangerText: {
+    color: '#fff',
+    fontSize: 13,
+    fontFamily: FONT_SANS_EXTRABOLD,
+  },
+  docCardSelected: {
+    borderWidth: 2,
+    borderColor: COLORS.link,
+  },
+  docCheckbox: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#fff',
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  docCheckboxSelected: {
+    backgroundColor: COLORS.link,
+    borderColor: COLORS.link,
+  },
+  orphanBadge: {
+    position: 'absolute',
+    top: 8,
+    right: 40,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: '#f59e0b',
+  },
+  orphanBadgeText: {
+    color: '#fff',
+    fontSize: 10,
+    fontFamily: FONT_SANS_EXTRABOLD,
+    textTransform: 'uppercase',
+  },
+  orphanWarning: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    padding: 12,
+    borderRadius: 14,
+    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(245, 158, 11, 0.3)',
+  },
+  orphanWarningText: {
+    flex: 1,
+    color: '#f59e0b',
+    fontSize: 13,
+    fontFamily: FONT_SANS,
+  },
+  orphanDeleteBtn: {
+    height: 32,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: '#f59e0b',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  orphanDeleteBtnText: {
+    color: '#fff',
+    fontSize: 12,
+    fontFamily: FONT_SANS_EXTRABOLD,
   },
 });

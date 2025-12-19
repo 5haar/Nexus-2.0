@@ -471,9 +471,10 @@ const listDocs = async (userId) => {
 const listSearchableDocs = async (userId) => {
     if (mysqlPool) {
         const docs = await listDocsFromDb(userId, { includeEmbedding: true });
-        return docs.filter((d) => d.embedding.length);
+        // Exclude orphan documents (no categories) from search results
+        return docs.filter((d) => d.embedding.length && d.categories.length > 0);
     }
-    return db.docs.filter((d) => d.userId === userId && d.embedding.length);
+    return db.docs.filter((d) => d.userId === userId && d.embedding.length && (d.categories?.length ?? 0) > 0);
 };
 const saveDoc = async (doc) => {
     if (mysqlPool)
