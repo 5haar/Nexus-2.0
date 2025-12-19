@@ -196,6 +196,7 @@ const PAYWALL_PLANS = [
 const IMPORT_PAGE_SIZE = 120;
 const IMPORT_MAX_ASSETS = 800;
 const REQUIRE_AUTH = process.env.EXPO_PUBLIC_REQUIRE_AUTH !== '0';
+const USER_ID_REGEX = /^[a-zA-Z0-9_-]{3,64}$/;
 
 const COLORS = {
   bg: '#ffffff',
@@ -561,8 +562,10 @@ export default function App() {
         const storedProvider = (await AsyncStorage.getItem(AUTH_PROVIDER_STORAGE_KEY))?.trim() ?? '';
         if (existing) {
           const isAnon = existing.startsWith('anon_');
-          if (REQUIRE_AUTH && isAnon) {
+          const isValid = USER_ID_REGEX.test(existing);
+          if (!isValid || (REQUIRE_AUTH && isAnon)) {
             await AsyncStorage.removeItem(USER_ID_STORAGE_KEY);
+            await AsyncStorage.removeItem(AUTH_PROVIDER_STORAGE_KEY);
           } else {
             if (!cancelled) setUserId(existing);
             if (!cancelled) setAuthProvider(storedProvider);

@@ -5,6 +5,7 @@ import multer from 'multer';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { OpenAI } from 'openai';
@@ -14,10 +15,12 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
+const USER_ID_REGEX = /^[a-zA-Z0-9_-]{3,64}$/;
+
 const getUserIdFromHeader = (req: express.Request) => {
   const raw = String(req.header('x-nexus-user-id') ?? '').trim();
   if (!raw) return 'public';
-  if (!/^[a-zA-Z0-9_-]{3,128}$/.test(raw)) throw new Error('Invalid user id');
+  if (!USER_ID_REGEX.test(raw)) throw new Error('Invalid user id');
   return raw;
 };
 
@@ -152,6 +155,11 @@ const verifyAppleIdentityToken = async (token: string) => {
   return payload;
 };
 
+const hashSubject = (value: string) =>
+  crypto.createHash('sha256').update(value).digest('hex').slice(0, 32);
+
+const buildAppleUserId = (sub: string) => `apple_${hashSubject(sub)}`;
+
 const sanitizeModelName = (value: unknown) => {
   const text = String(value ?? '').trim();
   if (!text) return '';
@@ -253,7 +261,7 @@ const ensureMysqlSchema = async () => {
       created_at BIGINT NOT NULL,
       updated_at BIGINT NOT NULL,
       provider VARCHAR(32) NULL,
-      provider_sub VARCHAR(128) NULL,
+      provider_sub VARCHAR(255) NULL,
       email VARCHAR(255) NULL,
       display_name VARCHAR(255) NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
@@ -267,9 +275,14 @@ const ensureMysqlSchema = async () => {
   };
   await addColumnIfMissing('users', 'updated_at BIGINT NOT NULL DEFAULT 0');
   await addColumnIfMissing('users', 'provider VARCHAR(32) NULL');
-  await addColumnIfMissing('users', 'provider_sub VARCHAR(128) NULL');
+  await addColumnIfMissing('users', 'provider_sub VARCHAR(255) NULL');
   await addColumnIfMissing('users', 'email VARCHAR(255) NULL');
   await addColumnIfMissing('users', 'display_name VARCHAR(255) NULL');
+  try {
+    await mysqlPool.execute('ALTER TABLE users MODIFY COLUMN provider_sub VARCHAR(255) NULL');
+  } catch (err: any) {
+    if (err?.code !== 'ER_TOO_BIG_FIELDLENGTH') throw err;
+  }
   await mysqlPool.execute(
     `CREATE TABLE IF NOT EXISTS docs (
       id VARCHAR(64) PRIMARY KEY,
@@ -1495,7 +1508,7 @@ app.post('/api/auth/verify', async (req, res) => {
     const email = typeof payload.email === 'string' ? payload.email : undefined;
     const fullName = (req.body as any)?.fullName as { givenName?: string; familyName?: string } | undefined;
     const displayName = [fullName?.givenName, fullName?.familyName].filter(Boolean).join(' ').trim() || undefined;
-    const userId = `apple_${sub}`;
+    const userId = buildAppleUserId(sub);
     await updateUserProfile(userId, {
       provider: 'apple',
       providerSub: sub,
@@ -2210,7 +2223,7 @@ wss.on('connection', (ws) => {
     const docId = docIdRaw && /^[a-zA-Z0-9_-]{3,128}$/.test(docIdRaw) ? docIdRaw : '';
     const model = resolveChatModel(message?.model);
     const userIdRaw = typeof message?.userId === 'string' ? message.userId.trim() : '';
-    const userId = userIdRaw && /^[a-zA-Z0-9_-]{3,128}$/.test(userIdRaw) ? userIdRaw : 'public';
+    const userId = userIdRaw && USER_ID_REGEX.test(userIdRaw) ? userIdRaw : 'public';
     if (!query) {
       wsSend(ws, { type: 'error', message: 'query is required' });
       return;
