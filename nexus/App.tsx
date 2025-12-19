@@ -380,7 +380,15 @@ const apiFetch = async <T,>(apiBase: string, userId: string, path: string, init?
   }
   if (!res.ok) {
     const detail = await res.text();
-    throw new Error(detail || `Request failed: ${res.status}`);
+    try {
+      const parsed = JSON.parse(detail);
+      const msg = String(parsed?.error ?? parsed?.message ?? '').trim() || detail || `Request failed: ${res.status}`;
+      const err = new Error(msg) as Error & { payload?: any };
+      err.payload = parsed;
+      throw err;
+    } catch {
+      throw new Error(detail || `Request failed: ${res.status}`);
+    }
   }
   return (await res.json()) as T;
 };
@@ -411,7 +419,9 @@ export default function App() {
   const [authProvider, setAuthProvider] = useState('');
   const [authReady, setAuthReady] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
+  const [errorToastMessage, setErrorToastMessage] = useState('');
+  const [errorToastVisible, setErrorToastVisible] = useState(false);
+  const [errorToastUpgrade, setErrorToastUpgrade] = useState(false);
   const [appleAvailable, setAppleAvailable] = useState(false);
   const [onboardingSeen, setOnboardingSeen] = useState(false);
   const [onboardingReady, setOnboardingReady] = useState(false);
@@ -446,7 +456,6 @@ export default function App() {
   }>({ running: false, current: 0, total: 0, done: 0, failed: 0 });
 
   const [docs, setDocs] = useState<ServerDoc[]>([]);
-  const [uiError, setUiError] = useState<string | null>(null);
 
   const [chatInput, setChatInput] = useState('');
   const [chatHistory, setChatHistory] = useState<ChatEntry[]>([]);
@@ -759,7 +768,6 @@ export default function App() {
   }, [loadingScreenshots, permission, route, screenshots.length]);
 
   const pickFiles = async () => {
-    setUiError(null);
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: [
@@ -787,7 +795,7 @@ export default function App() {
         return [...deduped, ...prev];
       });
     } catch (err: any) {
-      setUiError(err?.message ?? 'Failed to pick files');
+      showErrorToast(err?.message ?? 'Failed to pick files');
     }
   };
 
@@ -870,6 +878,14 @@ export default function App() {
     return 'Upgrade to keep going.';
   };
 
+  const showErrorToast = useCallback((message: string, opts?: { showUpgrade?: boolean }) => {
+    const trimmed = String(message ?? '').trim();
+    if (!trimmed) return;
+    setErrorToastMessage(trimmed);
+    setErrorToastVisible(true);
+    setErrorToastUpgrade(opts?.showUpgrade ?? false);
+  }, []);
+
   const openPaywall = useCallback(
     (payload?: any) => {
       if (!FEATURE_FLAGS.paywall) return;
@@ -880,13 +896,26 @@ export default function App() {
     [],
   );
 
+  const handleApiError = useCallback(
+    (err: any, fallback: string) => {
+      const message = String(err?.message ?? fallback).trim() || fallback;
+      if (err?.payload?.code === 'PAYWALL_REQUIRED') {
+        openPaywall(err.payload);
+        showErrorToast(message, { showUpgrade: true });
+        return;
+      }
+      showErrorToast(message);
+    },
+    [openPaywall, showErrorToast],
+  );
+
   const refreshDocs = async () => {
     try {
       if (!userId) return;
       const data = await apiFetch<{ docs: ServerDoc[] }>(apiBase, userId, '/api/docs');
       setDocs(data.docs ?? []);
     } catch (err: any) {
-      setUiError(err?.message ?? 'Failed to load stored documents');
+      handleApiError(err, 'Failed to load stored documents');
     }
   };
 
@@ -983,8 +1012,7 @@ export default function App() {
       setUserId(nextUserId);
     } catch (err: any) {
       const message = String(err?.message ?? 'Sign in failed.').trim();
-      setAuthError(message);
-      Alert.alert('Sign in failed', message);
+      showErrorToast(message);
     } finally {
       setAuthBusy(false);
     }
@@ -993,7 +1021,6 @@ export default function App() {
   const loadScreenshots = async () => {
     if (loadingScreenshots) return;
     setLoadingScreenshots(true);
-    setUiError(null);
     try {
       let currentPermission = permission ?? (await MediaLibrary.getPermissionsAsync(false));
       if (currentPermission.status !== 'granted' || getAccessPrivileges(currentPermission) === 'none') {
@@ -1046,7 +1073,7 @@ export default function App() {
       setAssetStageById({});
       setAssetErrorById({});
     } catch (err: any) {
-      setUiError(err?.message ?? 'Failed to load screenshots');
+      showErrorToast(err?.message ?? 'Failed to load screenshots');
     } finally {
       setLoadingScreenshots(false);
     }
@@ -1062,7 +1089,7 @@ export default function App() {
       }
       await Linking.openSettings();
     } catch (err: any) {
-      setUiError(err?.message ?? 'Failed to open photo picker');
+      showErrorToast(err?.message ?? 'Failed to open photo picker');
     }
   };
 
@@ -1159,7 +1186,7 @@ export default function App() {
             setAssetStageById((prev) => ({ ...prev, [item.id]: 'error' }));
             setAssetErrorById((prev) => ({ ...prev, [item.id]: String(message ?? 'Upload failed') }));
             session.failed += 1;
-            if (typeof message === 'string') setUiError((prev) => prev ?? message);
+            if (typeof message === 'string') showErrorToast(message);
           }
         }
       } finally {
@@ -1205,7 +1232,6 @@ export default function App() {
       Alert.alert('Just a sec', 'Finishing setup… please try again.');
       return;
     }
-    setUiError(null);
     const assetTargets = screenshots.filter((s) => selected.has(s.id)).map((s) => ({ ...s, kind: 'asset' as const }));
     const fileTargets = files.filter((f) => selected.has(f.id)).map((f) => ({ ...f, kind: 'file' as const }));
     const targets = [...assetTargets, ...fileTargets];
@@ -1226,7 +1252,6 @@ export default function App() {
     const prompt = chatInput.trim();
     setChatInput('');
     setChatThinking(true);
-    setUiError(null);
 
     const userEntry: ChatEntry = { id: randomId(), role: 'user', text: prompt };
     const assistantId = randomId();
@@ -1423,8 +1448,7 @@ export default function App() {
       });
     } catch (err: any) {
       const message = err?.message ?? 'Failed to run RAG search';
-      setUiError(message);
-      Alert.alert('Chat error', message);
+      showErrorToast(message, { showUpgrade: false });
       setAssistantStreaming(false);
 	    } finally {
 	      setChatThinking(false);
@@ -1532,7 +1556,6 @@ export default function App() {
           <AuthScreen
             appleAvailable={appleAvailable}
             authBusy={authBusy}
-            authError={authError}
             onSignIn={signInWithApple}
           />
         </SafeAreaView>
@@ -1556,13 +1579,33 @@ export default function App() {
             plans={PAYWALL_PLANS}
             onClose={() => setPaywallOpen(false)}
             onSelectPlan={(planId) => {
-              Alert.alert('Coming soon', `Purchases are not enabled yet. Plan selected: ${planId}.`);
+              showErrorToast(`Purchases are not enabled yet. Selected plan: ${planId}.`, { showUpgrade: false });
             }}
             onRestore={() => {
               Alert.alert('Restore purchases', 'Restore purchases will be available after Apple account reinstatement.');
             }}
           />
         )}
+        <ErrorToast
+          visible={errorToastVisible && !!errorToastMessage && !paywallOpen}
+          message={errorToastMessage}
+          showUpgrade={errorToastUpgrade && FEATURE_FLAGS.paywall}
+          onClose={() => {
+            setErrorToastVisible(false);
+            setErrorToastMessage('');
+            setErrorToastUpgrade(false);
+          }}
+          onUpgrade={
+            errorToastUpgrade && FEATURE_FLAGS.paywall
+              ? () => {
+                  setErrorToastVisible(false);
+                  setErrorToastMessage('');
+                  setErrorToastUpgrade(false);
+                  openPaywall();
+                }
+              : undefined
+          }
+        />
 
       <View style={[styles.shell, !isWide && styles.shellMobile]}>
           {isWide ? (
@@ -1619,7 +1662,6 @@ export default function App() {
             />
           ) : route === 'import' ? (
             <ImportScreen
-              uiError={uiError}
               permissionStatus={permission?.status ?? null}
               limitedAccess={getAccessPrivileges(permission) === 'limited'}
               loadingScreenshots={loadingScreenshots}
@@ -1635,10 +1677,10 @@ export default function App() {
               onToggleSelect={toggleSelect}
               assetStageById={assetStageById}
               assetErrorById={assetErrorById}
+              onShowError={showErrorToast}
             />
 	          ) : route === 'categories' ? (
             <CategoriesScreen
-              uiError={uiError}
               apiBase={apiBase}
               categories={categories}
               activeCategory={activeCategory}
@@ -1649,7 +1691,7 @@ export default function App() {
                 try {
                   await deleteCategory(name, mode);
                 } catch (err: any) {
-                  setUiError(err?.message ?? 'Failed to delete category');
+                  handleApiError(err, 'Failed to delete category');
                 }
               }}
               onDeleteCategories={async (names, mode) => {
@@ -1666,7 +1708,7 @@ export default function App() {
                   setActiveCategory(null);
                   await refreshDocs();
                 } catch (err: any) {
-                  setUiError(err?.message ?? 'Failed to delete categories');
+                  handleApiError(err, 'Failed to delete categories');
                   throw err;
                 }
               }}
@@ -1684,14 +1726,13 @@ export default function App() {
                 try {
                   await deleteDoc(docId);
                 } catch (err: any) {
-                  setUiError(err?.message ?? 'Failed to delete photo');
+                  handleApiError(err, 'Failed to delete photo');
                 }
               }}
               onOpenDoc={openDoc}
             />
           ) : (
             <DocumentsScreen
-              uiError={uiError}
               apiBase={apiBase}
               docs={docs}
               onRefresh={refreshDocs}
@@ -1699,7 +1740,7 @@ export default function App() {
                 try {
                   await deleteDoc(docId);
                 } catch (err: any) {
-                  setUiError(err?.message ?? 'Failed to delete document');
+                  handleApiError(err, 'Failed to delete document');
                 }
               }}
               onDeleteDocs={async (docIds) => {
@@ -1715,7 +1756,7 @@ export default function App() {
                   }
                   await refreshDocs();
                 } catch (err: any) {
-                  setUiError(err?.message ?? 'Failed to delete documents');
+                  handleApiError(err, 'Failed to delete documents');
                   throw err;
                 }
               }}
@@ -2582,7 +2623,6 @@ function ChatScreen(props: {
 }
 
 function ImportScreen(props: {
-  uiError: string | null;
   permissionStatus: MediaLibrary.PermissionStatus | null;
   limitedAccess: boolean;
   loadingScreenshots: boolean;
@@ -2598,6 +2638,7 @@ function ImportScreen(props: {
   onToggleSelect: (id: string) => void;
   assetStageById: Record<string, 'uploading' | 'indexing' | 'done' | 'error'>;
   assetErrorById?: Record<string, string>;
+  onShowError: (message: string) => void;
 }) {
   const showImporting =
     props.importProgress.total > 0 &&
@@ -2654,8 +2695,6 @@ function ImportScreen(props: {
           </View>
         </View>
 
-        {props.uiError && <Text style={styles.inlineError}>{props.uiError}</Text>}
-
         {showImporting && (
           <View style={styles.importBanner}>
             <View style={styles.importBannerIcon}>
@@ -2711,7 +2750,7 @@ function ImportScreen(props: {
                   onLongPress={() => {
                     if (stage !== 'error') return;
                     if (!errorMsg) return;
-                    Alert.alert('Import failed', errorMsg);
+                    props.onShowError(errorMsg);
                   }}
                   delayLongPress={220}
                   style={styles.assetWrapper}
@@ -2747,7 +2786,7 @@ function ImportScreen(props: {
                   onLongPress={() => {
                     if (stage !== 'error') return;
                     if (!errorMsg) return;
-                    Alert.alert('Import failed', errorMsg);
+                    props.onShowError(errorMsg);
                   }}
                   delayLongPress={220}
                   style={({ pressed }) => [styles.fileRow, pressed && styles.pressed]}
@@ -2942,7 +2981,6 @@ function CategoriesEmptyState(props: { onRefresh: () => void }) {
 }
 
 function CategoriesScreen(props: {
-  uiError: string | null;
   apiBase: string;
   categories: CategorySummary[];
   activeCategory: string | null;
@@ -3188,8 +3226,6 @@ function CategoriesScreen(props: {
               </Pressable>
             </View>
 
-            {props.uiError && <Text style={[styles.inlineError, { marginTop: 14 }]}>{props.uiError}</Text>}
-
             {props.docsInActiveCategory.length === 0 && (
               <Text style={[styles.mcMuted, { marginTop: 16 }]}>No media in this category.</Text>
             )}
@@ -3297,7 +3333,6 @@ function CategoriesScreen(props: {
       </View>
 
       {noMatch && <Text style={[styles.mcMuted, { marginTop: 12 }]}>No matching categories.</Text>}
-      {props.uiError && <Text style={[styles.inlineError, { marginTop: 10 }]}>{props.uiError}</Text>}
     </View>
   );
 
@@ -3508,7 +3543,6 @@ function OnboardingScreen(props: { onDone: () => void }) {
 function AuthScreen(props: {
   appleAvailable: boolean;
   authBusy: boolean;
-  authError: string | null;
   onSignIn: () => void;
 }) {
   return (
@@ -3539,7 +3573,6 @@ function AuthScreen(props: {
           </View>
         )}
         {props.authBusy && <ActivityIndicator color={COLORS.text} />}
-        {!!props.authError && <Text style={styles.authError}>{props.authError}</Text>}
       </View>
     </View>
   );
@@ -3618,8 +3651,40 @@ function PaywallModal(props: {
   );
 }
 
+function ErrorToast(props: {
+  visible: boolean;
+  message: string;
+  onClose: () => void;
+  onUpgrade?: () => void;
+  showUpgrade?: boolean;
+}) {
+  return (
+    <Modal visible={props.visible} transparent animationType="fade" onRequestClose={props.onClose}>
+      <View style={styles.toastBackdrop}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={props.onClose} />
+        <View style={styles.toastCard}>
+          <View style={styles.toastHeader}>
+            <Ionicons name="alert-circle" size={18} color={COLORS.danger} />
+            <Text style={styles.toastTitle}>Something went wrong</Text>
+          </View>
+          <Text style={styles.toastMessage}>{props.message}</Text>
+          <View style={styles.toastActions}>
+            {props.showUpgrade && props.onUpgrade && (
+              <Pressable onPress={props.onUpgrade} style={({ pressed }) => [styles.toastPrimary, pressed && styles.pressed]}>
+                <Text style={styles.toastPrimaryText}>View plans</Text>
+              </Pressable>
+            )}
+            <Pressable onPress={props.onClose} style={({ pressed }) => [styles.toastSecondary, pressed && styles.pressed]}>
+              <Text style={styles.toastSecondaryText}>Close</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function DocumentsScreen(props: {
-  uiError: string | null;
   apiBase: string;
   docs: ServerDoc[];
   onRefresh: () => void;
@@ -3973,8 +4038,6 @@ function DocumentsScreen(props: {
         )}
       </View>
 
-      {props.uiError && <Text style={[styles.inlineError, { marginBottom: 10 }]}>{props.uiError}</Text>}
-
       <FlatList
         data={listData}
         renderItem={renderDoc}
@@ -4196,12 +4259,6 @@ const styles = StyleSheet.create({
     width: '100%',
     height: 44,
   },
-  authError: {
-    color: COLORS.danger,
-    fontSize: 12,
-    fontFamily: FONT_SANS,
-    textAlign: 'center',
-  },
   onboardingScreen: {
     flex: 1,
     backgroundColor: COLORS.bg,
@@ -4400,6 +4457,67 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.surfaceAlt,
   },
   paywallButtonText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  toastBackdrop: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    paddingHorizontal: 18,
+    paddingBottom: 24,
+    backgroundColor: 'rgba(0,0,0,0.2)',
+  },
+  toastCard: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    padding: 16,
+    gap: 10,
+  },
+  toastHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  toastTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  toastMessage: {
+    color: COLORS.muted,
+    fontSize: 13,
+    lineHeight: 18,
+    fontFamily: FONT_SANS,
+  },
+  toastActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 4,
+  },
+  toastPrimary: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: COLORS.text,
+  },
+  toastPrimaryText: {
+    color: COLORS.surface,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  toastSecondary: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  toastSecondaryText: {
     color: COLORS.text,
     fontSize: 12,
     fontFamily: FONT_SANS_SEMIBOLD,
