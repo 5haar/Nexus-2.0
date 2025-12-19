@@ -196,7 +196,7 @@ const PAYWALL_PLANS = [
 const IMPORT_PAGE_SIZE = 120;
 const IMPORT_MAX_ASSETS = 800;
 const REQUIRE_AUTH = process.env.EXPO_PUBLIC_REQUIRE_AUTH !== '0';
-const USER_ID_REGEX = /^[a-zA-Z0-9_-]{3,64}$/;
+const USER_ID_REGEX = /^[a-zA-Z0-9._-]{3,64}$/;
 
 const COLORS = {
   bg: '#ffffff',

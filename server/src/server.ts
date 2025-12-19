@@ -5,7 +5,6 @@ import multer from 'multer';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import crypto from 'node:crypto';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { OpenAI } from 'openai';
@@ -15,7 +14,7 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
-const USER_ID_REGEX = /^[a-zA-Z0-9_-]{3,64}$/;
+const USER_ID_REGEX = /^[a-zA-Z0-9._-]{3,64}$/;
 
 const getUserIdFromHeader = (req: express.Request) => {
   const raw = String(req.header('x-nexus-user-id') ?? '').trim();
@@ -155,10 +154,7 @@ const verifyAppleIdentityToken = async (token: string) => {
   return payload;
 };
 
-const hashSubject = (value: string) =>
-  crypto.createHash('sha256').update(value).digest('hex').slice(0, 32);
-
-const buildAppleUserId = (sub: string) => `apple_${hashSubject(sub)}`;
+const buildAppleUserId = (sub: string) => `apple_${sub}`;
 
 const sanitizeModelName = (value: unknown) => {
   const text = String(value ?? '').trim();
