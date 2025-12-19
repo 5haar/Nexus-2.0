@@ -1451,10 +1451,22 @@ export default function App() {
             <ImportScreen
               uiError={uiError}
               permissionStatus={permission?.status ?? null}
+              limitedAccess={getAccessPrivileges(permission) === 'limited'}
               loadingScreenshots={loadingScreenshots}
               selectedCount={selected.size}
               importProgress={importProgress}
               onLoadScreenshots={loadScreenshots}
+              onPickLimitedPhotos={async () => {
+                try {
+                  const picker = (MediaLibrary as any).presentLimitedLibraryPickerAsync;
+                  if (typeof picker === 'function') {
+                    await picker();
+                    await loadScreenshots();
+                  }
+                } catch (err: any) {
+                  setUiError(err?.message ?? 'Failed to open photo picker');
+                }
+              }}
               onPickFiles={pickFiles}
               onIndexSelected={handleSendToAI}
               screenshots={screenshots}
@@ -2412,10 +2424,12 @@ function ChatScreen(props: {
 function ImportScreen(props: {
   uiError: string | null;
   permissionStatus: MediaLibrary.PermissionStatus | null;
+  limitedAccess: boolean;
   loadingScreenshots: boolean;
   selectedCount: number;
   importProgress: { running: boolean; current: number; total: number; done: number; failed: number };
   onLoadScreenshots: () => void;
+  onPickLimitedPhotos: () => void;
   onPickFiles: () => void;
   onIndexSelected: () => void;
   screenshots: ResolvedAsset[];
@@ -2444,6 +2458,15 @@ function ImportScreen(props: {
               <Ionicons name="image-outline" size={16} color={COLORS.text} />
               <Text style={styles.pillButtonText}>{props.loadingScreenshots ? 'Loading…' : 'Load screenshots'}</Text>
             </Pressable>
+            {props.limitedAccess && Platform.OS === 'ios' && (
+              <Pressable
+                onPress={props.onPickLimitedPhotos}
+                style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
+              >
+                <Ionicons name="images-outline" size={16} color={COLORS.text} />
+                <Text style={styles.pillButtonText}>Choose more photos</Text>
+              </Pressable>
+            )}
             <Pressable
               onPress={props.onPickFiles}
               style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
