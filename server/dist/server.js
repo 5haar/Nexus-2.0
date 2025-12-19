@@ -64,6 +64,15 @@ const PLAN_LIMITS = {
 };
 const APPLE_ISSUER = 'https://appleid.apple.com';
 const APPLE_AUDIENCE = process.env.APPLE_AUDIENCE || '';
+const APPLE_IAP_SHARED_SECRET = process.env.APPLE_IAP_SHARED_SECRET || '';
+const APPLE_IAP_BUNDLE_ID = process.env.APPLE_IAP_BUNDLE_ID || '';
+const IAP_PRODUCT_IDS = {
+    starter: process.env.IAP_PRODUCT_STARTER || '',
+    pro: process.env.IAP_PRODUCT_PRO || '',
+    max: process.env.IAP_PRODUCT_MAX || '',
+};
+const APPLE_IAP_VERIFY_URL = 'https://buy.itunes.apple.com/verifyReceipt';
+const APPLE_IAP_SANDBOX_URL = 'https://sandbox.itunes.apple.com/verifyReceipt';
 if (!OPENAI_API_KEY) {
     console.warn('OPENAI_API_KEY is not set. Vision and search will fail.');
 }
@@ -339,6 +348,18 @@ const resolveEffectivePlan = (entitlement) => {
     }
     return normalizePlanId(entitlement.plan);
 };
+const resolvePlanFromProductId = (productId) => {
+    const trimmed = String(productId ?? '').trim();
+    if (!trimmed)
+        return null;
+    if (trimmed === IAP_PRODUCT_IDS.starter || trimmed.endsWith('.starter') || trimmed === 'starter')
+        return 'starter';
+    if (trimmed === IAP_PRODUCT_IDS.pro || trimmed.endsWith('.pro') || trimmed === 'pro')
+        return 'pro';
+    if (trimmed === IAP_PRODUCT_IDS.max || trimmed.endsWith('.max') || trimmed === 'max')
+        return 'max';
+    return null;
+};
 const getEntitlement = async (userId) => {
     await ensureUserRow(userId);
     if (mysqlPool) {
@@ -364,6 +385,75 @@ const getEntitlement = async (userId) => {
     }
     const entry = db.entitlements.find((e) => e.userId === userId);
     return entry ?? null;
+};
+const upsertEntitlement = async (entry) => {
+    const now = Date.now();
+    await ensureUserRow(entry.userId);
+    const payload = {
+        ...entry,
+        createdAt: entry.createdAt ?? now,
+        updatedAt: now,
+    };
+    if (mysqlPool) {
+        await ensureSchemaOnce();
+        await mysqlPool.execute(`INSERT INTO entitlements
+        (user_id, plan, status, source, product_id, original_transaction_id, expires_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+        plan=VALUES(plan),
+        status=VALUES(status),
+        source=VALUES(source),
+        product_id=VALUES(product_id),
+        original_transaction_id=VALUES(original_transaction_id),
+        expires_at=VALUES(expires_at),
+        updated_at=VALUES(updated_at)`, [
+            payload.userId,
+            payload.plan,
+            payload.status,
+            payload.source,
+            payload.productId ?? null,
+            payload.originalTransactionId ?? null,
+            payload.expiresAt ?? null,
+            payload.createdAt,
+            payload.updatedAt,
+        ]);
+        return payload;
+    }
+    const existing = db.entitlements.find((e) => e.userId === payload.userId);
+    if (existing) {
+        Object.assign(existing, payload);
+    }
+    else {
+        db.entitlements.push(payload);
+    }
+    writeDB(db);
+    return payload;
+};
+const postAppleReceipt = async (url, receipt) => {
+    const fetchFn = globalThis.fetch;
+    if (!fetchFn)
+        throw new Error('fetch is not available on this runtime');
+    const res = await fetchFn(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            'receipt-data': receipt,
+            password: APPLE_IAP_SHARED_SECRET,
+            'exclude-old-transactions': true,
+        }),
+    });
+    if (!res.ok)
+        throw new Error(`Apple verify failed (${res.status})`);
+    return await res.json();
+};
+const verifyAppleReceipt = async (receipt) => {
+    if (!APPLE_IAP_SHARED_SECRET)
+        throw new Error('APPLE_IAP_SHARED_SECRET is not set');
+    let result = await postAppleReceipt(APPLE_IAP_VERIFY_URL, receipt);
+    if (Number(result?.status) === 21007) {
+        result = await postAppleReceipt(APPLE_IAP_SANDBOX_URL, receipt);
+    }
+    return result;
 };
 const getUsageDaily = async (userId, day) => {
     await ensureUserRow(userId);
@@ -1335,6 +1425,80 @@ app.post('/api/auth/refresh', async (_req, res) => {
         status: 'disabled',
         message: 'Auth is not configured yet.',
     });
+});
+app.post('/api/iap/verify', async (req, res) => {
+    let userId = '';
+    try {
+        userId = getUserIdFromHeader(req);
+    }
+    catch (err) {
+        return res.status(400).json({ error: err?.message ?? 'Invalid user id' });
+    }
+    if (!userId || userId === 'public') {
+        return res.status(401).json({ error: 'Sign in required' });
+    }
+    const receipt = String(req.body?.receipt ?? '').trim();
+    const requestedProductId = String(req.body?.productId ?? '').trim();
+    if (!receipt)
+        return res.status(400).json({ error: 'Receipt is required' });
+    if (!APPLE_IAP_SHARED_SECRET)
+        return res.status(400).json({ error: 'IAP secret is not configured' });
+    try {
+        const result = await verifyAppleReceipt(receipt);
+        if (Number(result?.status ?? 0) !== 0) {
+            return res.status(400).json({ error: `Apple receipt invalid (${result?.status ?? 'unknown'})` });
+        }
+        const bundleId = String(result?.receipt?.bundle_id ?? '').trim();
+        if (APPLE_IAP_BUNDLE_ID && bundleId && bundleId !== APPLE_IAP_BUNDLE_ID) {
+            return res.status(400).json({ error: 'Bundle ID mismatch' });
+        }
+        const rawTransactions = Array.isArray(result?.latest_receipt_info)
+            ? result.latest_receipt_info
+            : Array.isArray(result?.receipt?.in_app)
+                ? result.receipt.in_app
+                : [];
+        const transactions = rawTransactions.filter((tx) => {
+            if (!requestedProductId)
+                return true;
+            return String(tx?.product_id ?? '').trim() === requestedProductId;
+        });
+        if (!transactions.length) {
+            return res.status(400).json({ error: 'No matching purchases found.' });
+        }
+        const sorted = [...transactions].sort((a, b) => {
+            const aTime = Number(a?.expires_date_ms ?? a?.purchase_date_ms ?? 0);
+            const bTime = Number(b?.expires_date_ms ?? b?.purchase_date_ms ?? 0);
+            return aTime - bTime;
+        });
+        const latest = sorted[sorted.length - 1];
+        const productId = String(latest?.product_id ?? requestedProductId ?? '').trim();
+        const plan = resolvePlanFromProductId(productId);
+        if (!plan) {
+            return res.status(400).json({ error: 'Unknown product id' });
+        }
+        const expiresAtRaw = Number(latest?.expires_date_ms ?? latest?.expires_date ?? 0);
+        const expiresAt = Number.isFinite(expiresAtRaw) && expiresAtRaw > 0 ? expiresAtRaw : null;
+        const now = Date.now();
+        const status = expiresAt !== null && expiresAt <= now ? 'expired' : 'active';
+        const originalTransactionId = String(latest?.original_transaction_id ?? '').trim() || undefined;
+        const entitlement = await upsertEntitlement({
+            userId,
+            plan,
+            status,
+            source: 'apple',
+            productId,
+            originalTransactionId,
+            expiresAt,
+            createdAt: now,
+            updatedAt: now,
+        });
+        const effectivePlan = resolveEffectivePlan(entitlement);
+        return res.json({ ok: true, entitlement, effectivePlan });
+    }
+    catch (err) {
+        console.error('IAP verify failed', err);
+        return res.status(400).json({ error: err?.message ?? 'Failed to verify receipt' });
+    }
 });
 app.get('/api/me', async (req, res) => {
     let userId = 'public';

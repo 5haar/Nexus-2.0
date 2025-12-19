@@ -7,6 +7,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import { useFonts } from 'expo-font';
 import * as AppleAuthentication from 'expo-apple-authentication';
+import * as RNIap from 'react-native-iap';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ActivityIndicator,
@@ -167,11 +168,17 @@ const FEATURE_FLAGS = {
   paywall: process.env.EXPO_PUBLIC_ENABLE_PAYWALL === '1',
   auth: process.env.EXPO_PUBLIC_ENABLE_AUTH === '1',
 } as const;
+const PAYWALL_PRODUCT_IDS = {
+  starter: process.env.EXPO_PUBLIC_IAP_STARTER_PRODUCT_ID || '',
+  pro: process.env.EXPO_PUBLIC_IAP_PRO_PRODUCT_ID || '',
+  max: process.env.EXPO_PUBLIC_IAP_MAX_PRODUCT_ID || '',
+} as const;
 const PAYWALL_PLANS = [
   {
     id: 'starter',
     name: 'Starter',
     price: '$5/mo',
+    productId: PAYWALL_PRODUCT_IDS.starter,
     uploads: 100,
     messagesPerDay: 100,
     highlight: false,
@@ -180,6 +187,7 @@ const PAYWALL_PLANS = [
     id: 'pro',
     name: 'Pro',
     price: '$10/mo',
+    productId: PAYWALL_PRODUCT_IDS.pro,
     uploads: 500,
     messagesPerDay: 1000,
     highlight: true,
@@ -188,6 +196,7 @@ const PAYWALL_PLANS = [
     id: 'max',
     name: 'Max',
     price: '$20/mo',
+    productId: PAYWALL_PRODUCT_IDS.max,
     uploads: 1000,
     messagesPerDay: null,
     highlight: false,
@@ -467,6 +476,9 @@ export default function App() {
   const [chatModel, setChatModel] = useState(DEFAULT_CHAT_MODEL);
   const [paywallOpen, setPaywallOpen] = useState(false);
   const [paywallReason, setPaywallReason] = useState('');
+  const [iapReady, setIapReady] = useState(false);
+  const [iapProductsById, setIapProductsById] = useState<Record<string, { price?: string }>>({});
+  const [purchaseBusy, setPurchaseBusy] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const threadsRef = useRef<ChatThread[]>([]);
   const activeThreadIdRef = useRef('');
@@ -886,6 +898,16 @@ export default function App() {
     setErrorToastUpgrade(opts?.showUpgrade ?? false);
   }, []);
 
+  useEffect(() => {
+    if (!errorToastVisible) return;
+    const timer = setTimeout(() => {
+      setErrorToastVisible(false);
+      setErrorToastMessage('');
+      setErrorToastUpgrade(false);
+    }, 5500);
+    return () => clearTimeout(timer);
+  }, [errorToastVisible, errorToastMessage]);
+
   const openPaywall = useCallback(
     (payload?: any) => {
       if (!FEATURE_FLAGS.paywall) return;
@@ -908,6 +930,183 @@ export default function App() {
     },
     [openPaywall, showErrorToast],
   );
+
+  const iapProductIds = useMemo(() => PAYWALL_PLANS.map((plan) => plan.productId).filter(Boolean), []);
+
+  const refreshIapProducts = useCallback(async () => {
+    if (!iapProductIds.length) return;
+    try {
+      const getSubs = (RNIap as any).getSubscriptions;
+      const getProducts = (RNIap as any).getProducts;
+      let results: any[] = [];
+      if (typeof getSubs === 'function') {
+        try {
+          const response = await getSubs({ skus: iapProductIds });
+          results = Array.isArray(response) ? response : response?.products ?? response?.subscriptions ?? [];
+        } catch {
+          const response = await getSubs(iapProductIds);
+          results = Array.isArray(response) ? response : response?.products ?? response?.subscriptions ?? [];
+        }
+      } else if (typeof getProducts === 'function') {
+        try {
+          const response = await getProducts({ skus: iapProductIds });
+          results = Array.isArray(response) ? response : response?.products ?? [];
+        } catch {
+          const response = await getProducts(iapProductIds);
+          results = Array.isArray(response) ? response : response?.products ?? [];
+        }
+      }
+      const next: Record<string, { price?: string }> = {};
+      for (const item of results) {
+        const productId = String(item?.productId ?? '').trim();
+        if (!productId) continue;
+        const price =
+          String(item?.localizedPrice ?? item?.priceString ?? item?.price ?? '').trim() || undefined;
+        next[productId] = { price };
+      }
+      setIapProductsById(next);
+    } catch (err: any) {
+      showErrorToast(err?.message ?? 'Unable to load App Store products.');
+    }
+  }, [iapProductIds, showErrorToast]);
+
+  const verifyReceiptOnServer = useCallback(
+    async (receipt: string, productId?: string) => {
+      if (!userId) throw new Error('Missing user id');
+      return await apiFetch<{ ok: boolean; effectivePlan?: string }>(apiBase, userId, '/api/iap/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ receipt, productId }),
+      });
+    },
+    [apiBase, userId],
+  );
+
+  useEffect(() => {
+    if (!FEATURE_FLAGS.paywall || Platform.OS !== 'ios') return;
+    let active = true;
+    const connect = async () => {
+      try {
+        const initFn = (RNIap as any).initConnection;
+        if (typeof initFn === 'function') {
+          await initFn();
+        }
+        if (!active) return;
+        setIapReady(true);
+        await refreshIapProducts();
+      } catch (err: any) {
+        showErrorToast(err?.message ?? 'Unable to connect to the App Store.');
+      }
+    };
+    connect();
+    const updateSub = (RNIap as any).purchaseUpdatedListener?.(async (purchase: any) => {
+      if (!active) return;
+      try {
+        const receipt = String(purchase?.transactionReceipt ?? '').trim();
+        const productId = String(purchase?.productId ?? '').trim() || undefined;
+        if (!receipt) {
+          showErrorToast('Missing receipt. Please try again.');
+          return;
+        }
+        try {
+          await verifyReceiptOnServer(receipt, productId);
+          setPaywallOpen(false);
+          await (RNIap as any).finishTransaction?.(purchase, false);
+        } catch (err: any) {
+          handleApiError(err, 'Purchase verification failed.');
+        }
+      } finally {
+        setPurchaseBusy(false);
+      }
+    });
+    const errorSub = (RNIap as any).purchaseErrorListener?.((err: any) => {
+      if (!active) return;
+      setPurchaseBusy(false);
+      showErrorToast(err?.message ?? 'Purchase failed.');
+    });
+    return () => {
+      active = false;
+      try {
+        updateSub?.remove?.();
+        errorSub?.remove?.();
+      } catch {
+        // ignore
+      }
+      try {
+        (RNIap as any).endConnection?.();
+      } catch {
+        // ignore
+      }
+    };
+  }, [handleApiError, refreshIapProducts, showErrorToast, verifyReceiptOnServer]);
+
+  const startPurchase = useCallback(
+    async (planId: string) => {
+      const plan = PAYWALL_PLANS.find((item) => item.id === planId);
+      if (!plan?.productId) {
+        showErrorToast('This plan is not configured yet. Please try again later.');
+        return;
+      }
+      if (Platform.OS !== 'ios') {
+        showErrorToast('Purchases are only available on iOS right now.');
+        return;
+      }
+      if (!iapReady) {
+        showErrorToast('App Store connection is still starting. Try again in a moment.');
+        return;
+      }
+      try {
+        setPurchaseBusy(true);
+        const requestFn = (RNIap as any).requestSubscription ?? (RNIap as any).requestPurchase;
+        if (typeof requestFn !== 'function') throw new Error('Purchases are not available yet.');
+        try {
+          await requestFn({ sku: plan.productId });
+        } catch {
+          await requestFn(plan.productId);
+        }
+      } catch (err: any) {
+        setPurchaseBusy(false);
+        showErrorToast(err?.message ?? 'Purchase failed.');
+      }
+    },
+    [iapReady, showErrorToast],
+  );
+
+  const restorePurchases = useCallback(async () => {
+    if (Platform.OS !== 'ios') {
+      showErrorToast('Purchases are only available on iOS right now.');
+      return;
+    }
+    if (!iapReady) {
+      showErrorToast('App Store connection is still starting. Try again in a moment.');
+      return;
+    }
+    try {
+      setPurchaseBusy(true);
+      const restoreFn = (RNIap as any).getAvailablePurchases;
+      if (typeof restoreFn !== 'function') {
+        showErrorToast('Restore is not available on this build.');
+        return;
+      }
+      const response = await restoreFn();
+      const results = Array.isArray(response) ? response : response?.purchases ?? [];
+      const receipts = Array.from(
+        new Set(results.map((item: any) => String(item?.transactionReceipt ?? '').trim()).filter(Boolean)),
+      );
+      if (!receipts.length) {
+        showErrorToast('No previous purchases found.');
+        return;
+      }
+      for (const receipt of receipts) {
+        await verifyReceiptOnServer(receipt);
+      }
+      setPaywallOpen(false);
+    } catch (err: any) {
+      showErrorToast(err?.message ?? 'Failed to restore purchases.');
+    } finally {
+      setPurchaseBusy(false);
+    }
+  }, [iapReady, showErrorToast, verifyReceiptOnServer]);
 
   const refreshDocs = async () => {
     try {
@@ -1577,13 +1776,12 @@ export default function App() {
             visible={paywallOpen}
             reason={paywallReason}
             plans={PAYWALL_PLANS}
+            storeReady={iapReady}
+            purchaseBusy={purchaseBusy}
+            pricesByProductId={iapProductsById}
             onClose={() => setPaywallOpen(false)}
-            onSelectPlan={(planId) => {
-              showErrorToast(`Purchases are not enabled yet. Selected plan: ${planId}.`, { showUpgrade: false });
-            }}
-            onRestore={() => {
-              Alert.alert('Restore purchases', 'Restore purchases will be available after Apple account reinstatement.');
-            }}
+            onSelectPlan={startPurchase}
+            onRestore={restorePurchases}
           />
         )}
         <ErrorToast
@@ -3582,6 +3780,9 @@ function PaywallModal(props: {
   visible: boolean;
   reason: string;
   plans: typeof PAYWALL_PLANS;
+  storeReady?: boolean;
+  purchaseBusy?: boolean;
+  pricesByProductId?: Record<string, { price?: string }>;
   onClose: () => void;
   onSelectPlan: (planId: string) => void;
   onRestore: () => void;
@@ -3600,6 +3801,24 @@ function PaywallModal(props: {
               <Text style={styles.paywallTitle}>Upgrade to Nexus</Text>
               <Text style={styles.paywallSubtitle}>Unlock more uploads and higher message limits.</Text>
             </View>
+            {Platform.OS !== 'ios' && (
+              <View style={styles.paywallNotice}>
+                <Ionicons name="alert-circle-outline" size={16} color={COLORS.muted} />
+                <Text style={styles.paywallNoticeText}>Purchases are only available on iOS.</Text>
+              </View>
+            )}
+            {Platform.OS === 'ios' && props.storeReady === false && (
+              <View style={styles.paywallNotice}>
+                <Ionicons name="refresh-outline" size={16} color={COLORS.muted} />
+                <Text style={styles.paywallNoticeText}>Connecting to the App Store…</Text>
+              </View>
+            )}
+            {props.purchaseBusy && (
+              <View style={styles.paywallNotice}>
+                <ActivityIndicator size="small" color={COLORS.muted} />
+                <Text style={styles.paywallNoticeText}>Processing purchase…</Text>
+              </View>
+            )}
             {!!props.reason && (
               <View style={styles.paywallReason}>
                 <Ionicons name="lock-closed-outline" size={14} color={COLORS.muted} />
@@ -3611,30 +3830,38 @@ function PaywallModal(props: {
               <Text style={styles.paywallFreeText}>5 messages/day • 5 total uploads</Text>
             </View>
             <View style={styles.paywallPlans}>
-              {props.plans.map((plan) => (
-                <Pressable
-                  key={plan.id}
-                  onPress={() => props.onSelectPlan(plan.id)}
-                  style={({ pressed }) => [
-                    styles.paywallPlan,
-                    plan.highlight && styles.paywallPlanHighlight,
-                    pressed && styles.pressed,
-                  ]}
-                >
-                  <View style={styles.paywallPlanHeader}>
-                    <View>
-                      <Text style={styles.paywallPlanName}>{plan.name}</Text>
-                      <Text style={styles.paywallPlanPrice}>{plan.price}</Text>
-                    </View>
-                    {plan.highlight && (
-                      <View style={styles.paywallPlanBadge}>
-                        <Text style={styles.paywallPlanBadgeText}>Popular</Text>
+              {props.plans.map((plan) => {
+                const resolvedPrice = props.pricesByProductId?.[plan.productId]?.price || plan.price;
+                return (
+                  <Pressable
+                    key={plan.id}
+                    onPress={() => props.onSelectPlan(plan.id)}
+                    disabled={props.purchaseBusy}
+                    style={({ pressed }) => [
+                      styles.paywallPlan,
+                      plan.highlight && styles.paywallPlanHighlight,
+                      props.purchaseBusy && styles.disabled,
+                      pressed && styles.pressed,
+                    ]}
+                  >
+                    <View style={styles.paywallPlanHeader}>
+                      <View>
+                        <Text style={styles.paywallPlanName}>{plan.name}</Text>
+                        <Text style={styles.paywallPlanPrice}>{resolvedPrice}</Text>
                       </View>
+                      {plan.highlight && (
+                        <View style={styles.paywallPlanBadge}>
+                          <Text style={styles.paywallPlanBadgeText}>Popular</Text>
+                        </View>
+                      )}
+                    </View>
+                    <Text style={styles.paywallPlanMeta}>{renderPlanMeta(plan)}</Text>
+                    {!plan.productId && (
+                      <Text style={styles.paywallPlanHint}>Plan not configured yet.</Text>
                     )}
-                  </View>
-                  <Text style={styles.paywallPlanMeta}>{renderPlanMeta(plan)}</Text>
-                </Pressable>
-              ))}
+                  </Pressable>
+                );
+              })}
             </View>
             <View style={styles.paywallFooter}>
               <Pressable onPress={props.onRestore} style={({ pressed }) => [styles.paywallLink, pressed && styles.pressed]}>
@@ -4366,6 +4593,23 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: FONT_SANS,
   },
+  paywallNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+    marginBottom: 10,
+  },
+  paywallNoticeText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+  },
   paywallFree: {
     paddingHorizontal: 12,
     paddingVertical: 10,
@@ -4432,6 +4676,12 @@ const styles = StyleSheet.create({
     color: COLORS.muted,
     fontSize: 12,
     fontFamily: FONT_SANS,
+  },
+  paywallPlanHint: {
+    color: COLORS.muted2,
+    fontSize: 11,
+    fontFamily: FONT_SANS,
+    marginTop: 4,
   },
   paywallFooter: {
     marginTop: 16,
