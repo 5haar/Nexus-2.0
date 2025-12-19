@@ -50,6 +50,9 @@ const RAG_LEXICAL_WEIGHT = Number(process.env.RAG_LEXICAL_WEIGHT || 0.08);
 const RAG_MIN_HYBRID_SCORE = Number(process.env.RAG_MIN_HYBRID_SCORE || 0.19);
 const RAG_DOC_TEXT_MAX_CHARS = Number(process.env.RAG_DOC_TEXT_MAX_CHARS || 420);
 const RAG_DOC_CAPTION_MAX_CHARS = Number(process.env.RAG_DOC_CAPTION_MAX_CHARS || 120);
+const DOC_TEXT_ANALYSIS_MAX_CHARS = Number(process.env.DOC_TEXT_ANALYSIS_MAX_CHARS || 6000);
+const DOC_TEXT_EMBED_MAX_CHARS = Number(process.env.DOC_TEXT_EMBED_MAX_CHARS || 8000);
+const DOC_TEXT_STORE_MAX_CHARS = Number(process.env.DOC_TEXT_STORE_MAX_CHARS || 20000);
 const PAYWALL_ENFORCED = process.env.PAYWALL_ENFORCED !== '0';
 const PLAN_LIMITS = {
     free: { messagesPerDay: 5, uploadsTotal: 5 },
@@ -118,7 +121,7 @@ const upload = multer({
             cb(null, `${Date.now()}-${safeName}`);
         },
     }),
-    limits: { fileSize: 10 * 1024 * 1024 },
+    limits: { fileSize: 25 * 1024 * 1024 },
 });
 const app = express();
 app.use(cors());
@@ -585,6 +588,65 @@ const listDocsFromDb = async (userId, opts) => {
         };
     });
 };
+const getDocByIdFromDb = async (userId, docId) => {
+    if (!mysqlPool)
+        throw new Error('DB not configured');
+    await ensureSchemaOnce();
+    await ensureUserRow(userId);
+    const [rows] = (await mysqlPool.execute(`SELECT
+      d.id,
+      d.user_id AS userId,
+      d.original_name AS originalName,
+      d.file_mime AS fileMime,
+      d.media_type AS mediaType,
+      d.caption,
+      d.text,
+      d.embedding AS embedding,
+      d.created_at AS createdAt,
+      d.storage,
+      d.file_path AS filePath,
+      d.s3_key AS s3Key,
+      GROUP_CONCAT(c.name ORDER BY c.name SEPARATOR 0x01) AS categories
+    FROM docs d
+    LEFT JOIN doc_categories dc ON dc.doc_id = d.id
+    LEFT JOIN categories c ON c.id = dc.category_id
+    WHERE d.user_id = ? AND d.id = ?
+    GROUP BY d.id
+    LIMIT 1`, [userId, docId]));
+    const row = rows[0];
+    if (!row)
+        return null;
+    const catsRawOriginal = typeof row.categories === 'string' ? row.categories : row.categories == null ? '' : String(row.categories);
+    const catsRaw = catsRawOriginal.split('\\u0001').join(String.fromCharCode(1));
+    const categories = catsRaw
+        ? Array.from(new Set(catsRaw
+            .split('\u0001')
+            .map((c) => canonicalizeCategory(c))
+            .filter(Boolean)))
+        : [];
+    let embedding = [];
+    try {
+        embedding = JSON.parse(String(row.embedding ?? '[]'));
+    }
+    catch {
+        embedding = [];
+    }
+    return {
+        id: String(row.id),
+        userId: String(row.userId),
+        originalName: String(row.originalName),
+        fileMime: String(row.fileMime),
+        mediaType: row.mediaType,
+        caption: String(row.caption ?? ''),
+        categories,
+        text: String(row.text ?? ''),
+        embedding,
+        createdAt: Number(row.createdAt ?? Date.now()),
+        storage: String(row.storage ?? 'local') ?? 'local',
+        filePath: row.filePath ? String(row.filePath) : undefined,
+        s3Key: row.s3Key ? String(row.s3Key) : undefined,
+    };
+};
 const saveDocToDb = async (doc) => {
     if (!mysqlPool)
         throw new Error('DB not configured');
@@ -749,6 +811,12 @@ const listSearchableDocs = async (userId) => {
     }
     return db.docs.filter((d) => d.userId === userId && d.embedding.length && (d.categories?.length ?? 0) > 0);
 };
+const getDocById = async (userId, docId) => {
+    if (mysqlPool)
+        return await getDocByIdFromDb(userId, docId);
+    const doc = db.docs.find((d) => d.userId === userId && d.id === docId);
+    return doc ?? null;
+};
 const saveDoc = async (doc) => {
     if (mysqlPool)
         return await saveDocToDb(doc);
@@ -860,6 +928,93 @@ const analyzeScreenshot = async (filePath, mime, existingCategories) => {
         throw new Error('No analysis content returned');
     return JSON.parse(content);
 };
+let pdfParseLoader = null;
+const loadPdfParse = async () => {
+    if (pdfParseLoader)
+        return pdfParseLoader;
+    pdfParseLoader = import('pdf-parse')
+        .then((m) => m?.default ?? m)
+        .catch(() => null);
+    return pdfParseLoader;
+};
+let mammothLoader = null;
+const loadMammoth = async () => {
+    if (mammothLoader)
+        return mammothLoader;
+    mammothLoader = import('mammoth')
+        .then((m) => m?.default ?? m)
+        .catch(() => null);
+    return mammothLoader;
+};
+const extractTextFromPdf = async (filePath) => {
+    const parser = await loadPdfParse();
+    if (!parser)
+        throw new Error('pdf-parse is not available');
+    const data = await parser(fs.readFileSync(filePath));
+    return String(data?.text ?? '').trim();
+};
+const extractTextFromDocx = async (filePath) => {
+    const mammoth = await loadMammoth();
+    if (!mammoth)
+        throw new Error('mammoth is not available');
+    const result = await mammoth.extractRawText({ path: filePath });
+    return String(result?.value ?? '').trim();
+};
+const isTextDocMime = (mime) => mime.startsWith('text/') ||
+    mime === 'application/rtf' ||
+    mime === 'application/pdf' ||
+    mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+const analyzeDocumentText = async (text, filename, existingCategories) => {
+    if (!openai)
+        throw new Error('Missing OPENAI_API_KEY');
+    const safeExisting = Array.from(new Set(existingCategories.map((c) => canonicalizeCategory(c)).filter(Boolean))).slice(0, Math.max(0, Math.min(200, MAX_EXISTING_CATEGORIES_CONTEXT)));
+    const snippet = String(text ?? '').slice(0, Math.max(0, DOC_TEXT_ANALYSIS_MAX_CHARS));
+    const response = await openai.chat.completions.create({
+        model: VISION_MODEL,
+        response_format: {
+            type: 'json_schema',
+            json_schema: {
+                name: 'DocumentAnalysis',
+                schema: {
+                    type: 'object',
+                    properties: {
+                        caption: { type: 'string' },
+                        existingCategories: { type: 'array', items: { type: 'string' } },
+                        newCategories: { type: 'array', items: { type: 'string' } },
+                        text: { type: 'array', items: { type: 'string' } },
+                    },
+                    required: ['caption', 'existingCategories', 'newCategories', 'text'],
+                    additionalProperties: false,
+                },
+                strict: true,
+            },
+        },
+        messages: [
+            {
+                role: 'system',
+                content: 'You summarize documents and categorize them. Use the document text to pick a stable category.',
+            },
+            {
+                role: 'user',
+                content: 'Return JSON with caption, existingCategories, newCategories, text array.\n' +
+                    'Rules:\n' +
+                    '- Prefer the provided existing categories when a document fits.\n' +
+                    '- Output exactly 1 category total.\n' +
+                    '- If a provided category fits, set existingCategories to a 1-item array (picked verbatim) and set newCategories to an empty array.\n' +
+                    '- If none fit, set existingCategories to an empty array and set newCategories to a 1-item array.\n' +
+                    '- The chosen category should be stable and reusable (not overly specific).\n' +
+                    '- Never include numbers, ids, timestamps, or list indices in categories.\n' +
+                    `Filename: ${filename}\n` +
+                    `Existing categories: ${JSON.stringify(safeExisting)}\n` +
+                    `Document text:\n${snippet}`,
+            },
+        ],
+    });
+    const content = response.choices?.[0]?.message?.content;
+    if (!content)
+        throw new Error('No analysis content returned');
+    return JSON.parse(content);
+};
 const embedText = async (text) => {
     if (!openai)
         throw new Error('Missing OPENAI_API_KEY');
@@ -883,12 +1038,36 @@ const tokenize = (text) => {
         .match(/[a-z0-9]{3,}/g);
     return Array.from(new Set(tokens ?? [])).slice(0, 40);
 };
-const buildRetrievalContext = async (query, topK, userId, category) => {
+const buildRetrievalContext = async (query, topK, userId, opts) => {
     const requestedTopK = clampInt(topK, 1, RAG_TOPK_MAX);
-    const categoryKey = category ? canonicalizeCategory(category) : '';
+    const categoryKey = opts?.category ? canonicalizeCategory(opts.category) : '';
+    const docId = String(opts?.docId ?? '').trim();
+    if (docId) {
+        const doc = await getDocById(userId, docId);
+        if (!doc) {
+            return { context: '', ranked: [], reason: 'Document not found.' };
+        }
+        const queryEmbedding = await embedText(query);
+        const queryTokens = tokenize(query);
+        const cosineScore = cosine(queryEmbedding, doc.embedding);
+        const docBlob = `${doc.caption}\n${(doc.categories ?? []).join(' ')}\n${doc.text}`;
+        const docTokens = tokenize(docBlob);
+        const overlap = queryTokens.length === 0 ? 0 : queryTokens.filter((t) => docTokens.includes(t)).length / queryTokens.length;
+        const hybrid = cosineScore + RAG_LEXICAL_WEIGHT * overlap;
+        const ranked = [{ doc, score: hybrid, cosine: cosineScore, overlap }];
+        const context = ranked
+            .map(({ doc, score, cosine, overlap }) => {
+            const caption = truncate(doc.caption, RAG_DOC_CAPTION_MAX_CHARS);
+            const text = truncate(doc.text, RAG_DOC_TEXT_MAX_CHARS);
+            const cats = (doc.categories ?? []).map((c) => canonicalizeCategory(c)).filter(Boolean).join(', ');
+            return `score:${score.toFixed(3)} cos:${cosine.toFixed(3)} lex:${overlap.toFixed(2)} | caption:${caption} | categories:${cats} | text:${text}`;
+        })
+            .join('\n');
+        return { context, ranked };
+    }
     const searchableAll = await listSearchableDocs(userId);
     if (!searchableAll.length) {
-        return { context: '', ranked: [], reason: 'No screenshots indexed yet.' };
+        return { context: '', ranked: [], reason: 'No items indexed yet.' };
     }
     const searchable = categoryKey
         ? searchableAll.filter((d) => (d.categories ?? []).some((c) => canonicalizeCategory(c) === categoryKey))
@@ -897,7 +1076,7 @@ const buildRetrievalContext = async (query, topK, userId, category) => {
         return {
             context: '',
             ranked: [],
-            reason: categoryKey ? `No screenshots found in “${categoryKey}”.` : 'No screenshots indexed yet.',
+            reason: categoryKey ? `No items found in “${categoryKey}”.` : 'No items indexed yet.',
         };
     }
     const queryEmbedding = await embedText(query);
@@ -1372,9 +1551,30 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
         return res.status(400).json({ error: 'file is required' });
     }
     const createdAt = Number(req.body.createdAt) || Date.now();
-    const fileMime = req.file.mimetype || 'application/octet-stream';
+    const originalName = req.file.originalname;
+    let fileMime = req.file.mimetype || 'application/octet-stream';
+    const ext = path.extname(originalName).toLowerCase();
+    const inferMimeFromExt = (extension) => {
+        if (extension === '.pdf')
+            return 'application/pdf';
+        if (extension === '.txt')
+            return 'text/plain';
+        if (extension === '.md')
+            return 'text/markdown';
+        if (extension === '.rtf')
+            return 'application/rtf';
+        if (extension === '.docx')
+            return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        return '';
+    };
+    if (fileMime === 'application/octet-stream') {
+        const inferred = inferMimeFromExt(ext);
+        if (inferred)
+            fileMime = inferred;
+    }
     const isImage = fileMime.startsWith('image/');
     const isVideo = fileMime.startsWith('video/');
+    const isDoc = isTextDocMime(fileMime);
     if (isVideo) {
         try {
             if (fs.existsSync(req.file.path))
@@ -1384,6 +1584,16 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
             // ignore
         }
         return res.status(400).json({ error: 'Videos are not supported. Please upload screenshots (photos) only.' });
+    }
+    if (!isImage && !isDoc) {
+        try {
+            if (fs.existsSync(req.file.path))
+                fs.unlinkSync(req.file.path);
+        }
+        catch {
+            // ignore
+        }
+        return res.status(400).json({ error: 'Only images, PDFs, and text documents are supported.' });
     }
     const uploadAllowance = await checkUploadAllowance(userId);
     if (!uploadAllowance.allowed) {
@@ -1419,8 +1629,8 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
                 userId,
                 filePath: usablePath,
                 originalName: converted
-                    ? req.file.originalname.replace(/\.[^.]+$/i, '.png')
-                    : req.file.originalname,
+                    ? originalName.replace(/\.[^.]+$/i, '.png')
+                    : originalName,
                 fileMime: converted ? 'image/png' : fileMime,
                 mediaType: 'image',
                 caption: analysis.caption || 'Screenshot',
@@ -1431,14 +1641,52 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
             };
         }
         else {
+            const existingCategories = await listUserCategories(userId);
+            let extractedText = '';
             try {
-                if (fs.existsSync(req.file.path))
-                    fs.unlinkSync(req.file.path);
+                if (fileMime === 'application/pdf') {
+                    extractedText = await extractTextFromPdf(req.file.path);
+                }
+                else if (fileMime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+                    extractedText = await extractTextFromDocx(req.file.path);
+                }
+                else if (fileMime.startsWith('text/') || fileMime === 'application/rtf') {
+                    extractedText = fs.readFileSync(req.file.path, 'utf-8');
+                }
             }
-            catch {
-                // ignore
+            catch (err) {
+                console.warn('Document text extraction failed', err);
             }
-            return res.status(400).json({ error: 'Only photos are supported. Please upload screenshots.' });
+            const analysis = await analyzeDocumentText(extractedText, originalName, existingCategories);
+            const combinedText = [
+                analysis.caption,
+                ...(analysis.text ?? []),
+                extractedText.slice(0, Math.max(0, DOC_TEXT_EMBED_MAX_CHARS)),
+            ].join('\n');
+            const embedding = await embedText(combinedText);
+            const id = randomId();
+            const existingSet = new Set(existingCategories.map((c) => canonicalizeCategory(c)).filter(Boolean));
+            const pickedExisting = (analysis.existingCategories ?? [])
+                .map((c) => canonicalizeCategory(c))
+                .filter((c) => !!c && existingSet.has(c));
+            const pickedNew = (analysis.newCategories ?? [])
+                .map((c) => canonicalizeCategory(c))
+                .filter((c) => !!c && !existingSet.has(c));
+            const chosen = pickedExisting[0] || pickedNew[0] || 'unsorted';
+            const categories = [chosen].slice(0, Math.max(1, Math.min(10, MAX_CATEGORIES_PER_DOC)));
+            doc = {
+                id,
+                userId,
+                filePath: req.file.path,
+                originalName,
+                fileMime,
+                mediaType: 'document',
+                caption: analysis.caption || 'Document',
+                categories,
+                text: truncate(extractedText || analysis.text?.join(' ') || '', DOC_TEXT_STORE_MAX_CHARS),
+                embedding,
+                createdAt,
+            };
         }
         doc.storage = 'local';
         if (s3 && S3_BUCKET && doc.filePath) {
@@ -1472,7 +1720,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     }
 });
 app.post('/api/search', async (req, res) => {
-    const { query, topK = 5, category, model } = req.body;
+    const { query, topK = 5, category, model, docId } = req.body;
     if (!query || !query.trim()) {
         return res.status(400).json({ error: 'query is required' });
     }
@@ -1489,9 +1737,12 @@ app.post('/api/search', async (req, res) => {
             return res.status(402).json(buildPaywallPayload('messages', allowance.used, allowance.limit, allowance.plan));
         }
         await incrementUsageDaily(userId, allowance.day, 1);
-        const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, category);
+        const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, {
+            category,
+            docId,
+        });
         if (!ranked.length)
-            return res.json({ answer: reason || 'No screenshots indexed yet.', matches: [] });
+            return res.json({ answer: reason || 'No items indexed yet.', matches: [] });
         const openaiClient = requireOpenAI();
         const response = await openaiClient.chat.completions.create({
             model: resolveChatModel(model),
@@ -1521,7 +1772,7 @@ app.post('/api/search', async (req, res) => {
     }
 });
 app.post('/api/search-stream', async (req, res) => {
-    const { query, topK = 5, category, model } = req.body;
+    const { query, topK = 5, category, model, docId } = req.body;
     if (!query || !query.trim()) {
         res.status(400).json({ error: 'query is required' });
         return;
@@ -1567,9 +1818,12 @@ app.post('/api/search-stream', async (req, res) => {
     res.on('finish', () => clearInterval(heartbeat));
     try {
         await incrementUsageDaily(userId, allowance.day, 1);
-        const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, category);
+        const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, {
+            category,
+            docId,
+        });
         if (!ranked.length) {
-            writeSse(res, { type: 'info', message: reason || 'No screenshots indexed yet.' });
+            writeSse(res, { type: 'info', message: reason || 'No items indexed yet.' });
             writeSse(res, { type: 'done' });
             res.end();
             return;
@@ -1669,6 +1923,8 @@ wss.on('connection', (ws) => {
         const query = typeof message?.query === 'string' ? message.query.trim() : '';
         const topK = typeof message?.topK === 'number' ? message.topK : 5;
         const category = typeof message?.category === 'string' && message.category.trim().length <= 80 ? message.category.trim() : '';
+        const docIdRaw = typeof message?.docId === 'string' ? message.docId.trim() : '';
+        const docId = docIdRaw && /^[a-zA-Z0-9_-]{3,128}$/.test(docIdRaw) ? docIdRaw : '';
         const model = resolveChatModel(message?.model);
         const userIdRaw = typeof message?.userId === 'string' ? message.userId.trim() : '';
         const userId = userIdRaw && /^[a-zA-Z0-9_-]{3,128}$/.test(userIdRaw) ? userIdRaw : 'public';
@@ -1685,9 +1941,12 @@ wss.on('connection', (ws) => {
                 return;
             }
             await incrementUsageDaily(userId, allowance.day, 1);
-            const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, category);
+            const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, {
+                category,
+                docId,
+            });
             if (!ranked.length) {
-                wsSend(ws, { type: 'info', message: reason || 'No screenshots indexed yet.' });
+                wsSend(ws, { type: 'info', message: reason || 'No items indexed yet.' });
                 wsSend(ws, { type: 'done' });
                 return;
             }

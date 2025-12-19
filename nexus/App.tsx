@@ -3,6 +3,7 @@ import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Haptics from 'expo-haptics';
 import * as MediaLibrary from 'expo-media-library';
+import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import { useFonts } from 'expo-font';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -54,6 +55,8 @@ type ServerDoc = {
   uri?: string;
   score?: number;
   mediaType?: string;
+  fileMime?: string;
+  originalName?: string;
 };
 
 type CategorySummary = { name: string; count: number; updatedAt: number };
@@ -84,6 +87,19 @@ type ResolvedAsset = {
   mediaType: MediaLibrary.MediaTypeValue;
   asset: MediaLibrary.Asset;
 };
+
+type FileItem = {
+  id: string;
+  uri: string;
+  name: string;
+  size?: number | null;
+  mimeType?: string | null;
+  createdAt: number;
+};
+
+type UploadItem =
+  | ({ kind: 'asset' } & ResolvedAsset)
+  | ({ kind: 'file' } & FileItem);
 
 const inferDevServerHost = () => {
   const scriptURL: string | undefined = (NativeModules as any)?.SourceCode?.scriptURL;
@@ -258,6 +274,19 @@ const resolveDocUri = (apiBase: string, doc: ServerDoc) => {
   return `${apiBase}${doc.uri}`;
 };
 
+const isImageDoc = (doc: ServerDoc) => {
+  if (doc.mediaType === 'image') return true;
+  const mime = String(doc.fileMime ?? '').toLowerCase();
+  return mime.startsWith('image/');
+};
+
+const formatFileSize = (bytes?: number | null) => {
+  if (!bytes) return 'Unknown size';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
 const toWsUrl = (base: string) => {
   const url = new URL(base);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -320,6 +349,18 @@ const inferImageContentType = (filename: string | null | undefined) => {
   return 'image/jpeg';
 };
 
+const inferDocContentType = (filename: string | null | undefined) => {
+  const name = String(filename ?? '').toLowerCase();
+  if (name.endsWith('.pdf')) return 'application/pdf';
+  if (name.endsWith('.md')) return 'text/markdown';
+  if (name.endsWith('.txt')) return 'text/plain';
+  if (name.endsWith('.rtf')) return 'application/rtf';
+  if (name.endsWith('.docx')) {
+    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  }
+  return 'application/octet-stream';
+};
+
 const apiFetch = async <T,>(apiBase: string, userId: string, path: string, init?: RequestInit): Promise<T> => {
   let res: Response;
   try {
@@ -372,13 +413,14 @@ export default function App() {
   const [permission, setPermission] = useState<MediaLibrary.PermissionResponse | null>(null);
   const [loadingScreenshots, setLoadingScreenshots] = useState(false);
   const [screenshots, setScreenshots] = useState<ResolvedAsset[]>([]);
+  const [files, setFiles] = useState<FileItem[]>([]);
   const importAutoLoadAttemptedRef = useRef(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [assetStageById, setAssetStageById] = useState<Record<string, 'uploading' | 'indexing' | 'done' | 'error'>>(
     {},
   );
   const [assetErrorById, setAssetErrorById] = useState<Record<string, string>>({});
-  const importQueueRef = useRef<ResolvedAsset[]>([]);
+  const importQueueRef = useRef<UploadItem[]>([]);
   const importRunningRef = useRef(false);
   const importSessionRef = useRef<{ total: number; done: number; failed: number } | null>(null);
   const [importProgress, setImportProgress] = useState<{
@@ -397,7 +439,8 @@ export default function App() {
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState('');
   const [chatThinking, setChatThinking] = useState(false);
-  const [chatScopeCategory, setChatScopeCategory] = useState<string>(''); // '' => all screenshots
+  const [chatScopeCategory, setChatScopeCategory] = useState<string>(''); // '' => no category selected
+  const [chatScopeDocId, setChatScopeDocId] = useState<string>('');
   const [chatModel, setChatModel] = useState(DEFAULT_CHAT_MODEL);
   const [paywallOpen, setPaywallOpen] = useState(false);
   const [paywallReason, setPaywallReason] = useState('');
@@ -416,6 +459,21 @@ export default function App() {
   useEffect(() => {
     activeThreadIdRef.current = activeThreadId;
   }, [activeThreadId]);
+
+  const openDoc = useCallback(
+    (doc: ServerDoc) => {
+      const uri = resolveDocUri(apiBase, doc);
+      if (!uri) return;
+      if (isImageDoc(doc)) {
+        setViewerUri(uri);
+        return;
+      }
+      Linking.openURL(uri).catch(() => {
+        Alert.alert('Unable to open document', 'Please try again.');
+      });
+    },
+    [apiBase],
+  );
 
   const closeViewer = useCallback(() => setViewerUri(null), []);
 
@@ -644,6 +702,39 @@ export default function App() {
     void loadScreenshots();
   }, [loadingScreenshots, permission, route, screenshots.length]);
 
+  const pickFiles = async () => {
+    setUiError(null);
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: [
+          'application/pdf',
+          'text/plain',
+          'text/markdown',
+          'application/rtf',
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        ],
+        multiple: true,
+        copyToCacheDirectory: true,
+      });
+      if (result.canceled) return;
+      const nextItems = result.assets.map((asset) => ({
+        id: `file_${randomId()}`,
+        uri: asset.uri,
+        name: asset.name,
+        size: asset.size,
+        mimeType: asset.mimeType ?? null,
+        createdAt: Date.now(),
+      }));
+      setFiles((prev) => {
+        const existingUris = new Set(prev.map((f) => f.uri));
+        const deduped = nextItems.filter((f) => !existingUris.has(f.uri));
+        return [...deduped, ...prev];
+      });
+    } catch (err: any) {
+      setUiError(err?.message ?? 'Failed to pick files');
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -845,11 +936,14 @@ export default function App() {
     });
   };
 
-  const uploadAssetToServer = async (item: ResolvedAsset) => {
+  const uploadItemToServer = async (item: UploadItem) => {
     if (!userId) throw new Error('Missing user id');
-    const uri = await ensureUploadUri(item);
-    const filename = item.filename || `${item.id}.jpg`;
-    const contentType = inferImageContentType(filename);
+    const uri = item.kind === 'asset' ? await ensureUploadUri(item) : item.uri;
+    const filename =
+      item.kind === 'asset'
+        ? item.filename || `${item.id}.jpg`
+        : item.name || `document-${item.id}.pdf`;
+    const contentType = item.kind === 'asset' ? inferImageContentType(filename) : item.mimeType || inferDocContentType(filename);
 
     const form = new FormData();
     form.append('file', {
@@ -917,7 +1011,7 @@ export default function App() {
           });
 
           try {
-            const uploaded = await uploadAssetToServer(item);
+            const uploaded = await uploadItemToServer(item);
             setAssetStageById((prev) => ({ ...prev, [item.id]: 'done' }));
             session.done += 1;
             setDocs((prev) => [uploaded, ...prev]);
@@ -948,7 +1042,7 @@ export default function App() {
     })();
   };
 
-  const enqueueImport = (items: ResolvedAsset[]) => {
+  const enqueueImport = (items: UploadItem[]) => {
     if (!items.length) return;
     if (!importSessionRef.current) {
       importSessionRef.current = { total: 0, done: 0, failed: 0 };
@@ -973,13 +1067,19 @@ export default function App() {
       return;
     }
     setUiError(null);
-    const targets = screenshots.filter((s) => selected.has(s.id));
+    const assetTargets = screenshots.filter((s) => selected.has(s.id)).map((s) => ({ ...s, kind: 'asset' as const }));
+    const fileTargets = files.filter((f) => selected.has(f.id)).map((f) => ({ ...f, kind: 'file' as const }));
+    const targets = [...assetTargets, ...fileTargets];
     enqueueImport(targets);
     setSelected(new Set());
   };
 
   const handleAsk = async () => {
     if (!chatInput.trim() || chatThinking) return;
+    if (!chatScopeDocId && !chatScopeCategory) {
+      Alert.alert('Pick a category', 'Select a category (or open a document to chat about it) before asking.');
+      return;
+    }
     if (!userId) {
       Alert.alert('Just a sec', 'Finishing setup… please try again.');
       return;
@@ -1117,6 +1217,7 @@ export default function App() {
               query: prompt,
               userId,
               category: chatScopeCategory || '',
+              docId: chatScopeDocId || '',
               model: chatModel,
             }),
           );
@@ -1189,7 +1290,7 @@ export default function App() {
 	    } finally {
 	      setChatThinking(false);
 	      if (!assistantText) {
-	        assistantText = 'No response (nothing indexed yet?). Go to Import and index screenshots first.';
+        assistantText = 'No response (nothing indexed yet?). Go to Import and index some files first.';
 	        scheduleFlush();
 	        setAssistantStreaming(false);
 	      }
@@ -1330,7 +1431,13 @@ export default function App() {
               onSend={handleAsk}
               categories={categories}
               scopeCategory={chatScopeCategory}
-              onChangeScopeCategory={setChatScopeCategory}
+              scopeDocActive={!!chatScopeDocId}
+              scopeReady={!!chatScopeDocId || !!chatScopeCategory}
+              onChangeScopeCategory={(next) => {
+                setChatScopeDocId('');
+                setChatScopeCategory(next);
+              }}
+              onClearDocScope={() => setChatScopeDocId('')}
               chatModel={chatModel}
               chatModels={CHAT_MODEL_OPTIONS}
               onChangeChatModel={saveChatModel}
@@ -1338,26 +1445,25 @@ export default function App() {
                 Keyboard.dismiss();
                 setRoute('import');
               }}
-              onOpenSource={(uri) => {
-                if (!uri) return;
-                setViewerUri(uri);
-              }}
+              onOpenSource={openDoc}
             />
           ) : route === 'import' ? (
-	            <ImportScreen
-	              uiError={uiError}
-	              permissionStatus={permission?.status ?? null}
-	              loadingScreenshots={loadingScreenshots}
-	              selectedCount={selected.size}
-	              importProgress={importProgress}
-	              onLoadScreenshots={loadScreenshots}
-	              onIndexSelected={handleSendToAI}
-	              screenshots={screenshots}
-	              selected={selected}
-	              onToggleSelect={toggleSelect}
-	              assetStageById={assetStageById}
-	              assetErrorById={assetErrorById}
-	            />
+            <ImportScreen
+              uiError={uiError}
+              permissionStatus={permission?.status ?? null}
+              loadingScreenshots={loadingScreenshots}
+              selectedCount={selected.size}
+              importProgress={importProgress}
+              onLoadScreenshots={loadScreenshots}
+              onPickFiles={pickFiles}
+              onIndexSelected={handleSendToAI}
+              screenshots={screenshots}
+              files={files}
+              selected={selected}
+              onToggleSelect={toggleSelect}
+              assetStageById={assetStageById}
+              assetErrorById={assetErrorById}
+            />
 	          ) : route === 'categories' ? (
             <CategoriesScreen
               uiError={uiError}
@@ -1409,7 +1515,7 @@ export default function App() {
                   setUiError(err?.message ?? 'Failed to delete photo');
                 }
               }}
-              onView={(uri) => setViewerUri(uri)}
+              onOpenDoc={openDoc}
             />
           ) : (
             <DocumentsScreen
@@ -1441,7 +1547,12 @@ export default function App() {
                   throw err;
                 }
               }}
-              onView={(uri) => setViewerUri(uri)}
+              onOpenDoc={openDoc}
+              onChatDoc={(doc) => {
+                setChatScopeDocId(doc.id);
+                setChatScopeCategory('');
+                setRoute('chat');
+              }}
             />
           )}
         </View>
@@ -2019,13 +2130,16 @@ function ChatScreen(props: {
   chatThinking: boolean;
   onSend: () => void;
   categories: CategorySummary[];
-  scopeCategory: string; // '' => all screenshots
+  scopeCategory: string; // '' => no category selected
+  scopeDocActive: boolean;
+  scopeReady: boolean;
   onChangeScopeCategory: (category: string) => void;
+  onClearDocScope: () => void;
   chatModel: string;
   chatModels: string[];
   onChangeChatModel: (model: string) => void;
   onPressPlus: () => void;
-  onOpenSource: (uri: string) => void;
+  onOpenSource: (doc: ServerDoc) => void;
 }) {
   const insets = useSafeAreaInsets();
   const { width, height: windowHeight } = useWindowDimensions();
@@ -2033,7 +2147,7 @@ function ChatScreen(props: {
   const keyboardAnim = useRef(new Animated.Value(0)).current;
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const [composerHeight, setComposerHeight] = useState(0);
-  const canSend = !!props.chatInput.trim() && !props.chatThinking;
+  const canSend = !!props.chatInput.trim() && !props.chatThinking && props.scopeReady;
   const empty = props.chatHistory.length === 0;
   const [scopeOpen, setScopeOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
@@ -2084,17 +2198,21 @@ function ChatScreen(props: {
           <Pressable style={StyleSheet.absoluteFill} onPress={() => setScopeOpen(false)} />
           <View style={styles.scopeCard}>
             <Text style={styles.scopeTitle}>Chat scope</Text>
-            <Pressable
-              onPress={() => {
-                props.onChangeScopeCategory('');
-                setScopeOpen(false);
-              }}
-              style={({ pressed }) => [styles.scopeRow, pressed && styles.pressed]}
-            >
-              <Text style={styles.scopeRowText}>All screenshots</Text>
-              {!props.scopeCategory ? <Ionicons name="checkmark" size={18} color={COLORS.text} /> : null}
-            </Pressable>
-            <View style={styles.scopeDivider} />
+            {props.scopeDocActive && (
+              <>
+                <Pressable
+                  onPress={() => {
+                    props.onClearDocScope();
+                    setScopeOpen(false);
+                  }}
+                  style={({ pressed }) => [styles.scopeRow, pressed && styles.pressed]}
+                >
+                  <Text style={styles.scopeRowText}>Clear document scope</Text>
+                  <Ionicons name="close" size={18} color={COLORS.text} />
+                </Pressable>
+                <View style={styles.scopeDivider} />
+              </>
+            )}
             <ScrollView style={{ maxHeight: 320 }} showsVerticalScrollIndicator={false}>
               {props.categories
                 .slice()
@@ -2184,17 +2302,19 @@ function ChatScreen(props: {
                       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.sourcesRow}>
                         {item.sources.slice(0, 8).map((doc) => {
                           const uri = resolveDocUri(props.apiBase, doc);
+                          const showImage = !!uri && isImageDoc(doc);
                           return (
                             <Pressable
                               key={doc.id}
-                              onPress={() => uri && props.onOpenSource(uri)}
+                              onPress={() => uri && props.onOpenSource(doc)}
                               style={({ pressed }) => [styles.sourceThumb, pressed && styles.pressed]}
                             >
-                              {uri ? (
+                              {showImage ? (
                                 <Image source={{ uri }} style={styles.sourceThumbImage} />
                               ) : (
                                 <View style={[styles.sourceThumbImage, styles.assetMissing]}>
-                                  <Text style={styles.placeholderText}>No preview</Text>
+                                  <Ionicons name="document-text-outline" size={18} color={COLORS.muted} />
+                                  <Text style={styles.placeholderText}>Document</Text>
                                 </View>
                               )}
                             </Pressable>
@@ -2218,9 +2338,9 @@ function ChatScreen(props: {
             <View style={styles.chatEmptyIcon}>
               <Ionicons name="sparkles" size={18} color={COLORS.accentText} />
             </View>
-            <Text style={styles.chatEmptyTitle}>Chat with your screenshots</Text>
-            <Text style={styles.chatEmptySubtitle}>Ask questions and find what’s inside your screenshots.</Text>
-            <Text style={styles.chatEmptyHint}>Tap + to import screenshots, then index them.</Text>
+            <Text style={styles.chatEmptyTitle}>Chat with your library</Text>
+            <Text style={styles.chatEmptySubtitle}>Ask questions and find what’s inside your screenshots and documents.</Text>
+            <Text style={styles.chatEmptyHint}>Tap + to import files, then index them.</Text>
           </View>
         </Animated.View>
       )}
@@ -2258,7 +2378,7 @@ function ChatScreen(props: {
 
           <View style={styles.composerPill}>
             <TextInput
-              placeholder={props.scopeCategory ? `Ask about ${props.scopeCategory}` : 'Ask anything'}
+              placeholder={props.scopeDocActive ? 'Ask about this document' : props.scopeCategory ? 'Ask about this category' : 'Select a category to chat'}
               placeholderTextColor={COLORS.muted2}
               value={props.chatInput}
               onChangeText={props.onChangeChatInput}
@@ -2296,8 +2416,10 @@ function ImportScreen(props: {
   selectedCount: number;
   importProgress: { running: boolean; current: number; total: number; done: number; failed: number };
   onLoadScreenshots: () => void;
+  onPickFiles: () => void;
   onIndexSelected: () => void;
   screenshots: ResolvedAsset[];
+  files: FileItem[];
   selected: Set<string>;
   onToggleSelect: (id: string) => void;
   assetStageById: Record<string, 'uploading' | 'indexing' | 'done' | 'error'>;
@@ -2312,15 +2434,24 @@ function ImportScreen(props: {
         <View style={styles.pageHeader}>
           <View style={styles.pageHeaderText}>
             <Text style={styles.pageTitle}>Import Library</Text>
-            <Text style={styles.pageSubtitle}>Select screenshots and index them to your server.</Text>
+            <Text style={styles.pageSubtitle}>Select screenshots or documents and index them to your server.</Text>
           </View>
-          <Pressable
-            onPress={props.onLoadScreenshots}
-            style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
-          >
-            <Ionicons name="image-outline" size={16} color={COLORS.text} />
-            <Text style={styles.pillButtonText}>{props.loadingScreenshots ? 'Loading…' : 'Load screenshots'}</Text>
-          </Pressable>
+          <View style={styles.importActions}>
+            <Pressable
+              onPress={props.onLoadScreenshots}
+              style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
+            >
+              <Ionicons name="image-outline" size={16} color={COLORS.text} />
+              <Text style={styles.pillButtonText}>{props.loadingScreenshots ? 'Loading…' : 'Load screenshots'}</Text>
+            </Pressable>
+            <Pressable
+              onPress={props.onPickFiles}
+              style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
+            >
+              <Ionicons name="document-text-outline" size={16} color={COLORS.text} />
+              <Text style={styles.pillButtonText}>Pick files</Text>
+            </Pressable>
+          </View>
         </View>
 
         {props.uiError && <Text style={styles.inlineError}>{props.uiError}</Text>}
@@ -2400,6 +2531,49 @@ function ImportScreen(props: {
               );
             }}
           />
+        )}
+
+        {props.files.length > 0 && (
+          <View style={styles.fileList}>
+            <Text style={styles.sectionTitle}>Files</Text>
+            {props.files.map((file) => {
+              const isSelected = props.selected.has(file.id);
+              const stage = props.assetStageById[file.id];
+              const errorMsg = props.assetErrorById?.[file.id] ?? '';
+              return (
+                <Pressable
+                  key={file.id}
+                  onPress={() => props.onToggleSelect(file.id)}
+                  onLongPress={() => {
+                    if (stage !== 'error') return;
+                    if (!errorMsg) return;
+                    Alert.alert('Import failed', errorMsg);
+                  }}
+                  delayLongPress={220}
+                  style={({ pressed }) => [styles.fileRow, pressed && styles.pressed]}
+                >
+                  <View style={[styles.fileIcon, isSelected && styles.fileIconSelected]}>
+                    {isSelected ? (
+                      <Ionicons name="checkmark" size={16} color={COLORS.accentText} />
+                    ) : (
+                      <Ionicons name="document-text-outline" size={18} color={COLORS.muted} />
+                    )}
+                  </View>
+                  <View style={styles.fileMeta}>
+                    <Text style={styles.fileName} numberOfLines={1}>
+                      {file.name}
+                    </Text>
+                    <Text style={styles.fileDetail} numberOfLines={1}>
+                      {file.mimeType || 'Document'} • {formatFileSize(file.size)}
+                    </Text>
+                  </View>
+                  {stage === 'uploading' && <ActivityIndicator size="small" color={COLORS.muted} />}
+                  {stage === 'done' && <Ionicons name="checkmark-circle" size={18} color={COLORS.text} />}
+                  {stage === 'error' && <Ionicons name="alert-circle" size={18} color={COLORS.danger} />}
+                </Pressable>
+              );
+            })}
+          </View>
         )}
       </ScrollView>
 
@@ -2579,7 +2753,7 @@ function CategoriesScreen(props: {
   onDeleteCategories?: (names: string[], mode: 'unlink' | 'purge' | 'unlink-delete-orphans') => Promise<void> | void;
   onRenameCategory?: (from: string, to: string) => Promise<void> | void;
   onDeleteDoc: (docId: string) => void;
-  onView: (uri: string) => void;
+  onOpenDoc: (doc: ServerDoc) => void;
 }) {
   const { width } = useWindowDimensions();
   const categoryColumns = width >= 1024 ? 3 : width >= 768 ? 2 : 1;
@@ -2714,16 +2888,18 @@ function CategoriesScreen(props: {
     }, [anim, p.index]);
     const scale = anim.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1] });
     const uri = resolveDocUri(props.apiBase, p.doc);
+    const showImage = !!uri && isImageDoc(p.doc);
 
     return (
       <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ scale }] }]}>
         <View style={styles.mcMediaCard}>
-          <Pressable onPress={() => uri && props.onView(uri)} style={styles.assetPressable}>
-            {uri ? (
+          <Pressable onPress={() => uri && props.onOpenDoc(p.doc)} style={styles.assetPressable}>
+            {showImage ? (
               <Image source={{ uri }} style={styles.mcMediaImage} />
             ) : (
               <View style={[styles.mcMediaImage, styles.assetMissing]}>
-                <Text style={styles.placeholderText}>No preview</Text>
+                <Ionicons name="document-text-outline" size={20} color={COLORS.muted} />
+                <Text style={styles.placeholderText}>Document</Text>
               </View>
             )}
             <LinearGradient
@@ -3169,7 +3345,8 @@ function DocumentsScreen(props: {
   onRefresh: () => void;
   onDeleteDoc: (docId: string) => void;
   onDeleteDocs?: (docIds: string[]) => Promise<void> | void;
-  onView: (uri: string) => void;
+  onOpenDoc: (doc: ServerDoc) => void;
+  onChatDoc: (doc: ServerDoc) => void;
 }) {
   const { width } = useWindowDimensions();
   const columns = width >= 1280 ? 5 : width >= 1024 ? 4 : width >= 768 ? 3 : 2;
@@ -3197,7 +3374,8 @@ function DocumentsScreen(props: {
         (d) =>
           d.caption?.toLowerCase().includes(query) ||
           d.categories?.some((c) => c.toLowerCase().includes(query)) ||
-          d.text?.toLowerCase().includes(query),
+          d.text?.toLowerCase().includes(query) ||
+          d.originalName?.toLowerCase().includes(query),
       );
     }
     return result;
@@ -3250,7 +3428,7 @@ function DocumentsScreen(props: {
       }
       exitSelectionMode();
     } catch (err: any) {
-      Alert.alert('Delete failed', err?.message ?? 'Failed to delete selected screenshots.');
+      Alert.alert('Delete failed', err?.message ?? 'Failed to delete selected items.');
     } finally {
       setDeletingSelected(false);
     }
@@ -3259,8 +3437,8 @@ function DocumentsScreen(props: {
   const confirmDeleteSelected = () => {
     if (selectedDocs.size === 0) return;
     Alert.alert(
-      `Delete ${selectedDocs.size} screenshot${selectedDocs.size === 1 ? '' : 's'}?`,
-      'This will permanently remove the screenshots and their files from the server.',
+      `Delete ${selectedDocs.size} item${selectedDocs.size === 1 ? '' : 's'}?`,
+      'This will permanently remove the files from the server.',
       [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Delete', style: 'destructive', onPress: runDeleteSelected },
@@ -3271,8 +3449,8 @@ function DocumentsScreen(props: {
   const confirmDeleteAllOrphans = () => {
     if (orphanCount === 0) return;
     Alert.alert(
-      `Delete ${orphanCount} orphan screenshot${orphanCount === 1 ? '' : 's'}?`,
-      'These screenshots have no categories and are not searchable. This will permanently delete them.',
+      `Delete ${orphanCount} orphan item${orphanCount === 1 ? '' : 's'}?`,
+      'These items have no categories and are not searchable. This will permanently delete them.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -3284,7 +3462,7 @@ function DocumentsScreen(props: {
               try {
                 await props.onDeleteDocs(ids);
               } catch (err: any) {
-                Alert.alert('Delete failed', err?.message ?? 'Failed to delete orphan screenshots.');
+                Alert.alert('Delete failed', err?.message ?? 'Failed to delete orphan items.');
               }
             }
           },
@@ -3309,22 +3487,24 @@ function DocumentsScreen(props: {
     }, [anim, p.index]);
     const scale = anim.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1] });
     const uri = resolveDocUri(props.apiBase, p.doc);
+    const showImage = !!uri && isImageDoc(p.doc);
     const isSelected = selectedDocs.has(p.doc.id);
     const isOrphan = !p.doc.categories?.length;
 
     return (
       <Animated.View style={[styles.mcGridItem, { opacity: anim, transform: [{ scale }] }]}>
         <Pressable
-          onPress={() => (selectionMode ? toggleDocSelected(p.doc.id) : uri && props.onView(uri))}
+          onPress={() => (selectionMode ? toggleDocSelected(p.doc.id) : uri && props.onOpenDoc(p.doc))}
           onLongPress={() => toggleDocSelected(p.doc.id)}
           style={[styles.mcMediaCard, isSelected && styles.docCardSelected]}
         >
           <View style={styles.assetPressable}>
-            {uri ? (
+            {showImage ? (
               <Image source={{ uri }} style={styles.mcMediaImage} />
             ) : (
               <View style={[styles.mcMediaImage, styles.assetMissing]}>
-                <Text style={styles.placeholderText}>No preview</Text>
+                <Ionicons name="document-text-outline" size={22} color={COLORS.muted} />
+                <Text style={styles.placeholderText}>Document</Text>
               </View>
             )}
             <LinearGradient
@@ -3351,7 +3531,7 @@ function DocumentsScreen(props: {
             <Pressable
               hitSlop={10}
               onPress={() => {
-                Alert.alert('Delete screenshot?', 'This removes it from the server.', [
+                Alert.alert('Delete item?', 'This removes it from the server.', [
                   { text: 'Cancel', style: 'cancel' },
                   { text: 'Delete', style: 'destructive', onPress: () => props.onDeleteDoc(p.doc.id) },
                 ]);
@@ -3362,12 +3542,24 @@ function DocumentsScreen(props: {
             </Pressable>
           )}
 
+          {!selectionMode && (
+            <Pressable
+              hitSlop={10}
+              onPress={() => props.onChatDoc(p.doc)}
+              style={({ pressed }) => [styles.docChatButton, pressed && styles.pressed]}
+            >
+              <Ionicons name="chatbubble-ellipses-outline" size={16} color="#fff" />
+            </Pressable>
+          )}
+
           <View style={styles.mcMediaFooter} pointerEvents="none">
             <Text style={styles.mcMediaCaption} numberOfLines={1}>
               {p.doc.caption || 'Screenshot'}
             </Text>
             <Text style={styles.mcMediaDate} numberOfLines={1}>
-              {p.doc.categories?.length ? p.doc.categories.join(', ') : 'No category'}
+              {p.doc.categories?.length
+                ? p.doc.categories.join(', ')
+                : p.doc.originalName || 'No category'}
             </Text>
           </View>
         </Pressable>
@@ -3402,8 +3594,8 @@ function DocumentsScreen(props: {
             <View style={styles.mcDashedIcon}>
               <Ionicons name="documents-outline" size={28} color={COLORS.muted} />
             </View>
-            <Text style={styles.mcEmptyTitle}>No screenshots yet</Text>
-            <Text style={styles.mcEmptySubtitle}>Import and index some screenshots first.</Text>
+              <Text style={styles.mcEmptyTitle}>No items yet</Text>
+              <Text style={styles.mcEmptySubtitle}>Import and index some files first.</Text>
           </Pressable>
         </View>
       </View>
@@ -3417,7 +3609,7 @@ function DocumentsScreen(props: {
           <Ionicons name="search-outline" size={18} color={COLORS.muted} style={styles.mcSearchIcon} />
           <TextInput
             style={styles.mcSearchInput}
-            placeholder="Search screenshots..."
+            placeholder="Search documents..."
             placeholderTextColor={COLORS.muted}
             value={searchQuery}
             onChangeText={setSearchQuery}
@@ -3433,7 +3625,7 @@ function DocumentsScreen(props: {
         <View style={styles.docsToolbar}>
           <View style={styles.docsStats}>
             <Text style={styles.docsStatsText}>
-              {filteredDocs.length} screenshot{filteredDocs.length !== 1 ? 's' : ''}
+              {filteredDocs.length} item{filteredDocs.length !== 1 ? 's' : ''}
               {orphanCount > 0 && !filterOrphans && (
                 <Text style={styles.orphanCountText}> ({orphanCount} orphan{orphanCount !== 1 ? 's' : ''})</Text>
               )}
@@ -3492,7 +3684,7 @@ function DocumentsScreen(props: {
           <View style={styles.orphanWarning}>
             <Ionicons name="warning" size={18} color="#f59e0b" />
             <Text style={styles.orphanWarningText}>
-              These {orphanCount} screenshot{orphanCount !== 1 ? 's have' : ' has'} no categories and won't appear in search results.
+              These {orphanCount} item{orphanCount !== 1 ? 's have' : ' has'} no categories and won't appear in search results.
             </Text>
             <Pressable onPress={confirmDeleteAllOrphans} style={({ pressed }) => [styles.orphanDeleteBtn, pressed && styles.pressed]}>
               <Text style={styles.orphanDeleteBtnText}>Delete All</Text>
@@ -4368,7 +4560,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     paddingBottom: 8,
     gap: 8,
-    flexWrap: 'wrap',
   },
   scopePill: {
     flexDirection: 'row',
@@ -4511,6 +4702,59 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontFamily: FONT_SANS_SEMIBOLD,
     fontSize: 13,
+  },
+  importActions: {
+    alignItems: 'flex-end',
+    gap: 8,
+  },
+  sectionTitle: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+  },
+  fileList: {
+    gap: 10,
+  },
+  fileRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+  },
+  fileIcon: {
+    width: 30,
+    height: 30,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  fileIconSelected: {
+    backgroundColor: COLORS.accent,
+    borderColor: COLORS.accent,
+  },
+  fileMeta: {
+    flex: 1,
+    gap: 2,
+  },
+  fileName: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  fileDetail: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
   },
   callout: {
     borderRadius: 14,
@@ -5242,6 +5486,19 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 12,
     left: 12,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(15, 23, 42, 0.48)',
+    borderColor: 'rgba(255,255,255,0.14)',
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  docChatButton: {
+    position: 'absolute',
+    top: 12,
+    right: 12,
     width: 32,
     height: 32,
     borderRadius: 16,
