@@ -3495,7 +3495,7 @@ function OnboardingScreen(props: { onDone: () => void }) {
           ))}
         </View>
         <Pressable onPress={props.onDone} style={({ pressed }) => [styles.onboardingButton, pressed && styles.pressed]}>
-          <Text style={styles.onboardingButtonText}>Continue to Sign In</Text>
+          <Text style={styles.onboardingButtonText}>Continue</Text>
         </Pressable>
       </ScrollView>
     </View>
