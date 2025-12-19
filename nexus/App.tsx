@@ -1107,7 +1107,7 @@ export default function App() {
     refreshDocs();
   };
 
-  const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : route === 'categories' ? 'Categories' : 'Documents';
+  const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : route === 'categories' ? 'Categories' : 'Screenshots';
 
   useEffect(() => {
     if (!fontsLoaded) return;
@@ -1462,7 +1462,7 @@ function Sidebar(props: {
     { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' },
     { key: 'import', label: 'Import', icon: 'image-outline' },
     { key: 'categories', label: 'Categories', icon: 'folder-open-outline' },
-    { key: 'documents', label: 'Documents', icon: 'documents-outline' },
+    { key: 'documents', label: 'Screenshots', icon: 'images-outline' },
   ];
 
   return (
@@ -1622,7 +1622,7 @@ function HamburgerMenu(props: {
                     { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' as const },
                     { key: 'import', label: 'Import', icon: 'image-outline' as const },
                     { key: 'categories', label: 'Categories', icon: 'folder-open-outline' as const },
-                    { key: 'documents', label: 'Documents', icon: 'documents-outline' as const },
+                    { key: 'documents', label: 'Screenshots', icon: 'images-outline' as const },
                   ] as const).map((item) => {
                     const isActive = props.route === item.key;
                     return (
@@ -2914,7 +2914,7 @@ function DocumentsScreen(props: {
       }
       exitSelectionMode();
     } catch (err: any) {
-      Alert.alert('Delete failed', err?.message ?? 'Failed to delete selected documents.');
+      Alert.alert('Delete failed', err?.message ?? 'Failed to delete selected screenshots.');
     } finally {
       setDeletingSelected(false);
     }
@@ -2923,8 +2923,8 @@ function DocumentsScreen(props: {
   const confirmDeleteSelected = () => {
     if (selectedDocs.size === 0) return;
     Alert.alert(
-      `Delete ${selectedDocs.size} document${selectedDocs.size === 1 ? '' : 's'}?`,
-      'This will permanently remove the documents and their files from the server.',
+      `Delete ${selectedDocs.size} screenshot${selectedDocs.size === 1 ? '' : 's'}?`,
+      'This will permanently remove the screenshots and their files from the server.',
       [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Delete', style: 'destructive', onPress: runDeleteSelected },
@@ -2935,8 +2935,8 @@ function DocumentsScreen(props: {
   const confirmDeleteAllOrphans = () => {
     if (orphanCount === 0) return;
     Alert.alert(
-      `Delete ${orphanCount} orphan document${orphanCount === 1 ? '' : 's'}?`,
-      'These documents have no categories and are not searchable. This will permanently delete them.',
+      `Delete ${orphanCount} orphan screenshot${orphanCount === 1 ? '' : 's'}?`,
+      'These screenshots have no categories and are not searchable. This will permanently delete them.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -2948,7 +2948,7 @@ function DocumentsScreen(props: {
               try {
                 await props.onDeleteDocs(ids);
               } catch (err: any) {
-                Alert.alert('Delete failed', err?.message ?? 'Failed to delete orphan documents.');
+                Alert.alert('Delete failed', err?.message ?? 'Failed to delete orphan screenshots.');
               }
             }
           },
@@ -2959,7 +2959,10 @@ function DocumentsScreen(props: {
 
   const DocCard = (p: { doc: ServerDoc; index: number }) => {
     const anim = useRef(new Animated.Value(0)).current;
+    const hasAnimated = useRef(false);
     useEffect(() => {
+      if (hasAnimated.current) return;
+      hasAnimated.current = true;
       Animated.timing(anim, {
         toValue: 1,
         duration: 360,
@@ -3008,18 +3011,20 @@ function DocumentsScreen(props: {
             </View>
           )}
 
-          <Pressable
-            hitSlop={10}
-            onPress={() => {
-              Alert.alert('Delete document?', 'This removes it from the server.', [
-                { text: 'Cancel', style: 'cancel' },
-                { text: 'Delete', style: 'destructive', onPress: () => props.onDeleteDoc(p.doc.id) },
-              ]);
-            }}
-            style={({ pressed }) => [styles.mcMediaDelete, pressed && styles.pressed]}
-          >
-            <Ionicons name="trash-outline" size={16} color="#fff" />
-          </Pressable>
+          {!selectionMode && (
+            <Pressable
+              hitSlop={10}
+              onPress={() => {
+                Alert.alert('Delete screenshot?', 'This removes it from the server.', [
+                  { text: 'Cancel', style: 'cancel' },
+                  { text: 'Delete', style: 'destructive', onPress: () => props.onDeleteDoc(p.doc.id) },
+                ]);
+              }}
+              style={({ pressed }) => [styles.mcMediaDelete, pressed && styles.pressed]}
+            >
+              <Ionicons name="trash-outline" size={16} color="#fff" />
+            </Pressable>
+          )}
 
           <View style={styles.mcMediaFooter} pointerEvents="none">
             <Text style={styles.mcMediaCaption} numberOfLines={1}>
@@ -3060,7 +3065,7 @@ function DocumentsScreen(props: {
           <View style={styles.mcDashedIcon}>
             <Ionicons name="documents-outline" size={28} color={COLORS.muted} />
           </View>
-          <Text style={styles.mcEmptyTitle}>No documents yet</Text>
+          <Text style={styles.mcEmptyTitle}>No screenshots yet</Text>
           <Text style={styles.mcEmptySubtitle}>Import and index some screenshots first.</Text>
         </Pressable>
       </View>
@@ -3074,7 +3079,7 @@ function DocumentsScreen(props: {
           <Ionicons name="search-outline" size={18} color={COLORS.muted} style={styles.mcSearchIcon} />
           <TextInput
             style={styles.mcSearchInput}
-            placeholder="Search documents..."
+            placeholder="Search screenshots..."
             placeholderTextColor={COLORS.muted}
             value={searchQuery}
             onChangeText={setSearchQuery}
@@ -3090,7 +3095,7 @@ function DocumentsScreen(props: {
         <View style={styles.docsToolbar}>
           <View style={styles.docsStats}>
             <Text style={styles.docsStatsText}>
-              {filteredDocs.length} document{filteredDocs.length !== 1 ? 's' : ''}
+              {filteredDocs.length} screenshot{filteredDocs.length !== 1 ? 's' : ''}
               {orphanCount > 0 && !filterOrphans && (
                 <Text style={styles.orphanCountText}> ({orphanCount} orphan{orphanCount !== 1 ? 's' : ''})</Text>
               )}
@@ -3149,7 +3154,7 @@ function DocumentsScreen(props: {
           <View style={styles.orphanWarning}>
             <Ionicons name="warning" size={18} color="#f59e0b" />
             <Text style={styles.orphanWarningText}>
-              These {orphanCount} document{orphanCount !== 1 ? 's have' : ' has'} no categories and won't appear in search results.
+              These {orphanCount} screenshot{orphanCount !== 1 ? 's have' : ' has'} no categories and won't appear in search results.
             </Text>
             <Pressable onPress={confirmDeleteAllOrphans} style={({ pressed }) => [styles.orphanDeleteBtn, pressed && styles.pressed]}>
               <Text style={styles.orphanDeleteBtnText}>Delete All</Text>
