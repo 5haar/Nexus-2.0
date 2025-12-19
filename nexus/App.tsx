@@ -98,14 +98,34 @@ const inferDevServerHost = () => {
   return match?.[1] ?? null;
 };
 
+const isLocalHost = (host: string) =>
+  host === 'localhost' || host === '127.0.0.1' || host.endsWith('.local');
+
+const normalizeApiBase = (raw: string) => {
+  let trimmed = raw.trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  if (!/^https?:\/\//i.test(trimmed)) {
+    trimmed = `${__DEV__ ? 'http' : 'https'}://${trimmed}`;
+  }
+  try {
+    const url = new URL(trimmed);
+    if (!__DEV__ && url.protocol === 'http:' && !isLocalHost(url.hostname)) {
+      url.protocol = 'https:';
+    }
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return '';
+  }
+};
+
 const resolveApiBase = (configured: string) => {
   const trimmed = configured.trim();
-  if (!trimmed) return 'http://localhost:4000';
+  if (!trimmed) return normalizeApiBase('http://localhost:4000');
   if (trimmed.includes('localhost') || trimmed.includes('127.0.0.1')) {
     const host = inferDevServerHost();
-    if (host) return `http://${host}:4000`;
+    if (host) return normalizeApiBase(`http://${host}:4000`);
   }
-  return trimmed;
+  return normalizeApiBase(trimmed) || trimmed;
 };
 
 const DEFAULT_API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
@@ -124,6 +144,36 @@ const CHAT_MODEL_OPTIONS = (() => {
   const fallback = parsed.length ? parsed : [DEFAULT_CHAT_MODEL, 'gpt-4.1', 'gpt-4o-mini'];
   return Array.from(new Set(fallback));
 })();
+const FEATURE_FLAGS = {
+  paywall: process.env.EXPO_PUBLIC_ENABLE_PAYWALL === '1',
+  auth: process.env.EXPO_PUBLIC_ENABLE_AUTH === '1',
+} as const;
+const PAYWALL_PLANS = [
+  {
+    id: 'starter',
+    name: 'Starter',
+    price: '$5/mo',
+    uploads: 100,
+    messagesPerDay: 100,
+    highlight: false,
+  },
+  {
+    id: 'pro',
+    name: 'Pro',
+    price: '$10/mo',
+    uploads: 500,
+    messagesPerDay: 1000,
+    highlight: true,
+  },
+  {
+    id: 'max',
+    name: 'Max',
+    price: '$20/mo',
+    uploads: 1000,
+    messagesPerDay: null,
+    highlight: false,
+  },
+] as const;
 
 const COLORS = {
   bg: '#ffffff',
@@ -349,6 +399,8 @@ export default function App() {
   const [chatThinking, setChatThinking] = useState(false);
   const [chatScopeCategory, setChatScopeCategory] = useState<string>(''); // '' => all screenshots
   const [chatModel, setChatModel] = useState(DEFAULT_CHAT_MODEL);
+  const [paywallOpen, setPaywallOpen] = useState(false);
+  const [paywallReason, setPaywallReason] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
   const threadsRef = useRef<ChatThread[]>([]);
   const activeThreadIdRef = useRef('');
@@ -637,8 +689,11 @@ export default function App() {
   }, [apiModalOpen]);
 
   const saveApiBase = async () => {
-    const next = apiDraft.trim().replace(/\/+$/, '');
-    if (!next) return;
+    const next = normalizeApiBase(apiDraft);
+    if (!next) {
+      Alert.alert('Invalid URL', 'Please enter a valid API base URL.');
+      return;
+    }
     setApiBase(next);
     await AsyncStorage.setItem(API_BASE_STORAGE_KEY, next);
     setApiModalOpen(false);
@@ -654,6 +709,29 @@ export default function App() {
       // ignore
     }
   };
+
+  const formatPaywallReason = (payload: any) => {
+    const scope = String(payload?.scope ?? '');
+    const limit = Number(payload?.limit ?? 0);
+    const used = Number(payload?.used ?? 0);
+    if (scope === 'messages' && limit > 0) {
+      return `Daily message limit reached (${used}/${limit}).`;
+    }
+    if (scope === 'uploads' && limit > 0) {
+      return `Upload limit reached (${used}/${limit}).`;
+    }
+    return 'Upgrade to keep going.';
+  };
+
+  const openPaywall = useCallback(
+    (payload?: any) => {
+      if (!FEATURE_FLAGS.paywall) return;
+      const reason = payload ? formatPaywallReason(payload) : '';
+      setPaywallReason(reason);
+      setPaywallOpen(true);
+    },
+    [],
+  );
 
   const refreshDocs = async () => {
     try {
@@ -800,6 +878,9 @@ export default function App() {
       const detail = await res.text();
       try {
         const parsed = JSON.parse(detail);
+        if (parsed?.code === 'PAYWALL_REQUIRED') {
+          openPaywall(parsed);
+        }
         const msg = String(parsed?.error ?? parsed?.message ?? '').trim();
         if (msg) throw new Error(msg);
       } catch {
@@ -1079,6 +1160,9 @@ export default function App() {
               }
             });
           } else if (parsed.type === 'error') {
+            if (parsed.code === 'PAYWALL_REQUIRED') {
+              openPaywall(parsed);
+            }
             finishOnce(() => {
               setAssistantStreaming(false);
               try {
@@ -1194,19 +1278,39 @@ export default function App() {
           onClose={() => void dismissTutorial()}
           onGoToImport={() => void goToImportFromTutorial()}
         />
+        {FEATURE_FLAGS.paywall && (
+          <PaywallModal
+            visible={paywallOpen}
+            reason={paywallReason}
+            plans={PAYWALL_PLANS}
+            onClose={() => setPaywallOpen(false)}
+            onSelectPlan={(planId) => {
+              Alert.alert('Coming soon', `Purchases are not enabled yet. Plan selected: ${planId}.`);
+            }}
+            onRestore={() => {
+              Alert.alert('Restore purchases', 'Restore purchases will be available after Apple account reinstatement.');
+            }}
+          />
+        )}
 
       <View style={[styles.shell, !isWide && styles.shellMobile]}>
-	        {isWide ? (
-	          <Sidebar
-	            apiBase={apiBase}
-	            route={route}
-	            onNavigate={(next) => {
-	              setRoute(next);
-	              setMenuOpen(false);
-	            }}
-	            onPressApi={openApiModal}
-	          />
-	        ) : (
+          {isWide ? (
+            <Sidebar
+              apiBase={apiBase}
+              route={route}
+              onNavigate={(next) => {
+                setRoute(next);
+                setMenuOpen(false);
+              }}
+              onPressApi={openApiModal}
+              showPaywall={FEATURE_FLAGS.paywall}
+              onPressPaywall={() => openPaywall()}
+              showAuth={FEATURE_FLAGS.auth}
+              onPressAuth={() => {
+                Alert.alert('Sign in', 'Apple and Google sign-in will be enabled once the Apple Developer account is restored.');
+              }}
+            />
+          ) : (
 	          <AppHeader
 	            title={headerTitle}
 	            onOpenMenu={() => setMenuOpen(true)}
@@ -1368,15 +1472,27 @@ export default function App() {
 	          onDeleteThread={async (threadId) => {
 	            await deleteThreadById(threadId);
 	          }}
-	          onRenameThread={async (threadId, nextTitle) => {
-	            await renameThreadById(threadId, nextTitle);
-	          }}
-	          onPressApi={() => {
-	            setMenuOpen(false);
-	            requestAnimationFrame(openApiModal);
-	          }}
-	        />
-	      )}
+            onRenameThread={async (threadId, nextTitle) => {
+              await renameThreadById(threadId, nextTitle);
+            }}
+            onPressApi={() => {
+              setMenuOpen(false);
+              requestAnimationFrame(openApiModal);
+            }}
+            showPaywall={FEATURE_FLAGS.paywall}
+            onPressPaywall={() => {
+              setMenuOpen(false);
+              requestAnimationFrame(() => openPaywall());
+            }}
+            showAuth={FEATURE_FLAGS.auth}
+            onPressAuth={() => {
+              setMenuOpen(false);
+              requestAnimationFrame(() =>
+                Alert.alert('Sign in', 'Apple and Google sign-in will be enabled once the Apple Developer account is restored.'),
+              );
+            }}
+          />
+        )}
 
 	      <Modal visible={!!viewerUri} transparent animationType="fade" onRequestClose={closeViewer}>
 	        <View style={styles.viewerBackdrop}>
@@ -1507,6 +1623,10 @@ function Sidebar(props: {
   route: RouteKey;
   onNavigate: (route: RouteKey) => void;
   onPressApi?: () => void;
+  showPaywall?: boolean;
+  onPressPaywall?: () => void;
+  showAuth?: boolean;
+  onPressAuth?: () => void;
 }) {
   const items: { key: RouteKey; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
     { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' },
@@ -1549,6 +1669,29 @@ function Sidebar(props: {
       </View>
 
       <View style={styles.sidebarFooter}>
+        {(props.showPaywall || props.showAuth) && (
+          <View style={styles.sidebarAccount}>
+            <Text style={styles.sidebarFooterLabel}>Account</Text>
+            <View style={styles.sidebarAccountActions}>
+              {props.showAuth && (
+                <Pressable
+                  onPress={props.onPressAuth}
+                  style={({ pressed }) => [styles.sidebarAccountButton, pressed && styles.pressed]}
+                >
+                  <Text style={styles.sidebarAccountText}>Sign in</Text>
+                </Pressable>
+              )}
+              {props.showPaywall && (
+                <Pressable
+                  onPress={props.onPressPaywall}
+                  style={({ pressed }) => [styles.sidebarAccountButtonPrimary, pressed && styles.pressed]}
+                >
+                  <Text style={styles.sidebarAccountTextPrimary}>Upgrade</Text>
+                </Pressable>
+              )}
+            </View>
+          </View>
+        )}
         <Text style={styles.sidebarFooterLabel}>API</Text>
         <Pressable onPress={props.onPressApi} disabled={!props.onPressApi} style={({ pressed }) => pressed && styles.pressed}>
           <Text style={styles.sidebarFooterValue} numberOfLines={2}>
@@ -1586,6 +1729,10 @@ function HamburgerMenu(props: {
   onDeleteThread?: (threadId: string) => void | Promise<void>;
   onRenameThread?: (threadId: string, nextTitle: string) => void | Promise<void>;
   onPressApi?: () => void;
+  showPaywall?: boolean;
+  onPressPaywall?: () => void;
+  showAuth?: boolean;
+  onPressAuth?: () => void;
 }) {
   const [scrollViewportHeight, setScrollViewportHeight] = useState(0);
   const [scrollContentHeight, setScrollContentHeight] = useState(0);
@@ -1740,6 +1887,29 @@ function HamburgerMenu(props: {
             </View>
 
             <View style={styles.menuFooter}>
+              {(props.showPaywall || props.showAuth) && (
+                <View style={styles.menuAccount}>
+                  <Text style={styles.menuFooterLabel}>Account</Text>
+                  <View style={styles.menuAccountActions}>
+                    {props.showAuth && (
+                      <Pressable
+                        onPress={props.onPressAuth}
+                        style={({ pressed }) => [styles.menuAccountButton, pressed && styles.pressed]}
+                      >
+                        <Text style={styles.menuAccountText}>Sign in</Text>
+                      </Pressable>
+                    )}
+                    {props.showPaywall && (
+                      <Pressable
+                        onPress={props.onPressPaywall}
+                        style={({ pressed }) => [styles.menuAccountButtonPrimary, pressed && styles.pressed]}
+                      >
+                        <Text style={styles.menuAccountTextPrimary}>Upgrade</Text>
+                      </Pressable>
+                    )}
+                  </View>
+                </View>
+              )}
               <Text style={styles.menuFooterLabel}>API</Text>
               <Pressable
                 onPress={props.onPressApi}
@@ -2918,6 +3088,79 @@ function TutorialModal(props: { visible: boolean; onClose: () => void; onGoToImp
   );
 }
 
+function PaywallModal(props: {
+  visible: boolean;
+  reason: string;
+  plans: typeof PAYWALL_PLANS;
+  onClose: () => void;
+  onSelectPlan: (planId: string) => void;
+  onRestore: () => void;
+}) {
+  const renderPlanMeta = (plan: typeof PAYWALL_PLANS[number]) => {
+    const messages = plan.messagesPerDay == null ? 'Unlimited messages/day' : `${plan.messagesPerDay} messages/day`;
+    return `${plan.uploads} total uploads • ${messages}`;
+  };
+  return (
+    <Modal visible={props.visible} transparent animationType="fade" onRequestClose={props.onClose}>
+      <View style={styles.paywallBackdrop}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={props.onClose} />
+        <View style={styles.paywallCard}>
+          <ScrollView showsVerticalScrollIndicator={false}>
+            <View style={styles.paywallHeader}>
+              <Text style={styles.paywallTitle}>Upgrade to Nexus</Text>
+              <Text style={styles.paywallSubtitle}>Unlock more uploads and higher message limits.</Text>
+            </View>
+            {!!props.reason && (
+              <View style={styles.paywallReason}>
+                <Ionicons name="lock-closed-outline" size={14} color={COLORS.muted} />
+                <Text style={styles.paywallReasonText}>{props.reason}</Text>
+              </View>
+            )}
+            <View style={styles.paywallFree}>
+              <Text style={styles.paywallFreeTitle}>Free tier</Text>
+              <Text style={styles.paywallFreeText}>5 messages/day • 5 total uploads</Text>
+            </View>
+            <View style={styles.paywallPlans}>
+              {props.plans.map((plan) => (
+                <Pressable
+                  key={plan.id}
+                  onPress={() => props.onSelectPlan(plan.id)}
+                  style={({ pressed }) => [
+                    styles.paywallPlan,
+                    plan.highlight && styles.paywallPlanHighlight,
+                    pressed && styles.pressed,
+                  ]}
+                >
+                  <View style={styles.paywallPlanHeader}>
+                    <View>
+                      <Text style={styles.paywallPlanName}>{plan.name}</Text>
+                      <Text style={styles.paywallPlanPrice}>{plan.price}</Text>
+                    </View>
+                    {plan.highlight && (
+                      <View style={styles.paywallPlanBadge}>
+                        <Text style={styles.paywallPlanBadgeText}>Popular</Text>
+                      </View>
+                    )}
+                  </View>
+                  <Text style={styles.paywallPlanMeta}>{renderPlanMeta(plan)}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <View style={styles.paywallFooter}>
+              <Pressable onPress={props.onRestore} style={({ pressed }) => [styles.paywallLink, pressed && styles.pressed]}>
+                <Text style={styles.paywallLinkText}>Restore purchases</Text>
+              </Pressable>
+              <Pressable onPress={props.onClose} style={({ pressed }) => [styles.paywallButton, pressed && styles.pressed]}>
+                <Text style={styles.paywallButtonText}>Not now</Text>
+              </Pressable>
+            </View>
+          </ScrollView>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function DocumentsScreen(props: {
   uiError: string | null;
   apiBase: string;
@@ -3418,6 +3661,146 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
     paddingTop: 6,
   },
+  paywallBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.42)',
+    padding: 18,
+    justifyContent: 'center',
+  },
+  paywallCard: {
+    backgroundColor: COLORS.surface,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    padding: 16,
+    maxHeight: '90%',
+  },
+  paywallHeader: {
+    gap: 6,
+    paddingBottom: 12,
+  },
+  paywallTitle: {
+    color: COLORS.text,
+    fontSize: 20,
+    fontFamily: FONT_HEADING_BOLD,
+  },
+  paywallSubtitle: {
+    color: COLORS.muted,
+    fontSize: 13,
+    fontFamily: FONT_SANS,
+  },
+  paywallReason: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+    marginBottom: 10,
+  },
+  paywallReasonText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+  },
+  paywallFree: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+    marginBottom: 14,
+  },
+  paywallFreeTitle: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  paywallFreeText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 4,
+    fontFamily: FONT_SANS,
+  },
+  paywallPlans: {
+    gap: 10,
+  },
+  paywallPlan: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    padding: 14,
+    gap: 6,
+  },
+  paywallPlanHighlight: {
+    borderColor: COLORS.text,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  paywallPlanHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  paywallPlanName: {
+    color: COLORS.text,
+    fontSize: 15,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  paywallPlanPrice: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS,
+  },
+  paywallPlanBadge: {
+    backgroundColor: COLORS.accent,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 999,
+  },
+  paywallPlanBadgeText: {
+    color: COLORS.accentText,
+    fontSize: 11,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  paywallPlanMeta: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+  },
+  paywallFooter: {
+    marginTop: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  paywallLink: {
+    paddingVertical: 6,
+  },
+  paywallLinkText: {
+    color: COLORS.link,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  paywallButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  paywallButtonText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
   glowLayer: {
     ...StyleSheet.absoluteFillObject,
     overflow: 'hidden',
@@ -3740,6 +4123,41 @@ const styles = StyleSheet.create({
     borderTopWidth: StyleSheet.hairlineWidth,
     paddingTop: 12,
     gap: 4,
+  },
+  menuAccount: {
+    paddingBottom: 12,
+    gap: 8,
+  },
+  menuAccountActions: {
+    flexDirection: 'row',
+    gap: 8,
+    flexWrap: 'wrap',
+  },
+  menuAccountButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  menuAccountButtonPrimary: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.accent,
+  },
+  menuAccountText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  menuAccountTextPrimary: {
+    color: COLORS.accentText,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
   },
   menuFooterButton: {
     flexDirection: 'row',
@@ -4969,6 +5387,41 @@ const styles = StyleSheet.create({
     borderTopWidth: StyleSheet.hairlineWidth,
     paddingTop: 12,
     gap: 4,
+  },
+  sidebarAccount: {
+    paddingBottom: 12,
+    gap: 8,
+  },
+  sidebarAccountActions: {
+    flexDirection: 'row',
+    gap: 8,
+    flexWrap: 'wrap',
+  },
+  sidebarAccountButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  sidebarAccountButtonPrimary: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.accent,
+  },
+  sidebarAccountText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  sidebarAccountTextPrimary: {
+    color: COLORS.accentText,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
   },
   sidebarFooterLabel: {
     color: COLORS.muted,

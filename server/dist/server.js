@@ -50,6 +50,13 @@ const RAG_LEXICAL_WEIGHT = Number(process.env.RAG_LEXICAL_WEIGHT || 0.08);
 const RAG_MIN_HYBRID_SCORE = Number(process.env.RAG_MIN_HYBRID_SCORE || 0.19);
 const RAG_DOC_TEXT_MAX_CHARS = Number(process.env.RAG_DOC_TEXT_MAX_CHARS || 420);
 const RAG_DOC_CAPTION_MAX_CHARS = Number(process.env.RAG_DOC_CAPTION_MAX_CHARS || 120);
+const PAYWALL_ENFORCED = process.env.PAYWALL_ENFORCED !== '0';
+const PLAN_LIMITS = {
+    free: { messagesPerDay: 5, uploadsTotal: 5 },
+    starter: { messagesPerDay: 100, uploadsTotal: 100 },
+    pro: { messagesPerDay: 1000, uploadsTotal: 500 },
+    max: { messagesPerDay: null, uploadsTotal: 1000 },
+};
 if (!OPENAI_API_KEY) {
     console.warn('OPENAI_API_KEY is not set. Vision and search will fail.');
 }
@@ -118,8 +125,9 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use('/uploads', express.static(uploadsDir));
 const readDB = () => {
-    if (!fs.existsSync(dbPath))
-        return { docs: [] };
+    if (!fs.existsSync(dbPath)) {
+        return { docs: [], users: [], entitlements: [], usageDaily: [], usageTotals: [] };
+    }
     try {
         const raw = fs.readFileSync(dbPath, 'utf-8');
         const parsed = JSON.parse(raw);
@@ -127,11 +135,15 @@ const readDB = () => {
             ...doc,
             userId: typeof doc?.userId === 'string' && doc.userId.trim() ? doc.userId.trim() : 'public',
         }));
+        parsed.users = Array.isArray(parsed.users) ? parsed.users : [];
+        parsed.entitlements = Array.isArray(parsed.entitlements) ? parsed.entitlements : [];
+        parsed.usageDaily = Array.isArray(parsed.usageDaily) ? parsed.usageDaily : [];
+        parsed.usageTotals = Array.isArray(parsed.usageTotals) ? parsed.usageTotals : [];
         return parsed;
     }
     catch (err) {
         console.warn('Failed to read db file', err);
-        return { docs: [] };
+        return { docs: [], users: [], entitlements: [], usageDaily: [], usageTotals: [] };
     }
 };
 const writeDB = (data) => {
@@ -143,8 +155,27 @@ const ensureMysqlSchema = async () => {
         return;
     await mysqlPool.execute(`CREATE TABLE IF NOT EXISTS users (
       id VARCHAR(64) PRIMARY KEY,
-      created_at BIGINT NOT NULL
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL,
+      provider VARCHAR(32) NULL,
+      provider_sub VARCHAR(128) NULL,
+      email VARCHAR(255) NULL,
+      display_name VARCHAR(255) NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`);
+    const addColumnIfMissing = async (table, columnDef) => {
+        try {
+            await mysqlPool.execute(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
+        }
+        catch (err) {
+            if (err?.code !== 'ER_DUP_FIELDNAME')
+                throw err;
+        }
+    };
+    await addColumnIfMissing('users', 'updated_at BIGINT NOT NULL DEFAULT 0');
+    await addColumnIfMissing('users', 'provider VARCHAR(32) NULL');
+    await addColumnIfMissing('users', 'provider_sub VARCHAR(128) NULL');
+    await addColumnIfMissing('users', 'email VARCHAR(255) NULL');
+    await addColumnIfMissing('users', 'display_name VARCHAR(255) NULL');
     await mysqlPool.execute(`CREATE TABLE IF NOT EXISTS docs (
       id VARCHAR(64) PRIMARY KEY,
       user_id VARCHAR(64) NOT NULL,
@@ -176,6 +207,34 @@ const ensureMysqlSchema = async () => {
       INDEX idx_dc_category (category_id),
       CONSTRAINT fk_dc_doc FOREIGN KEY (doc_id) REFERENCES docs(id) ON DELETE CASCADE,
       CONSTRAINT fk_dc_category FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`);
+    await mysqlPool.execute(`CREATE TABLE IF NOT EXISTS entitlements (
+      user_id VARCHAR(64) PRIMARY KEY,
+      plan VARCHAR(32) NOT NULL,
+      status VARCHAR(32) NOT NULL,
+      source VARCHAR(32) NOT NULL,
+      product_id VARCHAR(128) NULL,
+      original_transaction_id VARCHAR(128) NULL,
+      expires_at BIGINT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL,
+      CONSTRAINT fk_entitlements_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`);
+    await mysqlPool.execute(`CREATE TABLE IF NOT EXISTS usage_daily (
+      user_id VARCHAR(64) NOT NULL,
+      day DATE NOT NULL,
+      messages_used INT NOT NULL,
+      updated_at BIGINT NOT NULL,
+      PRIMARY KEY (user_id, day),
+      INDEX idx_usage_daily_user (user_id),
+      CONSTRAINT fk_usage_daily_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`);
+    await mysqlPool.execute(`CREATE TABLE IF NOT EXISTS usage_totals (
+      user_id VARCHAR(64) PRIMARY KEY,
+      uploads_total INT NOT NULL,
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL,
+      CONSTRAINT fk_usage_totals_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`);
 };
 let schemaEnsured = null;
@@ -224,10 +283,201 @@ const canonicalizeCategory = (value) => {
     return text;
 };
 const ensureUserRow = async (userId) => {
-    if (!mysqlPool)
+    const now = Date.now();
+    if (!mysqlPool) {
+        const existing = db.users.find((u) => u.id === userId);
+        if (!existing) {
+            db.users.push({ id: userId, createdAt: now, updatedAt: now });
+            writeDB(db);
+        }
         return;
+    }
     await ensureSchemaOnce();
-    await mysqlPool.execute('INSERT IGNORE INTO users (id, created_at) VALUES (?, ?)', [userId, Date.now()]);
+    await mysqlPool.execute('INSERT INTO users (id, created_at, updated_at) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE updated_at=VALUES(updated_at)', [userId, now, now]);
+};
+const getUtcDay = () => new Date().toISOString().slice(0, 10);
+const normalizePlanId = (value) => {
+    const key = String(value ?? '').trim().toLowerCase();
+    if (key in PLAN_LIMITS)
+        return key;
+    return 'free';
+};
+const resolveEffectivePlan = (entitlement) => {
+    if (!entitlement)
+        return 'free';
+    const status = String(entitlement.status ?? '').toLowerCase();
+    if (status !== 'active')
+        return 'free';
+    if (typeof entitlement.expiresAt === 'number' && entitlement.expiresAt > 0 && entitlement.expiresAt <= Date.now()) {
+        return 'free';
+    }
+    return normalizePlanId(entitlement.plan);
+};
+const getEntitlement = async (userId) => {
+    await ensureUserRow(userId);
+    if (mysqlPool) {
+        await ensureSchemaOnce();
+        const [rows] = (await mysqlPool.execute(`SELECT user_id AS userId, plan, status, source, product_id AS productId,
+        original_transaction_id AS originalTransactionId, expires_at AS expiresAt,
+        created_at AS createdAt, updated_at AS updatedAt
+       FROM entitlements WHERE user_id=? LIMIT 1`, [userId]));
+        const row = rows[0];
+        if (!row)
+            return null;
+        return {
+            userId: String(row.userId),
+            plan: String(row.plan ?? 'free'),
+            status: String(row.status ?? 'inactive'),
+            source: String(row.source ?? 'manual'),
+            productId: row.productId ? String(row.productId) : undefined,
+            originalTransactionId: row.originalTransactionId ? String(row.originalTransactionId) : undefined,
+            expiresAt: row.expiresAt == null ? null : Number(row.expiresAt),
+            createdAt: Number(row.createdAt ?? Date.now()),
+            updatedAt: Number(row.updatedAt ?? Date.now()),
+        };
+    }
+    const entry = db.entitlements.find((e) => e.userId === userId);
+    return entry ?? null;
+};
+const getUsageDaily = async (userId, day) => {
+    await ensureUserRow(userId);
+    if (mysqlPool) {
+        await ensureSchemaOnce();
+        const [rows] = (await mysqlPool.execute('SELECT user_id AS userId, day, messages_used AS messagesUsed, updated_at AS updatedAt FROM usage_daily WHERE user_id=? AND day=?', [userId, day]));
+        const row = rows[0];
+        if (row) {
+            return {
+                userId: String(row.userId),
+                day: String(row.day),
+                messagesUsed: Number(row.messagesUsed ?? 0),
+                updatedAt: Number(row.updatedAt ?? Date.now()),
+            };
+        }
+        return { userId, day, messagesUsed: 0, updatedAt: Date.now() };
+    }
+    const entry = db.usageDaily.find((u) => u.userId === userId && u.day === day);
+    return entry ?? { userId, day, messagesUsed: 0, updatedAt: Date.now() };
+};
+const incrementUsageDaily = async (userId, day, delta = 1) => {
+    await ensureUserRow(userId);
+    const now = Date.now();
+    if (mysqlPool) {
+        await ensureSchemaOnce();
+        await mysqlPool.execute(`INSERT INTO usage_daily (user_id, day, messages_used, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE messages_used = messages_used + VALUES(messages_used), updated_at = VALUES(updated_at)`, [userId, day, delta, now]);
+        return await getUsageDaily(userId, day);
+    }
+    const entry = db.usageDaily.find((u) => u.userId === userId && u.day === day);
+    if (entry) {
+        entry.messagesUsed += delta;
+        entry.updatedAt = now;
+    }
+    else {
+        db.usageDaily.push({ userId, day, messagesUsed: delta, updatedAt: now });
+    }
+    writeDB(db);
+    return await getUsageDaily(userId, day);
+};
+const getUsageTotals = async (userId) => {
+    await ensureUserRow(userId);
+    if (mysqlPool) {
+        await ensureSchemaOnce();
+        const [rows] = (await mysqlPool.execute('SELECT user_id AS userId, uploads_total AS uploadsTotal, created_at AS createdAt, updated_at AS updatedAt FROM usage_totals WHERE user_id=?', [userId]));
+        const row = rows[0];
+        if (row) {
+            return {
+                userId: String(row.userId),
+                uploadsTotal: Number(row.uploadsTotal ?? 0),
+                createdAt: Number(row.createdAt ?? Date.now()),
+                updatedAt: Number(row.updatedAt ?? Date.now()),
+            };
+        }
+        return { userId, uploadsTotal: 0, createdAt: Date.now(), updatedAt: Date.now() };
+    }
+    const entry = db.usageTotals.find((u) => u.userId === userId);
+    return entry ?? { userId, uploadsTotal: 0, createdAt: Date.now(), updatedAt: Date.now() };
+};
+const incrementUploadsTotal = async (userId, delta = 1) => {
+    await ensureUserRow(userId);
+    const now = Date.now();
+    if (mysqlPool) {
+        await ensureSchemaOnce();
+        await mysqlPool.execute(`INSERT INTO usage_totals (user_id, uploads_total, created_at, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE uploads_total = uploads_total + VALUES(uploads_total), updated_at = VALUES(updated_at)`, [userId, delta, now, now]);
+        return await getUsageTotals(userId);
+    }
+    const entry = db.usageTotals.find((u) => u.userId === userId);
+    if (entry) {
+        entry.uploadsTotal += delta;
+        entry.updatedAt = now;
+    }
+    else {
+        db.usageTotals.push({ userId, uploadsTotal: delta, createdAt: now, updatedAt: now });
+    }
+    writeDB(db);
+    return await getUsageTotals(userId);
+};
+const getUserRecord = async (userId) => {
+    await ensureUserRow(userId);
+    if (mysqlPool) {
+        await ensureSchemaOnce();
+        const [rows] = (await mysqlPool.execute(`SELECT id, created_at AS createdAt, updated_at AS updatedAt,
+        provider, provider_sub AS providerSub, email, display_name AS displayName
+       FROM users WHERE id=? LIMIT 1`, [userId]));
+        const row = rows[0];
+        if (row) {
+            return {
+                id: String(row.id),
+                createdAt: Number(row.createdAt ?? Date.now()),
+                updatedAt: Number(row.updatedAt ?? Date.now()),
+                provider: row.provider ? String(row.provider) : undefined,
+                providerSub: row.providerSub ? String(row.providerSub) : undefined,
+                email: row.email ? String(row.email) : undefined,
+                displayName: row.displayName ? String(row.displayName) : undefined,
+            };
+        }
+    }
+    const entry = db.users.find((u) => u.id === userId);
+    if (entry)
+        return entry;
+    const now = Date.now();
+    const created = { id: userId, createdAt: now, updatedAt: now };
+    db.users.push(created);
+    writeDB(db);
+    return created;
+};
+const buildPaywallPayload = (scope, used, limit, plan) => ({
+    error: 'Payment required',
+    code: 'PAYWALL_REQUIRED',
+    scope,
+    used,
+    limit,
+    plan,
+});
+const checkMessageAllowance = async (userId) => {
+    if (!PAYWALL_ENFORCED)
+        return { allowed: true, plan: 'free', day: getUtcDay(), used: 0, limit: null };
+    const day = getUtcDay();
+    const entitlement = await getEntitlement(userId);
+    const plan = resolveEffectivePlan(entitlement);
+    const limit = PLAN_LIMITS[plan].messagesPerDay;
+    if (limit == null)
+        return { allowed: true, plan, day, used: 0, limit };
+    const usage = await getUsageDaily(userId, day);
+    return { allowed: usage.messagesUsed < limit, plan, day, used: usage.messagesUsed, limit };
+};
+const checkUploadAllowance = async (userId) => {
+    if (!PAYWALL_ENFORCED)
+        return { allowed: true, plan: 'free', used: 0, limit: null };
+    const entitlement = await getEntitlement(userId);
+    const plan = resolveEffectivePlan(entitlement);
+    const limit = PLAN_LIMITS[plan].uploadsTotal;
+    if (limit == null)
+        return { allowed: true, plan, used: 0, limit };
+    const usage = await getUsageTotals(userId);
+    return { allowed: usage.uploadsTotal < limit, plan, used: usage.uploadsTotal, limit };
 };
 const upsertCategoryId = async (userId, name) => {
     if (!mysqlPool)
@@ -800,6 +1050,62 @@ app.get('/api/health', async (_req, res) => {
         },
     });
 });
+app.post('/api/auth/prepare', async (req, res) => {
+    const provider = String(req.body?.provider ?? '').trim().toLowerCase();
+    res.json({
+        ok: false,
+        status: 'disabled',
+        provider,
+        message: 'Auth is not configured yet. Enable Apple/Google Sign-In after Apple Developer access is restored.',
+    });
+});
+app.post('/api/auth/verify', async (req, res) => {
+    const provider = String(req.body?.provider ?? '').trim().toLowerCase();
+    res.json({
+        ok: false,
+        status: 'disabled',
+        provider,
+        message: 'Auth is not configured yet. Enable Apple/Google Sign-In after Apple Developer access is restored.',
+    });
+});
+app.post('/api/auth/refresh', async (_req, res) => {
+    res.json({
+        ok: false,
+        status: 'disabled',
+        message: 'Auth is not configured yet.',
+    });
+});
+app.get('/api/me', async (req, res) => {
+    let userId = 'public';
+    try {
+        userId = getUserIdFromHeader(req);
+    }
+    catch (err) {
+        return res.status(400).json({ error: err?.message ?? 'Invalid request' });
+    }
+    try {
+        const user = await getUserRecord(userId);
+        const entitlement = await getEntitlement(userId);
+        const effectivePlan = resolveEffectivePlan(entitlement);
+        const usageDay = getUtcDay();
+        const usageDaily = await getUsageDaily(userId, usageDay);
+        const usageTotals = await getUsageTotals(userId);
+        res.json({
+            user,
+            entitlement,
+            effectivePlan,
+            limits: PLAN_LIMITS[effectivePlan],
+            usage: {
+                day: usageDay,
+                messagesUsed: usageDaily.messagesUsed,
+                uploadsTotal: usageTotals.uploadsTotal,
+            },
+        });
+    }
+    catch (err) {
+        res.status(500).json({ error: err?.message ?? 'Failed to load profile' });
+    }
+});
 app.get('/api/docs', async (req, res) => {
     try {
         const userId = getUserIdFromHeader(req);
@@ -1079,6 +1385,17 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
         }
         return res.status(400).json({ error: 'Videos are not supported. Please upload screenshots (photos) only.' });
     }
+    const uploadAllowance = await checkUploadAllowance(userId);
+    if (!uploadAllowance.allowed) {
+        try {
+            if (fs.existsSync(req.file.path))
+                fs.unlinkSync(req.file.path);
+        }
+        catch {
+            // ignore
+        }
+        return res.status(402).json(buildPaywallPayload('uploads', uploadAllowance.used, uploadAllowance.limit, uploadAllowance.plan));
+    }
     try {
         let doc;
         if (isImage) {
@@ -1146,6 +1463,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
             }
         }
         await saveDoc(doc);
+        await incrementUploadsTotal(userId, 1);
         res.json({ doc: await toPublicDoc(doc) });
     }
     catch (err) {
@@ -1166,6 +1484,11 @@ app.post('/api/search', async (req, res) => {
         return res.status(400).json({ error: err?.message ?? 'Invalid request' });
     }
     try {
+        const allowance = await checkMessageAllowance(userId);
+        if (!allowance.allowed) {
+            return res.status(402).json(buildPaywallPayload('messages', allowance.used, allowance.limit, allowance.plan));
+        }
+        await incrementUsageDaily(userId, allowance.day, 1);
         const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, category);
         if (!ranked.length)
             return res.json({ answer: reason || 'No screenshots indexed yet.', matches: [] });
@@ -1211,6 +1534,11 @@ app.post('/api/search-stream', async (req, res) => {
         res.status(400).json({ error: err?.message ?? 'Invalid request' });
         return;
     }
+    const allowance = await checkMessageAllowance(userId);
+    if (!allowance.allowed) {
+        res.status(402).json(buildPaywallPayload('messages', allowance.used, allowance.limit, allowance.plan));
+        return;
+    }
     // Prepare SSE headers
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache');
@@ -1238,6 +1566,7 @@ app.post('/api/search-stream', async (req, res) => {
     res.on('close', () => clearInterval(heartbeat));
     res.on('finish', () => clearInterval(heartbeat));
     try {
+        await incrementUsageDaily(userId, allowance.day, 1);
         const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, category);
         if (!ranked.length) {
             writeSse(res, { type: 'info', message: reason || 'No screenshots indexed yet.' });
@@ -1350,6 +1679,12 @@ wss.on('connection', (ws) => {
         abortActive();
         activeController = new AbortController();
         try {
+            const allowance = await checkMessageAllowance(userId);
+            if (!allowance.allowed) {
+                wsSend(ws, { type: 'error', ...buildPaywallPayload('messages', allowance.used, allowance.limit, allowance.plan) });
+                return;
+            }
+            await incrementUsageDaily(userId, allowance.day, 1);
             const { context, ranked, reason } = await buildRetrievalContext(query, topK, userId, category);
             if (!ranked.length) {
                 wsSend(ws, { type: 'info', message: reason || 'No screenshots indexed yet.' });

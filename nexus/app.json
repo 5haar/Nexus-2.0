@@ -15,10 +15,7 @@
     "ios": {
       "supportsTablet": false,
       "infoPlist": {
-        "NSPhotoLibraryUsageDescription": "We need access to your photo library to import screenshots for AI categorization.",
-        "NSAppTransportSecurity": {
-          "NSAllowsArbitraryLoads": true
-        }
+        "NSPhotoLibraryUsageDescription": "We need access to your photo library to import screenshots for AI categorization."
       }
     },
     "android": {
