@@ -190,6 +190,8 @@ const PAYWALL_PLANS = [
     highlight: false,
   },
 ] as const;
+const IMPORT_PAGE_SIZE = 120;
+const IMPORT_MAX_ASSETS = 800;
 
 const COLORS = {
   bg: '#ffffff',
@@ -895,15 +897,24 @@ export default function App() {
         return;
       }
 
-      const result = await MediaLibrary.getAssetsAsync({
-        first: 60,
-        sortBy: [MediaLibrary.SortBy.creationTime],
-        mediaType: [MediaLibrary.MediaType.photo],
-        mediaSubtypes: ['screenshot'],
-      });
+      const collected: MediaLibrary.Asset[] = [];
+      let after: string | undefined = undefined;
+      let hasNextPage = true;
+      while (hasNextPage && collected.length < IMPORT_MAX_ASSETS) {
+        const result = await MediaLibrary.getAssetsAsync({
+          first: IMPORT_PAGE_SIZE,
+          after,
+          sortBy: [MediaLibrary.SortBy.creationTime],
+          mediaType: [MediaLibrary.MediaType.photo],
+          mediaSubtypes: ['screenshot'],
+        });
+        collected.push(...result.assets);
+        after = result.endCursor;
+        hasNextPage = !!result.hasNextPage;
+      }
 
       const resolved = await Promise.all(
-        result.assets.map(async (asset) => {
+        collected.slice(0, IMPORT_MAX_ASSETS).map(async (asset) => {
           const info = await MediaLibrary.getAssetInfoAsync(asset);
           const legacyLocalUri = (asset as any).localUri as string | undefined;
           return {
@@ -924,6 +935,20 @@ export default function App() {
       setUiError(err?.message ?? 'Failed to load screenshots');
     } finally {
       setLoadingScreenshots(false);
+    }
+  };
+
+  const openLimitedLibraryPicker = async () => {
+    try {
+      const picker = (MediaLibrary as any).presentLimitedLibraryPickerAsync;
+      if (typeof picker === 'function') {
+        await picker();
+        await loadScreenshots();
+        return;
+      }
+      await Linking.openSettings();
+    } catch (err: any) {
+      setUiError(err?.message ?? 'Failed to open photo picker');
     }
   };
 
@@ -1456,17 +1481,7 @@ export default function App() {
               selectedCount={selected.size}
               importProgress={importProgress}
               onLoadScreenshots={loadScreenshots}
-              onPickLimitedPhotos={async () => {
-                try {
-                  const picker = (MediaLibrary as any).presentLimitedLibraryPickerAsync;
-                  if (typeof picker === 'function') {
-                    await picker();
-                    await loadScreenshots();
-                  }
-                } catch (err: any) {
-                  setUiError(err?.message ?? 'Failed to open photo picker');
-                }
-              }}
+              onPickLimitedPhotos={openLimitedLibraryPicker}
               onPickFiles={pickFiles}
               onIndexSelected={handleSendToAI}
               screenshots={screenshots}
@@ -2453,26 +2468,43 @@ function ImportScreen(props: {
           <View style={styles.importActions}>
             <Pressable
               onPress={props.onLoadScreenshots}
-              style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
+              style={({ pressed }) => [styles.importActionCard, pressed && styles.pressed]}
             >
-              <Ionicons name="image-outline" size={16} color={COLORS.text} />
-              <Text style={styles.pillButtonText}>{props.loadingScreenshots ? 'Loading…' : 'Load screenshots'}</Text>
+              <View style={styles.importActionIcon}>
+                <Ionicons name="image-outline" size={18} color={COLORS.text} />
+              </View>
+              <View style={styles.importActionText}>
+                <Text style={styles.importActionTitle}>Screenshots</Text>
+                <Text style={styles.importActionSubtitle}>
+                  {props.loadingScreenshots ? 'Loading…' : 'Load from Photos'}
+                </Text>
+              </View>
             </Pressable>
             {props.limitedAccess && Platform.OS === 'ios' && (
               <Pressable
                 onPress={props.onPickLimitedPhotos}
-                style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
+                style={({ pressed }) => [styles.importActionCard, pressed && styles.pressed]}
               >
-                <Ionicons name="images-outline" size={16} color={COLORS.text} />
-                <Text style={styles.pillButtonText}>Choose more photos</Text>
+                <View style={styles.importActionIcon}>
+                  <Ionicons name="images-outline" size={18} color={COLORS.text} />
+                </View>
+                <View style={styles.importActionText}>
+                  <Text style={styles.importActionTitle}>More Photos</Text>
+                  <Text style={styles.importActionSubtitle}>Expand selection</Text>
+                </View>
               </Pressable>
             )}
             <Pressable
               onPress={props.onPickFiles}
-              style={({ pressed }) => [styles.pillButton, pressed && styles.pressed]}
+              style={({ pressed }) => [styles.importActionCard, pressed && styles.pressed]}
             >
-              <Ionicons name="document-text-outline" size={16} color={COLORS.text} />
-              <Text style={styles.pillButtonText}>Pick files</Text>
+              <View style={styles.importActionIcon}>
+                <Ionicons name="document-text-outline" size={18} color={COLORS.text} />
+              </View>
+              <View style={styles.importActionText}>
+                <Text style={styles.importActionTitle}>Documents</Text>
+                <Text style={styles.importActionSubtitle}>Pick PDFs or text</Text>
+              </View>
             </Pressable>
           </View>
         </View>
@@ -4690,13 +4722,13 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   pageHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 12,
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+    gap: 14,
   },
   pageHeaderText: {
     flex: 1,
+    width: '100%',
   },
   pageTitle: {
     color: COLORS.text,
@@ -4708,6 +4740,49 @@ const styles = StyleSheet.create({
     marginTop: 4,
     fontSize: 13,
     lineHeight: 18,
+    fontFamily: FONT_SANS,
+  },
+  importActions: {
+    width: '100%',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  importActionCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+    flexGrow: 1,
+    flexBasis: 160,
+  },
+  importActionIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  importActionText: {
+    flex: 1,
+    gap: 2,
+  },
+  importActionTitle: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  importActionSubtitle: {
+    color: COLORS.muted,
+    fontSize: 12,
     fontFamily: FONT_SANS,
   },
   pillButton: {
@@ -4725,10 +4800,6 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontFamily: FONT_SANS_SEMIBOLD,
     fontSize: 13,
-  },
-  importActions: {
-    alignItems: 'flex-end',
-    gap: 8,
   },
   sectionTitle: {
     color: COLORS.muted,
