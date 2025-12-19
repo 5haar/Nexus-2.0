@@ -6,7 +6,7 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -14,9 +14,11 @@
     },
     "ios": {
       "supportsTablet": false,
+      "bundleIdentifier": "com.ragobble.Nexus",
       "usesAppleSignIn": true,
       "infoPlist": {
-        "NSPhotoLibraryUsageDescription": "We need access to your photo library to import screenshots for AI categorization."
+        "NSPhotoLibraryUsageDescription": "We need access to your photo library to import screenshots for AI categorization.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
@@ -32,6 +34,11 @@
     },
     "plugins": [
       "expo-font"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "b270ba0f-0f4a-45cb-bc14-ec30a0a785a4"
+      }
+    }
   }
 }
