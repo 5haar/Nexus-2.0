@@ -22,6 +22,7 @@
     "openai": "^4.83.0",
     "pdf-parse": "^1.1.1",
     "mammoth": "^1.7.1",
+    "jose": "^5.9.6",
     "ws": "^8.18.3"
   },
   "optionalDependencies": {

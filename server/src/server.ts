@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { OpenAI } from 'openai';
 import { WebSocketServer } from 'ws';
 import mysql from 'mysql2/promise';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -127,6 +128,8 @@ const PLAN_LIMITS = {
   pro: { messagesPerDay: 1000, uploadsTotal: 500 },
   max: { messagesPerDay: null, uploadsTotal: 1000 },
 } as const;
+const APPLE_ISSUER = 'https://appleid.apple.com';
+const APPLE_AUDIENCE = process.env.APPLE_AUDIENCE || '';
 
 if (!OPENAI_API_KEY) {
   console.warn('OPENAI_API_KEY is not set. Vision and search will fail.');
@@ -136,6 +139,17 @@ const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const requireOpenAI = () => {
   if (!openai) throw new Error('Missing OPENAI_API_KEY');
   return openai;
+};
+
+const appleJwks = createRemoteJWKSet(new URL(`${APPLE_ISSUER}/auth/keys`));
+const verifyAppleIdentityToken = async (token: string) => {
+  const options: { issuer: string; audience?: string | string[]; clockTolerance?: number } = {
+    issuer: APPLE_ISSUER,
+    clockTolerance: 10,
+  };
+  if (APPLE_AUDIENCE) options.audience = APPLE_AUDIENCE;
+  const { payload } = await jwtVerify(token, appleJwks, options);
+  return payload;
 };
 
 const sanitizeModelName = (value: unknown) => {
@@ -574,6 +588,36 @@ const getUserRecord = async (userId: string): Promise<UserRecord> => {
   db.users.push(created);
   writeDB(db);
   return created;
+};
+
+const updateUserProfile = async (userId: string, updates: Partial<UserRecord>) => {
+  const now = Date.now();
+  await ensureUserRow(userId);
+  if (mysqlPool) {
+    await ensureSchemaOnce();
+    await mysqlPool.execute(
+      `UPDATE users
+       SET provider=?, provider_sub=?, email=?, display_name=?, updated_at=?
+       WHERE id=?`,
+      [
+        updates.provider ?? null,
+        updates.providerSub ?? null,
+        updates.email ?? null,
+        updates.displayName ?? null,
+        now,
+        userId,
+      ],
+    );
+    return;
+  }
+  const entry = db.users.find((u) => u.id === userId);
+  if (!entry) return;
+  entry.provider = updates.provider ?? entry.provider;
+  entry.providerSub = updates.providerSub ?? entry.providerSub;
+  entry.email = updates.email ?? entry.email;
+  entry.displayName = updates.displayName ?? entry.displayName;
+  entry.updatedAt = now;
+  writeDB(db);
 };
 
 const buildPaywallPayload = (scope: 'messages' | 'uploads', used: number, limit: number | null, plan: string) => ({
@@ -1427,22 +1471,51 @@ app.get('/api/health', async (_req, res) => {
 
 app.post('/api/auth/prepare', async (req, res) => {
   const provider = String((req.body as any)?.provider ?? '').trim().toLowerCase();
+  if (provider !== 'apple') {
+    return res.status(400).json({ error: 'Unsupported provider' });
+  }
   res.json({
-    ok: false,
-    status: 'disabled',
+    ok: true,
     provider,
-    message: 'Auth is not configured yet. Enable Apple/Google Sign-In after Apple Developer access is restored.',
+    audience: APPLE_AUDIENCE || null,
   });
 });
 
 app.post('/api/auth/verify', async (req, res) => {
   const provider = String((req.body as any)?.provider ?? '').trim().toLowerCase();
-  res.json({
-    ok: false,
-    status: 'disabled',
-    provider,
-    message: 'Auth is not configured yet. Enable Apple/Google Sign-In after Apple Developer access is restored.',
-  });
+  if (provider !== 'apple') {
+    return res.status(400).json({ error: 'Unsupported provider' });
+  }
+  const identityToken = String((req.body as any)?.identityToken ?? '').trim();
+  if (!identityToken) return res.status(400).json({ error: 'identityToken is required' });
+  try {
+    const payload = await verifyAppleIdentityToken(identityToken);
+    const sub = String(payload.sub ?? '').trim();
+    if (!sub) return res.status(400).json({ error: 'Invalid Apple token' });
+    const email = typeof payload.email === 'string' ? payload.email : undefined;
+    const fullName = (req.body as any)?.fullName as { givenName?: string; familyName?: string } | undefined;
+    const displayName = [fullName?.givenName, fullName?.familyName].filter(Boolean).join(' ').trim() || undefined;
+    const userId = `apple_${sub}`;
+    await updateUserProfile(userId, {
+      provider: 'apple',
+      providerSub: sub,
+      email,
+      displayName,
+    });
+    return res.json({
+      ok: true,
+      provider: 'apple',
+      userId,
+      user: {
+        id: userId,
+        email: email ?? null,
+        displayName: displayName ?? null,
+      },
+    });
+  } catch (err: any) {
+    console.error('Apple verify failed', err);
+    return res.status(401).json({ error: err?.message ?? 'Invalid Apple token' });
+  }
 });
 
 app.post('/api/auth/refresh', async (_req, res) => {

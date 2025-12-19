@@ -6,6 +6,7 @@ import * as MediaLibrary from 'expo-media-library';
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import { useFonts } from 'expo-font';
+import * as AppleAuthentication from 'expo-apple-authentication';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   ActivityIndicator,
@@ -149,6 +150,7 @@ const DEFAULT_CHAT_MODEL = process.env.EXPO_PUBLIC_CHAT_MODEL ?? 'gpt-5.2';
 const API_BASE_STORAGE_KEY = 'nexus.apiBase';
 const CHAT_MODEL_STORAGE_KEY = 'nexus.chatModel';
 const USER_ID_STORAGE_KEY = 'nexus.userId';
+const AUTH_PROVIDER_STORAGE_KEY = 'nexus.authProvider';
 const THREADS_STORAGE_KEY_PREFIX = 'nexus.threads.';
 const ACTIVE_THREAD_STORAGE_KEY_PREFIX = 'nexus.thread.active.';
 const TUTORIAL_SEEN_STORAGE_KEY = 'nexus.tutorialSeen.v1';
@@ -192,6 +194,7 @@ const PAYWALL_PLANS = [
 ] as const;
 const IMPORT_PAGE_SIZE = 120;
 const IMPORT_MAX_ASSETS = 800;
+const REQUIRE_AUTH = process.env.EXPO_PUBLIC_REQUIRE_AUTH !== '0';
 
 const COLORS = {
   bg: '#ffffff',
@@ -403,6 +406,11 @@ export default function App() {
   const [apiDraft, setApiDraft] = useState('');
   const apiInputRef = useRef<TextInput | null>(null);
   const [userId, setUserId] = useState('');
+  const [authProvider, setAuthProvider] = useState('');
+  const [authReady, setAuthReady] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [appleAvailable, setAppleAvailable] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
   const tutorialCheckedRef = useRef(false);
 
@@ -547,17 +555,40 @@ export default function App() {
     (async () => {
       try {
         const existing = (await AsyncStorage.getItem(USER_ID_STORAGE_KEY))?.trim();
+        const storedProvider = (await AsyncStorage.getItem(AUTH_PROVIDER_STORAGE_KEY))?.trim() ?? '';
         if (existing) {
-          if (!cancelled) setUserId(existing);
-          return;
+          const isAnon = existing.startsWith('anon_');
+          if (REQUIRE_AUTH && isAnon) {
+            await AsyncStorage.removeItem(USER_ID_STORAGE_KEY);
+          } else {
+            if (!cancelled) setUserId(existing);
+            if (!cancelled) setAuthProvider(storedProvider);
+          }
+        } else if (!REQUIRE_AUTH) {
+          const next = `anon_${randomId()}`;
+          await AsyncStorage.setItem(USER_ID_STORAGE_KEY, next);
+          if (!cancelled) setUserId(next);
         }
-        const next = `anon_${randomId()}`;
-        await AsyncStorage.setItem(USER_ID_STORAGE_KEY, next);
-        if (!cancelled) setUserId(next);
       } catch {
         // ignore
+      } finally {
+        if (!cancelled) setAuthReady(true);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    AppleAuthentication.isAvailableAsync()
+      .then((available) => {
+        if (!cancelled) setAppleAvailable(available);
+      })
+      .catch(() => {
+        if (!cancelled) setAppleAvailable(false);
+      });
     return () => {
       cancelled = true;
     };
@@ -874,6 +905,56 @@ export default function App() {
     const response = await MediaLibrary.requestPermissionsAsync(false);
     setPermission(response);
     return hasMediaLibraryReadAccess(response);
+  };
+
+  const signInWithApple = async () => {
+    if (authBusy) return;
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      const credential = await AppleAuthentication.signInAsync({
+        requestedScopes: [
+          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+          AppleAuthentication.AppleAuthenticationScope.EMAIL,
+        ],
+      });
+      if (!credential.identityToken) throw new Error('Missing identity token.');
+      const res = await fetch(`${apiBase}/api/auth/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'apple',
+          identityToken: credential.identityToken,
+          authorizationCode: credential.authorizationCode,
+          fullName: credential.fullName,
+          email: credential.email,
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        try {
+          const parsed = JSON.parse(detail);
+          const msg = String(parsed?.error ?? parsed?.message ?? '').trim();
+          if (msg) throw new Error(msg);
+        } catch {
+          // ignore
+        }
+        throw new Error(detail || 'Sign in failed.');
+      }
+      const data = (await res.json()) as { userId?: string; provider?: string };
+      const nextUserId = String(data.userId ?? '').trim();
+      if (!nextUserId) throw new Error('Missing user id.');
+      await AsyncStorage.setItem(USER_ID_STORAGE_KEY, nextUserId);
+      await AsyncStorage.setItem(AUTH_PROVIDER_STORAGE_KEY, 'apple');
+      setAuthProvider('apple');
+      setUserId(nextUserId);
+    } catch (err: any) {
+      const message = String(err?.message ?? 'Sign in failed.').trim();
+      setAuthError(message);
+      Alert.alert('Sign in failed', message);
+    } finally {
+      setAuthBusy(false);
+    }
   };
 
   const loadScreenshots = async () => {
@@ -1381,7 +1462,10 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [bootOpacity, fontsLoaded]);
 
-  if (!fontsLoaded) {
+  const isAuthenticated = !!userId && !userId.startsWith('anon_');
+  const showAuthGate = REQUIRE_AUTH && authReady && !isAuthenticated;
+
+  if (!fontsLoaded || !authReady) {
     return (
       <SafeAreaProvider>
         <SafeAreaView style={styles.safeArea}>
@@ -1390,6 +1474,22 @@ export default function App() {
             <Image source={require('./assets/icon.png')} style={styles.bootIcon} />
             <Text style={styles.bootTitle}>Nexus</Text>
           </View>
+        </SafeAreaView>
+      </SafeAreaProvider>
+    );
+  }
+
+  if (showAuthGate) {
+    return (
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.safeArea}>
+          <StatusBar style="dark" />
+          <AuthScreen
+            appleAvailable={appleAvailable}
+            authBusy={authBusy}
+            authError={authError}
+            onSignIn={signInWithApple}
+          />
         </SafeAreaView>
       </SafeAreaProvider>
     );
@@ -3320,6 +3420,46 @@ function TutorialModal(props: { visible: boolean; onClose: () => void; onGoToImp
   );
 }
 
+function AuthScreen(props: {
+  appleAvailable: boolean;
+  authBusy: boolean;
+  authError: string | null;
+  onSignIn: () => void;
+}) {
+  return (
+    <View style={styles.authScreen}>
+      <View style={styles.authCard}>
+        <View style={styles.authIcon}>
+          <Ionicons name="shield-checkmark-outline" size={22} color={COLORS.accentText} />
+        </View>
+        <Text style={styles.authTitle}>Sign in to Nexus</Text>
+        <Text style={styles.authSubtitle}>
+          Use Sign in with Apple to access your indexed library and chat history.
+        </Text>
+        {!props.appleAvailable && (
+          <View style={styles.authNotice}>
+            <Ionicons name="alert-circle-outline" size={16} color={COLORS.muted} />
+            <Text style={styles.authNoticeText}>Apple Sign In isn’t available on this device.</Text>
+          </View>
+        )}
+        {props.appleAvailable && (
+          <View style={styles.authButtonWrap}>
+            <AppleAuthentication.AppleAuthenticationButton
+              buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
+              buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
+              cornerRadius={12}
+              style={styles.authButton}
+              onPress={props.onSignIn}
+            />
+          </View>
+        )}
+        {props.authBusy && <ActivityIndicator color={COLORS.text} />}
+        {!!props.authError && <Text style={styles.authError}>{props.authError}</Text>}
+      </View>
+    </View>
+  );
+}
+
 function PaywallModal(props: {
   visible: boolean;
   reason: string;
@@ -3908,6 +4048,74 @@ const styles = StyleSheet.create({
     gap: 10,
     justifyContent: 'flex-end',
     paddingTop: 6,
+  },
+  authScreen: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+    backgroundColor: COLORS.bg,
+  },
+  authCard: {
+    width: '100%',
+    maxWidth: 360,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    padding: 18,
+    alignItems: 'center',
+    gap: 12,
+  },
+  authIcon: {
+    width: 44,
+    height: 44,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.accent,
+  },
+  authTitle: {
+    color: COLORS.text,
+    fontSize: 18,
+    fontFamily: FONT_HEADING_BOLD,
+  },
+  authSubtitle: {
+    color: COLORS.muted,
+    fontSize: 13,
+    textAlign: 'center',
+    fontFamily: FONT_SANS,
+    lineHeight: 18,
+  },
+  authNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  authNoticeText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+  },
+  authButtonWrap: {
+    width: '100%',
+    alignItems: 'center',
+  },
+  authButton: {
+    width: '100%',
+    height: 44,
+  },
+  authError: {
+    color: COLORS.danger,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+    textAlign: 'center',
   },
   paywallBackdrop: {
     flex: 1,
