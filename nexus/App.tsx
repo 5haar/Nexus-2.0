@@ -2037,8 +2037,9 @@ function ChatScreen(props: {
   const empty = props.chatHistory.length === 0;
   const [scopeOpen, setScopeOpen] = useState(false);
   const [modelOpen, setModelOpen] = useState(false);
-  const scopeLabel = props.scopeCategory ? `Category: ${props.scopeCategory}` : 'All screenshots';
-  const modelLabel = `Model: ${props.chatModel}`;
+  const scopeLabel = 'Category';
+  const modelLabel = 'Model';
+  const showEmptyOverlay = empty && !props.chatInput.trim() && keyboardHeight === 0;
 
   useEffect(() => {
     const animateTo = (nextHeight: number, duration: number) => {
@@ -2208,7 +2209,7 @@ function ChatScreen(props: {
           );
         }}
       />
-      {empty && (
+      {showEmptyOverlay && (
         <Animated.View
           pointerEvents="none"
           style={[styles.chatEmptyOverlay, { bottom: composerHeight + 22, paddingHorizontal: pagePadding, transform: [{ translateY }] }]}
