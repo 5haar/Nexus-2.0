@@ -154,6 +154,7 @@ const AUTH_PROVIDER_STORAGE_KEY = 'nexus.authProvider';
 const THREADS_STORAGE_KEY_PREFIX = 'nexus.threads.';
 const ACTIVE_THREAD_STORAGE_KEY_PREFIX = 'nexus.thread.active.';
 const TUTORIAL_SEEN_STORAGE_KEY = 'nexus.tutorialSeen.v1';
+const ONBOARDING_SEEN_STORAGE_KEY = 'nexus.onboardingSeen.v1';
 const CHAT_MODEL_OPTIONS = (() => {
   const raw = process.env.EXPO_PUBLIC_CHAT_MODELS;
   const parsed = raw
@@ -411,6 +412,8 @@ export default function App() {
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [appleAvailable, setAppleAvailable] = useState(false);
+  const [onboardingSeen, setOnboardingSeen] = useState(false);
+  const [onboardingReady, setOnboardingReady] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
   const tutorialCheckedRef = useRef(false);
 
@@ -589,6 +592,23 @@ export default function App() {
       .catch(() => {
         if (!cancelled) setAppleAvailable(false);
       });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const seen = (await AsyncStorage.getItem(ONBOARDING_SEEN_STORAGE_KEY)) === '1';
+        if (!cancelled) setOnboardingSeen(seen);
+      } catch {
+        if (!cancelled) setOnboardingSeen(false);
+      } finally {
+        if (!cancelled) setOnboardingReady(true);
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -890,6 +910,16 @@ export default function App() {
   const dismissTutorial = useCallback(async () => {
     setTutorialOpen(false);
     try {
+      await AsyncStorage.setItem(TUTORIAL_SEEN_STORAGE_KEY, '1');
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const completeOnboarding = useCallback(async () => {
+    setOnboardingSeen(true);
+    try {
+      await AsyncStorage.setItem(ONBOARDING_SEEN_STORAGE_KEY, '1');
       await AsyncStorage.setItem(TUTORIAL_SEEN_STORAGE_KEY, '1');
     } catch {
       // ignore
@@ -1464,8 +1494,9 @@ export default function App() {
 
   const isAuthenticated = !!userId && !userId.startsWith('anon_');
   const showAuthGate = REQUIRE_AUTH && authReady && !isAuthenticated;
+  const showOnboarding = !onboardingSeen;
 
-  if (!fontsLoaded || !authReady) {
+  if (!fontsLoaded || !authReady || !onboardingReady) {
     return (
       <SafeAreaProvider>
         <SafeAreaView style={styles.safeArea}>
@@ -1474,6 +1505,17 @@ export default function App() {
             <Image source={require('./assets/icon.png')} style={styles.bootIcon} />
             <Text style={styles.bootTitle}>Nexus</Text>
           </View>
+        </SafeAreaView>
+      </SafeAreaProvider>
+    );
+  }
+
+  if (showOnboarding) {
+    return (
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.safeArea}>
+          <StatusBar style="dark" />
+          <OnboardingScreen onDone={() => void completeOnboarding()} />
         </SafeAreaView>
       </SafeAreaProvider>
     );
@@ -3420,6 +3462,46 @@ function TutorialModal(props: { visible: boolean; onClose: () => void; onGoToImp
   );
 }
 
+function OnboardingScreen(props: { onDone: () => void }) {
+  const steps = [
+    {
+      title: 'Import screenshots + docs',
+      body: 'Bring in your screenshots, PDFs, and notes to index them.',
+      image: require('./assets/splash-icon.png'),
+    },
+    {
+      title: 'Organize automatically',
+      body: 'Nexus assigns a category so you can find things fast.',
+      image: require('./assets/nexus-logo.jpg'),
+    },
+    {
+      title: 'Ask questions',
+      body: 'Chat with a category or a specific document.',
+      image: require('./assets/icon.png'),
+    },
+  ];
+  return (
+    <View style={styles.onboardingScreen}>
+      <ScrollView contentContainerStyle={styles.onboardingContent} showsVerticalScrollIndicator={false}>
+        <Text style={styles.onboardingTitle}>Welcome to Nexus</Text>
+        <Text style={styles.onboardingSubtitle}>A quick tour before you get started.</Text>
+        <View style={styles.onboardingSteps}>
+          {steps.map((step) => (
+            <View key={step.title} style={styles.onboardingCard}>
+              <Image source={step.image} style={styles.onboardingImage} resizeMode="contain" />
+              <Text style={styles.onboardingCardTitle}>{step.title}</Text>
+              <Text style={styles.onboardingCardBody}>{step.body}</Text>
+            </View>
+          ))}
+        </View>
+        <Pressable onPress={props.onDone} style={({ pressed }) => [styles.onboardingButton, pressed && styles.pressed]}>
+          <Text style={styles.onboardingButtonText}>Continue to Sign In</Text>
+        </Pressable>
+      </ScrollView>
+    </View>
+  );
+}
+
 function AuthScreen(props: {
   appleAvailable: boolean;
   authBusy: boolean;
@@ -4116,6 +4198,68 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: FONT_SANS,
     textAlign: 'center',
+  },
+  onboardingScreen: {
+    flex: 1,
+    backgroundColor: COLORS.bg,
+  },
+  onboardingContent: {
+    padding: 20,
+    paddingTop: 28,
+    gap: 12,
+  },
+  onboardingTitle: {
+    color: COLORS.text,
+    fontSize: 22,
+    fontFamily: FONT_HEADING_BOLD,
+  },
+  onboardingSubtitle: {
+    color: COLORS.muted,
+    fontSize: 13,
+    fontFamily: FONT_SANS,
+    marginBottom: 10,
+  },
+  onboardingSteps: {
+    gap: 12,
+  },
+  onboardingCard: {
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    padding: 14,
+    gap: 8,
+    alignItems: 'center',
+  },
+  onboardingImage: {
+    width: '100%',
+    height: 140,
+    borderRadius: 14,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  onboardingCardTitle: {
+    color: COLORS.text,
+    fontSize: 15,
+    fontFamily: FONT_SANS_SEMIBOLD,
+    textAlign: 'center',
+  },
+  onboardingCardBody: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+    textAlign: 'center',
+  },
+  onboardingButton: {
+    marginTop: 8,
+    paddingVertical: 12,
+    borderRadius: 14,
+    backgroundColor: COLORS.accent,
+    alignItems: 'center',
+  },
+  onboardingButtonText: {
+    color: COLORS.accentText,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
   },
   paywallBackdrop: {
     flex: 1,
