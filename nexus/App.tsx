@@ -1805,7 +1805,8 @@ function ChatScreen(props: {
   onOpenSource: (uri: string) => void;
 }) {
   const insets = useSafeAreaInsets();
-  const { height: windowHeight } = useWindowDimensions();
+  const { width, height: windowHeight } = useWindowDimensions();
+  const pagePadding = width >= 768 ? 32 : 24;
   const keyboardAnim = useRef(new Animated.Value(0)).current;
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const [composerHeight, setComposerHeight] = useState(0);
@@ -1956,7 +1957,7 @@ function ChatScreen(props: {
       {empty && (
         <Animated.View
           pointerEvents="none"
-          style={[styles.chatEmptyOverlay, { bottom: composerHeight + 22, transform: [{ translateY }] }]}
+          style={[styles.chatEmptyOverlay, { bottom: composerHeight + 22, paddingHorizontal: pagePadding, transform: [{ translateY }] }]}
         >
           <View pointerEvents="none" style={styles.chatEmptyCard}>
             <View style={styles.chatEmptyIcon}>
@@ -3060,14 +3061,16 @@ function DocumentsScreen(props: {
 
   if (props.docs.length === 0) {
     return (
-      <View style={styles.mcEmptyWrap}>
-        <Pressable onPress={props.onRefresh} style={({ pressed }) => [styles.mcEmptyCard, pressed && styles.mcDashedCardPressed]}>
-          <View style={styles.mcDashedIcon}>
-            <Ionicons name="documents-outline" size={28} color={COLORS.muted} />
-          </View>
-          <Text style={styles.mcEmptyTitle}>No screenshots yet</Text>
-          <Text style={styles.mcEmptySubtitle}>Import and index some screenshots first.</Text>
-        </Pressable>
+      <View style={[pageStyle, { flex: 1 }]}>
+        <View style={styles.mcEmptyWrap}>
+          <Pressable onPress={props.onRefresh} style={({ pressed }) => [styles.mcEmptyCard, pressed && styles.mcDashedCardPressed]}>
+            <View style={styles.mcDashedIcon}>
+              <Ionicons name="documents-outline" size={28} color={COLORS.muted} />
+            </View>
+            <Text style={styles.mcEmptyTitle}>No screenshots yet</Text>
+            <Text style={styles.mcEmptySubtitle}>Import and index some screenshots first.</Text>
+          </Pressable>
+        </View>
       </View>
     );
   }
