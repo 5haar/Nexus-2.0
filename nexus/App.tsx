@@ -480,6 +480,7 @@ export default function App() {
   }>({ running: false, current: 0, total: 0, done: 0, failed: 0 });
 
   const [docs, setDocs] = useState<ServerDoc[]>([]);
+  const [userProfile, setUserProfile] = useState<{ email?: string | null; displayName?: string | null } | null>(null);
 
   const [chatInput, setChatInput] = useState('');
   const [chatHistory, setChatHistory] = useState<ChatEntry[]>([]);
@@ -959,6 +960,31 @@ export default function App() {
     [openPaywall, showErrorToast],
   );
 
+  const loadUserProfile = useCallback(async () => {
+    if (!userId) {
+      setUserProfile(null);
+      return;
+    }
+    try {
+      const data = await apiFetch<{ user?: { email?: string | null; displayName?: string | null } }>(
+        apiBase,
+        userId,
+        '/api/me',
+      );
+      const user = data?.user;
+      if (!user) {
+        setUserProfile(null);
+        return;
+      }
+      setUserProfile({
+        email: user.email ?? null,
+        displayName: user.displayName ?? null,
+      });
+    } catch (err: any) {
+      if (AUTH_DEBUG) pushAuthDebug(`Profile load failed: ${String(err?.message ?? err)}`);
+    }
+  }, [apiBase, userId, pushAuthDebug]);
+
   const iapProductIds = useMemo(() => PAYWALL_PLANS.map((plan) => plan.productId).filter(Boolean), []);
 
   const refreshIapProducts = useCallback(async () => {
@@ -1152,6 +1178,14 @@ export default function App() {
   }, [apiBase, userId]);
 
   useEffect(() => {
+    if (!userId) {
+      setUserProfile(null);
+      return;
+    }
+    void loadUserProfile();
+  }, [loadUserProfile, userId]);
+
+  useEffect(() => {
     if (!fontsLoaded) return;
     if (!userId) return;
     if (tutorialCheckedRef.current) return;
@@ -1251,12 +1285,23 @@ export default function App() {
         }
         throw new Error(detail || 'Sign in failed.');
       }
-      const data = (await res.json()) as { userId?: string; provider?: string };
+      const data = (await res.json()) as {
+        userId?: string;
+        provider?: string;
+        user?: { email?: string | null; displayName?: string | null };
+      };
       const nextUserId = String(data.userId ?? '').trim();
       if (!nextUserId) throw new Error('Missing user id.');
       await AsyncStorage.setItem(USER_ID_STORAGE_KEY, nextUserId);
       await AsyncStorage.setItem(AUTH_PROVIDER_STORAGE_KEY, 'apple');
       setAuthProvider('apple');
+      if (data.user) {
+        const user = data.user;
+        setUserProfile({
+          email: user?.email ?? null,
+          displayName: user?.displayName ?? null,
+        });
+      }
       setUserId(nextUserId);
       pushAuthDebug('Sign-in complete');
     } catch (err: any) {
@@ -1775,6 +1820,14 @@ export default function App() {
   const isAuthenticated = !!userId && !userId.startsWith('anon_');
   const showAuthGate = REQUIRE_AUTH && authReady && !isAuthenticated;
   const showOnboarding = !onboardingSeen;
+  const accountLabel = useMemo(() => {
+    if (!isAuthenticated) return '';
+    const name = userProfile?.displayName?.trim();
+    if (name) return name;
+    const email = userProfile?.email?.trim();
+    if (email) return email;
+    return 'Signed in with Apple';
+  }, [isAuthenticated, userProfile]);
 
   if (!fontsLoaded || !authReady || !onboardingReady) {
     return (
@@ -1882,9 +1935,15 @@ export default function App() {
               showPaywall={FEATURE_FLAGS.paywall}
               onPressPaywall={() => openPaywall()}
               showAuth={FEATURE_FLAGS.auth}
-              onPressAuth={() => {
-                Alert.alert('Sign in', 'Apple and Google sign-in will be enabled once the Apple Developer account is restored.');
-              }}
+              authSignedIn={isAuthenticated}
+              authLabel={accountLabel}
+              onPressAuth={
+                isAuthenticated
+                  ? undefined
+                  : () => {
+                      Alert.alert('Sign in', 'Apple and Google sign-in will be enabled once the Apple Developer account is restored.');
+                    }
+              }
             />
           ) : (
 	          <AppHeader
@@ -2071,12 +2130,18 @@ export default function App() {
               requestAnimationFrame(() => openPaywall());
             }}
             showAuth={FEATURE_FLAGS.auth}
-            onPressAuth={() => {
-              setMenuOpen(false);
-              requestAnimationFrame(() =>
-                Alert.alert('Sign in', 'Apple and Google sign-in will be enabled once the Apple Developer account is restored.'),
-              );
-            }}
+            authSignedIn={isAuthenticated}
+            authLabel={accountLabel}
+            onPressAuth={
+              isAuthenticated
+                ? undefined
+                : () => {
+                    setMenuOpen(false);
+                    requestAnimationFrame(() =>
+                      Alert.alert('Sign in', 'Apple and Google sign-in will be enabled once the Apple Developer account is restored.'),
+                    );
+                  }
+            }
           />
         )}
 
@@ -2212,6 +2277,8 @@ function Sidebar(props: {
   showPaywall?: boolean;
   onPressPaywall?: () => void;
   showAuth?: boolean;
+  authSignedIn?: boolean;
+  authLabel?: string;
   onPressAuth?: () => void;
 }) {
   const items: { key: RouteKey; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
@@ -2259,13 +2326,21 @@ function Sidebar(props: {
           <View style={styles.sidebarAccount}>
             <Text style={styles.sidebarFooterLabel}>Account</Text>
             <View style={styles.sidebarAccountActions}>
-              {props.showAuth && (
+              {props.showAuth && !props.authSignedIn && (
                 <Pressable
                   onPress={props.onPressAuth}
                   style={({ pressed }) => [styles.sidebarAccountButton, pressed && styles.pressed]}
                 >
                   <Text style={styles.sidebarAccountText}>Sign in</Text>
                 </Pressable>
+              )}
+              {props.showAuth && props.authSignedIn && (
+                <View style={styles.sidebarAccountStatus}>
+                  <Text style={styles.sidebarAccountText}>Signed in</Text>
+                  <Text style={styles.sidebarAccountSubtext} numberOfLines={1}>
+                    {props.authLabel || 'Signed in with Apple'}
+                  </Text>
+                </View>
               )}
               {props.showPaywall && (
                 <Pressable
@@ -2318,6 +2393,8 @@ function HamburgerMenu(props: {
   showPaywall?: boolean;
   onPressPaywall?: () => void;
   showAuth?: boolean;
+  authSignedIn?: boolean;
+  authLabel?: string;
   onPressAuth?: () => void;
 }) {
   const [scrollViewportHeight, setScrollViewportHeight] = useState(0);
@@ -2477,13 +2554,21 @@ function HamburgerMenu(props: {
                 <View style={styles.menuAccount}>
                   <Text style={styles.menuFooterLabel}>Account</Text>
                   <View style={styles.menuAccountActions}>
-                    {props.showAuth && (
+                    {props.showAuth && !props.authSignedIn && (
                       <Pressable
                         onPress={props.onPressAuth}
                         style={({ pressed }) => [styles.menuAccountButton, pressed && styles.pressed]}
                       >
                         <Text style={styles.menuAccountText}>Sign in</Text>
                       </Pressable>
+                    )}
+                    {props.showAuth && props.authSignedIn && (
+                      <View style={styles.menuAccountStatus}>
+                        <Text style={styles.menuAccountText}>Signed in</Text>
+                        <Text style={styles.menuAccountSubtext} numberOfLines={1}>
+                          {props.authLabel || 'Signed in with Apple'}
+                        </Text>
+                      </View>
                     )}
                     {props.showPaywall && (
                       <Pressable
@@ -5289,6 +5374,10 @@ const styles = StyleSheet.create({
     gap: 8,
     flexWrap: 'wrap',
   },
+  menuAccountStatus: {
+    gap: 2,
+    maxWidth: 220,
+  },
   menuAccountButton: {
     paddingHorizontal: 12,
     paddingVertical: 8,
@@ -5309,6 +5398,11 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontSize: 12,
     fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  menuAccountSubtext: {
+    color: COLORS.muted,
+    fontSize: 11,
+    fontFamily: FONT_SANS,
   },
   menuAccountTextPrimary: {
     color: COLORS.accentText,
@@ -6657,6 +6751,10 @@ const styles = StyleSheet.create({
     gap: 8,
     flexWrap: 'wrap',
   },
+  sidebarAccountStatus: {
+    gap: 2,
+    maxWidth: 200,
+  },
   sidebarAccountButton: {
     paddingHorizontal: 12,
     paddingVertical: 8,
@@ -6677,6 +6775,11 @@ const styles = StyleSheet.create({
     color: COLORS.text,
     fontSize: 12,
     fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  sidebarAccountSubtext: {
+    color: COLORS.muted,
+    fontSize: 11,
+    fontFamily: FONT_SANS,
   },
   sidebarAccountTextPrimary: {
     color: COLORS.accentText,
