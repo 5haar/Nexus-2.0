@@ -3,7 +3,6 @@ import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Haptics from 'expo-haptics';
 import * as MediaLibrary from 'expo-media-library';
-import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import { useFonts } from 'expo-font';
 import * as AppleAuthentication from 'expo-apple-authentication';
@@ -90,18 +89,7 @@ type ResolvedAsset = {
   asset: MediaLibrary.Asset;
 };
 
-type FileItem = {
-  id: string;
-  uri: string;
-  name: string;
-  size?: number | null;
-  mimeType?: string | null;
-  createdAt: number;
-};
-
-type UploadItem =
-  | ({ kind: 'asset' } & ResolvedAsset)
-  | ({ kind: 'file' } & FileItem);
+type UploadItem = { kind: 'asset' } & ResolvedAsset;
 
 const inferDevServerHost = () => {
   const scriptURL: string | undefined = (NativeModules as any)?.SourceCode?.scriptURL;
@@ -297,13 +285,6 @@ const isImageDoc = (doc: ServerDoc) => {
   return mime.startsWith('image/');
 };
 
-const formatFileSize = (bytes?: number | null) => {
-  if (!bytes) return 'Unknown size';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-};
-
 const toWsUrl = (base: string) => {
   const url = new URL(base);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -364,18 +345,6 @@ const inferImageContentType = (filename: string | null | undefined) => {
   if (name.endsWith('.heic') || name.endsWith('.heif')) return 'image/heic';
   if (name.endsWith('.webp')) return 'image/webp';
   return 'image/jpeg';
-};
-
-const inferDocContentType = (filename: string | null | undefined) => {
-  const name = String(filename ?? '').toLowerCase();
-  if (name.endsWith('.pdf')) return 'application/pdf';
-  if (name.endsWith('.md')) return 'text/markdown';
-  if (name.endsWith('.txt')) return 'text/plain';
-  if (name.endsWith('.rtf')) return 'application/rtf';
-  if (name.endsWith('.docx')) {
-    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-  }
-  return 'application/octet-stream';
 };
 
 const withTimeout = async <T,>(promise: Promise<T>, ms: number, message: string): Promise<T> => {
@@ -461,7 +430,6 @@ export default function App() {
   const [permission, setPermission] = useState<MediaLibrary.PermissionResponse | null>(null);
   const [loadingScreenshots, setLoadingScreenshots] = useState(false);
   const [screenshots, setScreenshots] = useState<ResolvedAsset[]>([]);
-  const [files, setFiles] = useState<FileItem[]>([]);
   const importAutoLoadAttemptedRef = useRef(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [assetStageById, setAssetStageById] = useState<Record<string, 'uploading' | 'indexing' | 'done' | 'error'>>(
@@ -521,7 +489,7 @@ export default function App() {
         return;
       }
       Linking.openURL(uri).catch(() => {
-        Alert.alert('Unable to open document', 'Please try again.');
+        Alert.alert('Unable to open screenshot', 'Please try again.');
       });
     },
     [apiBase],
@@ -795,38 +763,6 @@ export default function App() {
     importAutoLoadAttemptedRef.current = true;
     void loadScreenshots();
   }, [loadingScreenshots, permission, route, screenshots.length]);
-
-  const pickFiles = async () => {
-    try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: [
-          'application/pdf',
-          'text/plain',
-          'text/markdown',
-          'application/rtf',
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        ],
-        multiple: true,
-        copyToCacheDirectory: true,
-      });
-      if (result.canceled) return;
-      const nextItems = result.assets.map((asset) => ({
-        id: `file_${randomId()}`,
-        uri: asset.uri,
-        name: asset.name,
-        size: asset.size,
-        mimeType: asset.mimeType ?? null,
-        createdAt: Date.now(),
-      }));
-      setFiles((prev) => {
-        const existingUris = new Set(prev.map((f) => f.uri));
-        const deduped = nextItems.filter((f) => !existingUris.has(f.uri));
-        return [...deduped, ...prev];
-      });
-    } catch (err: any) {
-      showErrorToast(err?.message ?? 'Failed to pick files');
-    }
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -1168,7 +1104,7 @@ export default function App() {
       const data = await apiFetch<{ docs: ServerDoc[] }>(apiBase, userId, '/api/docs');
       setDocs(data.docs ?? []);
     } catch (err: any) {
-      handleApiError(err, 'Failed to load stored documents');
+      handleApiError(err, 'Failed to load stored screenshots');
     }
   };
 
@@ -1402,12 +1338,9 @@ export default function App() {
 
   const uploadItemToServer = async (item: UploadItem) => {
     if (!userId) throw new Error('Missing user id');
-    const uri = item.kind === 'asset' ? await ensureUploadUri(item) : item.uri;
-    const filename =
-      item.kind === 'asset'
-        ? item.filename || `${item.id}.jpg`
-        : item.name || `document-${item.id}.pdf`;
-    const contentType = item.kind === 'asset' ? inferImageContentType(filename) : item.mimeType || inferDocContentType(filename);
+    const uri = await ensureUploadUri(item);
+    const filename = item.filename || `${item.id}.jpg`;
+    const contentType = inferImageContentType(filename);
 
     const form = new FormData();
     form.append('file', {
@@ -1531,16 +1464,14 @@ export default function App() {
       return;
     }
     const assetTargets = screenshots.filter((s) => selected.has(s.id)).map((s) => ({ ...s, kind: 'asset' as const }));
-    const fileTargets = files.filter((f) => selected.has(f.id)).map((f) => ({ ...f, kind: 'file' as const }));
-    const targets = [...assetTargets, ...fileTargets];
-    enqueueImport(targets);
+    enqueueImport(assetTargets);
     setSelected(new Set());
   };
 
   const handleAsk = async () => {
     if (!chatInput.trim() || chatThinking) return;
     if (!chatScopeDocId && !chatScopeCategory) {
-      Alert.alert('Pick a category', 'Select a category (or open a document to chat about it) before asking.');
+        Alert.alert('Pick a category', 'Select a category (or open a screenshot to chat about it) before asking.');
       return;
     }
     if (!userId) {
@@ -1751,7 +1682,7 @@ export default function App() {
 	    } finally {
 	      setChatThinking(false);
 	      if (!assistantText) {
-        assistantText = 'No response (nothing indexed yet?). Go to Import and index some files first.';
+        assistantText = 'No response (nothing indexed yet?). Go to Import and index some screenshots first.';
 	        scheduleFlush();
 	        setAssistantStreaming(false);
 	      }
@@ -1990,10 +1921,8 @@ export default function App() {
               importProgress={importProgress}
               onLoadScreenshots={loadScreenshots}
               onPickLimitedPhotos={openLimitedLibraryPicker}
-              onPickFiles={pickFiles}
               onIndexSelected={handleSendToAI}
               screenshots={screenshots}
-              files={files}
               selected={selected}
               onToggleSelect={toggleSelect}
               assetStageById={assetStageById}
@@ -2061,7 +1990,7 @@ export default function App() {
                 try {
                   await deleteDoc(docId);
                 } catch (err: any) {
-                  handleApiError(err, 'Failed to delete document');
+                  handleApiError(err, 'Failed to delete screenshot');
                 }
               }}
               onDeleteDocs={async (docIds) => {
@@ -2077,7 +2006,7 @@ export default function App() {
                   }
                   await refreshDocs();
                 } catch (err: any) {
-                  handleApiError(err, 'Failed to delete documents');
+                  handleApiError(err, 'Failed to delete screenshots');
                   throw err;
                 }
               }}
@@ -2767,7 +2696,7 @@ function ChatScreen(props: {
                   }}
                   style={({ pressed }) => [styles.scopeRow, pressed && styles.pressed]}
                 >
-                  <Text style={styles.scopeRowText}>Clear document scope</Text>
+                  <Text style={styles.scopeRowText}>Clear screenshot scope</Text>
                   <Ionicons name="close" size={18} color={COLORS.text} />
                 </Pressable>
                 <View style={styles.scopeDivider} />
@@ -2873,8 +2802,8 @@ function ChatScreen(props: {
                                 <Image source={{ uri }} style={styles.sourceThumbImage} />
                               ) : (
                                 <View style={[styles.sourceThumbImage, styles.assetMissing]}>
-                                  <Ionicons name="document-text-outline" size={18} color={COLORS.muted} />
-                                  <Text style={styles.placeholderText}>Document</Text>
+                                  <Ionicons name="image-outline" size={18} color={COLORS.muted} />
+                                  <Text style={styles.placeholderText}>Screenshot</Text>
                                 </View>
                               )}
                             </Pressable>
@@ -2899,8 +2828,8 @@ function ChatScreen(props: {
               <Ionicons name="sparkles" size={18} color={COLORS.accentText} />
             </View>
             <Text style={styles.chatEmptyTitle}>Chat with your library</Text>
-            <Text style={styles.chatEmptySubtitle}>Ask questions and find what’s inside your screenshots and documents.</Text>
-            <Text style={styles.chatEmptyHint}>Tap + to import files, then index them.</Text>
+            <Text style={styles.chatEmptySubtitle}>Ask questions and find what’s inside your screenshots.</Text>
+            <Text style={styles.chatEmptyHint}>Tap + to import screenshots, then index them.</Text>
           </View>
         </Animated.View>
       )}
@@ -2938,7 +2867,7 @@ function ChatScreen(props: {
 
           <View style={styles.composerPill}>
             <TextInput
-              placeholder={props.scopeDocActive ? 'Ask about this document' : props.scopeCategory ? 'Ask about this category' : 'Select a category to chat'}
+              placeholder={props.scopeDocActive ? 'Ask about this screenshot' : props.scopeCategory ? 'Ask about this category' : 'Select a category to chat'}
               placeholderTextColor={COLORS.muted2}
               value={props.chatInput}
               onChangeText={props.onChangeChatInput}
@@ -2977,10 +2906,8 @@ function ImportScreen(props: {
   importProgress: { running: boolean; current: number; total: number; done: number; failed: number };
   onLoadScreenshots: () => void;
   onPickLimitedPhotos: () => void;
-  onPickFiles: () => void;
   onIndexSelected: () => void;
   screenshots: ResolvedAsset[];
-  files: FileItem[];
   selected: Set<string>;
   onToggleSelect: (id: string) => void;
   assetStageById: Record<string, 'uploading' | 'indexing' | 'done' | 'error'>;
@@ -2996,7 +2923,7 @@ function ImportScreen(props: {
         <View style={styles.pageHeader}>
           <View style={styles.pageHeaderText}>
             <Text style={styles.pageTitle}>Import Library</Text>
-            <Text style={styles.pageSubtitle}>Select screenshots or documents and index them to your server.</Text>
+            <Text style={styles.pageSubtitle}>Select screenshots and index them to your server.</Text>
           </View>
           <View style={styles.importActions}>
             <Pressable
@@ -3027,18 +2954,6 @@ function ImportScreen(props: {
                 </View>
               </Pressable>
             )}
-            <Pressable
-              onPress={props.onPickFiles}
-              style={({ pressed }) => [styles.importActionCard, pressed && styles.pressed]}
-            >
-              <View style={styles.importActionIcon}>
-                <Ionicons name="document-text-outline" size={18} color={COLORS.text} />
-              </View>
-              <View style={styles.importActionText}>
-                <Text style={styles.importActionTitle}>Documents</Text>
-                <Text style={styles.importActionSubtitle}>Pick PDFs or text</Text>
-              </View>
-            </Pressable>
           </View>
         </View>
 
@@ -3119,48 +3034,6 @@ function ImportScreen(props: {
           />
         )}
 
-        {props.files.length > 0 && (
-          <View style={styles.fileList}>
-            <Text style={styles.sectionTitle}>Files</Text>
-            {props.files.map((file) => {
-              const isSelected = props.selected.has(file.id);
-              const stage = props.assetStageById[file.id];
-              const errorMsg = props.assetErrorById?.[file.id] ?? '';
-              return (
-                <Pressable
-                  key={file.id}
-                  onPress={() => props.onToggleSelect(file.id)}
-                  onLongPress={() => {
-                    if (stage !== 'error') return;
-                    if (!errorMsg) return;
-                    props.onShowError(errorMsg);
-                  }}
-                  delayLongPress={220}
-                  style={({ pressed }) => [styles.fileRow, pressed && styles.pressed]}
-                >
-                  <View style={[styles.fileIcon, isSelected && styles.fileIconSelected]}>
-                    {isSelected ? (
-                      <Ionicons name="checkmark" size={16} color={COLORS.accentText} />
-                    ) : (
-                      <Ionicons name="document-text-outline" size={18} color={COLORS.muted} />
-                    )}
-                  </View>
-                  <View style={styles.fileMeta}>
-                    <Text style={styles.fileName} numberOfLines={1}>
-                      {file.name}
-                    </Text>
-                    <Text style={styles.fileDetail} numberOfLines={1}>
-                      {file.mimeType || 'Document'} • {formatFileSize(file.size)}
-                    </Text>
-                  </View>
-                  {stage === 'uploading' && <ActivityIndicator size="small" color={COLORS.muted} />}
-                  {stage === 'done' && <Ionicons name="checkmark-circle" size={18} color={COLORS.text} />}
-                  {stage === 'error' && <Ionicons name="alert-circle" size={18} color={COLORS.danger} />}
-                </Pressable>
-              );
-            })}
-          </View>
-        )}
       </ScrollView>
 
       {props.selectedCount > 0 && (
@@ -3483,8 +3356,8 @@ function CategoriesScreen(props: {
               <Image source={{ uri }} style={styles.mcMediaImage} />
             ) : (
               <View style={[styles.mcMediaImage, styles.assetMissing]}>
-                <Ionicons name="document-text-outline" size={20} color={COLORS.muted} />
-                <Text style={styles.placeholderText}>Document</Text>
+                <Ionicons name="image-outline" size={20} color={COLORS.muted} />
+                <Text style={styles.placeholderText}>Screenshot</Text>
               </View>
             )}
             <LinearGradient
@@ -3850,8 +3723,8 @@ function TutorialModal(props: { visible: boolean; onClose: () => void; onGoToImp
 function OnboardingScreen(props: { onDone: () => void }) {
   const steps = [
     {
-      title: 'Import screenshots + docs',
-      body: 'Bring in your screenshots, PDFs, and notes to index them.',
+      title: 'Import screenshots',
+      body: 'Bring in your screenshots to index them.',
       image: require('./assets/splash-icon.png'),
     },
     {
@@ -3861,7 +3734,7 @@ function OnboardingScreen(props: { onDone: () => void }) {
     },
     {
       title: 'Ask questions',
-      body: 'Chat with a category or a specific document.',
+      body: 'Chat with a category or a specific screenshot.',
       image: require('./assets/icon.png'),
     },
   ];
@@ -4201,7 +4074,7 @@ function DocumentsScreen(props: {
     if (selectedDocs.size === 0) return;
     Alert.alert(
       `Delete ${selectedDocs.size} item${selectedDocs.size === 1 ? '' : 's'}?`,
-      'This will permanently remove the files from the server.',
+      'This will permanently remove the screenshots from the server.',
       [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Delete', style: 'destructive', onPress: runDeleteSelected },
@@ -4266,8 +4139,8 @@ function DocumentsScreen(props: {
               <Image source={{ uri }} style={styles.mcMediaImage} />
             ) : (
               <View style={[styles.mcMediaImage, styles.assetMissing]}>
-                <Ionicons name="document-text-outline" size={22} color={COLORS.muted} />
-                <Text style={styles.placeholderText}>Document</Text>
+                <Ionicons name="image-outline" size={22} color={COLORS.muted} />
+                <Text style={styles.placeholderText}>Screenshot</Text>
               </View>
             )}
             <LinearGradient
@@ -4355,10 +4228,10 @@ function DocumentsScreen(props: {
         <View style={styles.mcEmptyWrap}>
           <Pressable onPress={props.onRefresh} style={({ pressed }) => [styles.mcEmptyCard, pressed && styles.mcDashedCardPressed]}>
             <View style={styles.mcDashedIcon}>
-              <Ionicons name="documents-outline" size={28} color={COLORS.muted} />
+              <Ionicons name="images-outline" size={28} color={COLORS.muted} />
             </View>
-              <Text style={styles.mcEmptyTitle}>No items yet</Text>
-              <Text style={styles.mcEmptySubtitle}>Import and index some files first.</Text>
+              <Text style={styles.mcEmptyTitle}>No screenshots yet</Text>
+              <Text style={styles.mcEmptySubtitle}>Import and index some screenshots first.</Text>
           </Pressable>
         </View>
       </View>
@@ -4372,7 +4245,7 @@ function DocumentsScreen(props: {
           <Ionicons name="search-outline" size={18} color={COLORS.muted} style={styles.mcSearchIcon} />
           <TextInput
             style={styles.mcSearchInput}
-            placeholder="Search documents..."
+            placeholder="Search screenshots..."
             placeholderTextColor={COLORS.muted}
             value={searchQuery}
             onChangeText={setSearchQuery}

@@ -47,7 +47,7 @@ type ScreenshotDoc = {
   s3Key?: string;
   originalName: string;
   fileMime: string;
-  mediaType: 'image' | 'video' | 'other' | 'document';
+  mediaType: 'image' | 'video' | 'other';
   caption: string;
   categories: string[];
   text: string;
@@ -120,9 +120,6 @@ const RAG_LEXICAL_WEIGHT = Number(process.env.RAG_LEXICAL_WEIGHT || 0.08);
 const RAG_MIN_HYBRID_SCORE = Number(process.env.RAG_MIN_HYBRID_SCORE || 0.19);
 const RAG_DOC_TEXT_MAX_CHARS = Number(process.env.RAG_DOC_TEXT_MAX_CHARS || 420);
 const RAG_DOC_CAPTION_MAX_CHARS = Number(process.env.RAG_DOC_CAPTION_MAX_CHARS || 120);
-const DOC_TEXT_ANALYSIS_MAX_CHARS = Number(process.env.DOC_TEXT_ANALYSIS_MAX_CHARS || 6000);
-const DOC_TEXT_EMBED_MAX_CHARS = Number(process.env.DOC_TEXT_EMBED_MAX_CHARS || 8000);
-const DOC_TEXT_STORE_MAX_CHARS = Number(process.env.DOC_TEXT_STORE_MAX_CHARS || 20000);
 const PAYWALL_ENFORCED = process.env.PAYWALL_ENFORCED !== '0';
 const PLAN_LIMITS = {
   free: { messagesPerDay: 5, uploadsTotal: 5 },
@@ -822,7 +819,7 @@ const listDocsFromDb = async (userId: string, opts?: { includeEmbedding?: boolea
     FROM docs d
     LEFT JOIN doc_categories dc ON dc.doc_id = d.id
     LEFT JOIN categories c ON c.id = dc.category_id
-    WHERE d.user_id = ?
+    WHERE d.user_id = ? AND d.media_type = 'image'
     GROUP BY d.id
     ORDER BY d.created_at DESC`,
     [userId],
@@ -890,7 +887,7 @@ const getDocByIdFromDb = async (userId: string, docId: string): Promise<Screensh
     FROM docs d
     LEFT JOIN doc_categories dc ON dc.doc_id = d.id
     LEFT JOIN categories c ON c.id = dc.category_id
-    WHERE d.user_id = ? AND d.id = ?
+    WHERE d.user_id = ? AND d.id = ? AND d.media_type = 'image'
     GROUP BY d.id
     LIMIT 1`,
     [userId, docId],
@@ -1105,21 +1102,23 @@ const deleteCategoryInDb = async (
 
 const listDocs = async (userId: string) => {
   if (mysqlPool) return await listDocsFromDb(userId, { includeEmbedding: false });
-  return db.docs.filter((d) => d.userId === userId);
+  return db.docs.filter((d) => d.userId === userId && d.mediaType === 'image');
 };
 
 const listSearchableDocs = async (userId: string) => {
   if (mysqlPool) {
     const docs = await listDocsFromDb(userId, { includeEmbedding: true });
-    // Exclude orphan documents (no categories) from search results
-    return docs.filter((d) => d.embedding.length && d.categories.length > 0);
+    // Exclude orphan screenshots (no categories) from search results
+    return docs.filter((d) => d.mediaType === 'image' && d.embedding.length && d.categories.length > 0);
   }
-  return db.docs.filter((d) => d.userId === userId && d.embedding.length && (d.categories?.length ?? 0) > 0);
+  return db.docs.filter(
+    (d) => d.userId === userId && d.mediaType === 'image' && d.embedding.length && (d.categories?.length ?? 0) > 0,
+  );
 };
 
 const getDocById = async (userId: string, docId: string): Promise<ScreenshotDoc | null> => {
   if (mysqlPool) return await getDocByIdFromDb(userId, docId);
-  const doc = db.docs.find((d) => d.userId === userId && d.id === docId);
+  const doc = db.docs.find((d) => d.userId === userId && d.id === docId && d.mediaType === 'image');
   return doc ?? null;
 };
 
@@ -1150,11 +1149,13 @@ const listUserCategories = async (userId: string) => {
   if (mysqlPool) {
     await ensureSchemaOnce();
     const [rows] = (await mysqlPool.execute(
-      `SELECT c.name AS name, COUNT(dc.doc_id) AS cnt
+      `SELECT c.name AS name, COUNT(d.id) AS cnt
        FROM categories c
        LEFT JOIN doc_categories dc ON dc.category_id = c.id
+       LEFT JOIN docs d ON d.id = dc.doc_id AND d.media_type = 'image'
        WHERE c.user_id=?
        GROUP BY c.id
+       HAVING cnt > 0
        ORDER BY cnt DESC, c.name ASC
        LIMIT ${limit}`,
       [userId],
@@ -1243,104 +1244,6 @@ const analyzeScreenshot = async (filePath: string, mime: string, existingCategor
   return JSON.parse(content) as Analysis;
 };
 
-let pdfParseLoader: Promise<any> | null = null;
-const loadPdfParse = async () => {
-  if (pdfParseLoader) return pdfParseLoader;
-  pdfParseLoader = import('pdf-parse')
-    .then((m) => m?.default ?? m)
-    .catch(() => null);
-  return pdfParseLoader;
-};
-
-let mammothLoader: Promise<any> | null = null;
-const loadMammoth = async () => {
-  if (mammothLoader) return mammothLoader;
-  mammothLoader = import('mammoth')
-    .then((m) => m?.default ?? m)
-    .catch(() => null);
-  return mammothLoader;
-};
-
-const extractTextFromPdf = async (filePath: string) => {
-  const parser = await loadPdfParse();
-  if (!parser) throw new Error('pdf-parse is not available');
-  const data = await parser(fs.readFileSync(filePath));
-  return String(data?.text ?? '').trim();
-};
-
-const extractTextFromDocx = async (filePath: string) => {
-  const mammoth = await loadMammoth();
-  if (!mammoth) throw new Error('mammoth is not available');
-  const result = await mammoth.extractRawText({ path: filePath });
-  return String(result?.value ?? '').trim();
-};
-
-const isTextDocMime = (mime: string) =>
-  mime.startsWith('text/') ||
-  mime === 'application/rtf' ||
-  mime === 'application/pdf' ||
-  mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-
-const analyzeDocumentText = async (
-  text: string,
-  filename: string,
-  existingCategories: string[],
-): Promise<Analysis> => {
-  if (!openai) throw new Error('Missing OPENAI_API_KEY');
-  const safeExisting = Array.from(new Set(existingCategories.map((c) => canonicalizeCategory(c)).filter(Boolean))).slice(
-    0,
-    Math.max(0, Math.min(200, MAX_EXISTING_CATEGORIES_CONTEXT)),
-  );
-  const snippet = String(text ?? '').slice(0, Math.max(0, DOC_TEXT_ANALYSIS_MAX_CHARS));
-  const response = await openai.chat.completions.create({
-    model: VISION_MODEL,
-    response_format: {
-      type: 'json_schema',
-      json_schema: {
-        name: 'DocumentAnalysis',
-        schema: {
-          type: 'object',
-          properties: {
-            caption: { type: 'string' },
-            existingCategories: { type: 'array', items: { type: 'string' } },
-            newCategories: { type: 'array', items: { type: 'string' } },
-            text: { type: 'array', items: { type: 'string' } },
-          },
-          required: ['caption', 'existingCategories', 'newCategories', 'text'],
-          additionalProperties: false,
-        },
-        strict: true,
-      },
-    },
-    messages: [
-      {
-        role: 'system',
-        content:
-          'You summarize documents and categorize them. Use the document text to pick a stable category.',
-      },
-      {
-        role: 'user',
-        content:
-          'Return JSON with caption, existingCategories, newCategories, text array.\n' +
-          'Rules:\n' +
-          '- Prefer the provided existing categories when a document fits.\n' +
-          '- Output exactly 1 category total.\n' +
-          '- If a provided category fits, set existingCategories to a 1-item array (picked verbatim) and set newCategories to an empty array.\n' +
-          '- If none fit, set existingCategories to an empty array and set newCategories to a 1-item array.\n' +
-          '- The chosen category should be stable and reusable (not overly specific).\n' +
-          '- Never include numbers, ids, timestamps, or list indices in categories.\n' +
-          `Filename: ${filename}\n` +
-          `Existing categories: ${JSON.stringify(safeExisting)}\n` +
-          `Document text:\n${snippet}`,
-      },
-    ],
-  });
-
-  const content = response.choices?.[0]?.message?.content;
-  if (!content) throw new Error('No analysis content returned');
-  return JSON.parse(content) as Analysis;
-};
-
 const embedText = async (text: string) => {
   if (!openai) throw new Error('Missing OPENAI_API_KEY');
   const result = await openai.embeddings.create({
@@ -1376,7 +1279,7 @@ const buildRetrievalContext = async (
   if (docId) {
     const doc = await getDocById(userId, docId);
     if (!doc) {
-      return { context: '', ranked: [] as { doc: ScreenshotDoc; score: number }[], reason: 'Document not found.' };
+      return { context: '', ranked: [] as { doc: ScreenshotDoc; score: number }[], reason: 'Screenshot not found.' };
     }
     const queryEmbedding = await embedText(query);
     const queryTokens = tokenize(query);
@@ -1986,11 +1889,10 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   let fileMime = req.file.mimetype || 'application/octet-stream';
   const ext = path.extname(originalName).toLowerCase();
   const inferMimeFromExt = (extension: string) => {
-    if (extension === '.pdf') return 'application/pdf';
-    if (extension === '.txt') return 'text/plain';
-    if (extension === '.md') return 'text/markdown';
-    if (extension === '.rtf') return 'application/rtf';
-    if (extension === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    if (extension === '.png') return 'image/png';
+    if (extension === '.jpg' || extension === '.jpeg') return 'image/jpeg';
+    if (extension === '.heic' || extension === '.heif') return 'image/heic';
+    if (extension === '.webp') return 'image/webp';
     return '';
   };
   if (fileMime === 'application/octet-stream') {
@@ -1999,7 +1901,6 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
   const isImage = fileMime.startsWith('image/');
   const isVideo = fileMime.startsWith('video/');
-  const isDoc = isTextDocMime(fileMime);
 
   if (isVideo) {
     try {
@@ -2010,13 +1911,13 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     return res.status(400).json({ error: 'Videos are not supported. Please upload screenshots (photos) only.' });
   }
 
-  if (!isImage && !isDoc) {
+  if (!isImage) {
     try {
       if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
     } catch {
       // ignore
     }
-    return res.status(400).json({ error: 'Only images, PDFs, and text documents are supported.' });
+    return res.status(400).json({ error: 'Only screenshots (images) are supported.' });
   }
 
   const uploadAllowance = await checkUploadAllowance(userId);
@@ -2032,85 +1933,37 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
     let doc: ScreenshotDoc;
 
-    if (isImage) {
-      const { filePath: usablePath, converted } = await convertImageToPng(req.file.path, fileMime);
-      const existingCategories = await listUserCategories(userId);
-      const analysis = await analyzeScreenshot(usablePath, converted ? 'image/png' : fileMime, existingCategories);
-      const combinedText = [analysis.caption, ...(analysis.text ?? [])].join('\n');
-      const embedding = await embedText(combinedText);
-      const id = randomId();
-      const existingSet = new Set(existingCategories.map((c) => canonicalizeCategory(c)).filter(Boolean));
-      const pickedExisting = (analysis.existingCategories ?? [])
-        .map((c) => canonicalizeCategory(c))
-        .filter((c) => !!c && existingSet.has(c));
-      const pickedNew = (analysis.newCategories ?? [])
-        .map((c) => canonicalizeCategory(c))
-        .filter((c) => !!c && !existingSet.has(c));
-      const chosen = pickedExisting[0] || pickedNew[0] || 'unsorted';
-      const categories = [chosen].slice(0, Math.max(1, Math.min(10, MAX_CATEGORIES_PER_DOC)));
+    const { filePath: usablePath, converted } = await convertImageToPng(req.file.path, fileMime);
+    const existingCategories = await listUserCategories(userId);
+    const analysis = await analyzeScreenshot(usablePath, converted ? 'image/png' : fileMime, existingCategories);
+    const combinedText = [analysis.caption, ...(analysis.text ?? [])].join('\n');
+    const embedding = await embedText(combinedText);
+    const id = randomId();
+    const existingSet = new Set(existingCategories.map((c) => canonicalizeCategory(c)).filter(Boolean));
+    const pickedExisting = (analysis.existingCategories ?? [])
+      .map((c) => canonicalizeCategory(c))
+      .filter((c) => !!c && existingSet.has(c));
+    const pickedNew = (analysis.newCategories ?? [])
+      .map((c) => canonicalizeCategory(c))
+      .filter((c) => !!c && !existingSet.has(c));
+    const chosen = pickedExisting[0] || pickedNew[0] || 'unsorted';
+    const categories = [chosen].slice(0, Math.max(1, Math.min(10, MAX_CATEGORIES_PER_DOC)));
 
-      doc = {
-        id,
-        userId,
-        filePath: usablePath,
-        originalName: converted
-          ? originalName.replace(/\.[^.]+$/i, '.png')
-          : originalName,
-        fileMime: converted ? 'image/png' : fileMime,
-        mediaType: 'image',
-        caption: analysis.caption || 'Screenshot',
-        categories,
-        text: (analysis.text ?? []).join(' '),
-        embedding,
-        createdAt,
-      };
-    } else {
-      const existingCategories = await listUserCategories(userId);
-      let extractedText = '';
-      try {
-        if (fileMime === 'application/pdf') {
-          extractedText = await extractTextFromPdf(req.file.path);
-        } else if (fileMime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
-          extractedText = await extractTextFromDocx(req.file.path);
-        } else if (fileMime.startsWith('text/') || fileMime === 'application/rtf') {
-          extractedText = fs.readFileSync(req.file.path, 'utf-8');
-        }
-      } catch (err) {
-        console.warn('Document text extraction failed', err);
-      }
-
-      const analysis = await analyzeDocumentText(extractedText, originalName, existingCategories);
-      const combinedText = [
-        analysis.caption,
-        ...(analysis.text ?? []),
-        extractedText.slice(0, Math.max(0, DOC_TEXT_EMBED_MAX_CHARS)),
-      ].join('\n');
-      const embedding = await embedText(combinedText);
-      const id = randomId();
-      const existingSet = new Set(existingCategories.map((c) => canonicalizeCategory(c)).filter(Boolean));
-      const pickedExisting = (analysis.existingCategories ?? [])
-        .map((c) => canonicalizeCategory(c))
-        .filter((c) => !!c && existingSet.has(c));
-      const pickedNew = (analysis.newCategories ?? [])
-        .map((c) => canonicalizeCategory(c))
-        .filter((c) => !!c && !existingSet.has(c));
-      const chosen = pickedExisting[0] || pickedNew[0] || 'unsorted';
-      const categories = [chosen].slice(0, Math.max(1, Math.min(10, MAX_CATEGORIES_PER_DOC)));
-
-      doc = {
-        id,
-        userId,
-        filePath: req.file.path,
-        originalName,
-        fileMime,
-        mediaType: 'document',
-        caption: analysis.caption || 'Document',
-        categories,
-        text: truncate(extractedText || analysis.text?.join(' ') || '', DOC_TEXT_STORE_MAX_CHARS),
-        embedding,
-        createdAt,
-      };
-    }
+    doc = {
+      id,
+      userId,
+      filePath: usablePath,
+      originalName: converted
+        ? originalName.replace(/\.[^.]+$/i, '.png')
+        : originalName,
+      fileMime: converted ? 'image/png' : fileMime,
+      mediaType: 'image',
+      caption: analysis.caption || 'Screenshot',
+      categories,
+      text: (analysis.text ?? []).join(' '),
+      embedding,
+      createdAt,
+    };
 
     doc.storage = 'local';
     if (s3 && S3_BUCKET && doc.filePath) {

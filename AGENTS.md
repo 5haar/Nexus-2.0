@@ -5,7 +5,7 @@ This repo is a small monorepo with:
 - `nexus/`: Expo (React Native) iOS app (single-screen-style app in one large `App.tsx`)
 - `server/`: Node/Express API + WebSocket (RAG + uploads), deployed to AWS Elastic Beanstalk/ALB
 
-Current product features include: Apple Sign In gate, paywall + IAP entitlements, screenshot + document uploads (PDF/TXT/RTF/DOCX), category or document scoped chat, and model selection.
+Current product features include: Apple Sign In gate, paywall + IAP entitlements, screenshot-only uploads, category or screenshot scoped chat, and model selection.
 
 Use this file as the source of truth for how to work safely and consistently in this codebase.
 
@@ -35,9 +35,9 @@ Use this file as the source of truth for how to work safely and consistently in 
   - `cd server && npm run build`
   - Commit both `server/src/server.ts` and `server/dist/server.js` together.
 - **Production iOS must not rely on insecure HTTP**. Avoid shipping with `NSAllowsArbitraryLoads` or `http://` URLs.
-- **Uploads are screenshots + documents only**. No videos.
-- **Category fan-out is capped per document** (default `MAX_CATEGORIES_PER_DOC=2`). Don’t reintroduce “category spam”.
-- **Chat scope is required**. Chat requires a category or a specific document (no “all screenshots” mode).
+- **Uploads are screenshots only**. No videos or documents.
+- **Category fan-out is capped per screenshot** (default `MAX_CATEGORIES_PER_DOC=2`). Don’t reintroduce “category spam”.
+- **Chat scope is required**. Chat requires a category or a specific screenshot (no “all screenshots” mode).
 
 ## Coding Style & Structure
 
@@ -102,7 +102,7 @@ Use this file as the source of truth for how to work safely and consistently in 
 - Server build: `cd server && npm run build`
 - Smoke test (optional but recommended):
   - Start server and confirm `GET /api/health`
-  - From app: Apple sign-in → Import screenshots/docs → Index → Chat with category/doc
+  - From app: Apple sign-in → Import screenshots → Index → Chat with category/screenshot
   - Trigger paywall and confirm upgrade modal shows
 
 ## Deployment Notes (AWS Elastic Beanstalk)
