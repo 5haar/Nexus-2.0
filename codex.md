@@ -32,3 +32,35 @@ If you want, I can start implementing any of the above right now. Pick one or mo
 2. Add auth scaffolding endpoints + user model.
 3. Add subscription/entitlement storage + gating hooks.
 4. Remove `NSAllowsArbitraryLoads` and tighten API base handling for production.
+
+---
+
+## Current State Snapshot (2025-02-14)
+
+App
+- Bundle ID: `com.ragobble.Nexus`
+- iOS build number: `4` (from `nexus/app.json`)
+- Production env (EAS `production` profile):
+  - `EXPO_PUBLIC_API_BASE_URL=https://nexus.ragobble.com`
+  - `EXPO_PUBLIC_CHAT_MODEL=gpt-5.2`
+  - `EXPO_PUBLIC_CHAT_MODELS=gpt-5.2,gpt-4.1,gpt-4o-mini`
+  - `EXPO_PUBLIC_ENABLE_PAYWALL=1`
+  - `EXPO_PUBLIC_ENABLE_AUTH=1`
+  - `EXPO_PUBLIC_REQUIRE_AUTH=1`
+  - `EXPO_PUBLIC_AUTH_DEBUG=0`
+  - `EXPO_PUBLIC_IAP_STARTER_PRODUCT_ID=com.ragobble.Nexus.lite_tier`
+  - `EXPO_PUBLIC_IAP_PRO_PRODUCT_ID=com.ragobble.Nexus.pro_tier`
+  - `EXPO_PUBLIC_IAP_MAX_PRODUCT_ID=com.ragobble.Nexus.max_tier`
+
+Server
+- Streaming chat uses WebSocket `/ws` and HTTP SSE `/api/search-stream`.
+- Uploads are image-only (screenshots) and stored locally or in S3.
+- Paywall enforced via `PAYWALL_ENFORCED` and usage counters (messages/day + total uploads).
+- IAP product IDs (server env):
+  - `IAP_PRODUCT_STARTER=com.ragobble.Nexus.lite_tier`
+  - `IAP_PRODUCT_PRO=com.ragobble.Nexus.pro_tier`
+  - `IAP_PRODUCT_MAX=com.ragobble.Nexus.max_tier`
+
+Handoff Notes
+- Pending EAS build IDs: none recorded.
+- Active feature flags: paywall + auth are enabled in production (see EAS env above).

@@ -164,7 +164,7 @@ const PAYWALL_PRODUCT_IDS = {
 const PAYWALL_PLANS = [
   {
     id: 'starter',
-    name: 'Starter',
+    name: 'Lite',
     price: '$5/mo',
     productId: PAYWALL_PRODUCT_IDS.starter,
     uploads: 100,
@@ -1049,11 +1049,7 @@ export default function App() {
         setPurchaseBusy(true);
         const requestFn = (RNIap as any).requestSubscription ?? (RNIap as any).requestPurchase;
         if (typeof requestFn !== 'function') throw new Error('Purchases are not available yet.');
-        try {
-          await requestFn({ sku: plan.productId });
-        } catch {
-          await requestFn(plan.productId);
-        }
+        await requestFn({ sku: plan.productId });
       } catch (err: any) {
         setPurchaseBusy(false);
         showErrorToast(err?.message ?? 'Purchase failed.');
