@@ -205,6 +205,7 @@ const PAYWALL_PLANS = [
 const IMPORT_PAGE_SIZE = 120;
 const IMPORT_MAX_ASSETS = 800;
 const REQUIRE_AUTH = process.env.EXPO_PUBLIC_REQUIRE_AUTH !== '0';
+const AUTH_DEBUG = process.env.EXPO_PUBLIC_AUTH_DEBUG === '1';
 const USER_ID_REGEX = /^[a-zA-Z0-9._-]{3,64}$/;
 
 const COLORS = {
@@ -377,6 +378,18 @@ const inferDocContentType = (filename: string | null | undefined) => {
   return 'application/octet-stream';
 };
 
+const withTimeout = async <T,>(promise: Promise<T>, ms: number, message: string): Promise<T> => {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+};
+
 const apiFetch = async <T,>(apiBase: string, userId: string, path: string, init?: RequestInit): Promise<T> => {
   let res: Response;
   try {
@@ -431,6 +444,8 @@ export default function App() {
   const [errorToastMessage, setErrorToastMessage] = useState('');
   const [errorToastVisible, setErrorToastVisible] = useState(false);
   const [errorToastUpgrade, setErrorToastUpgrade] = useState(false);
+  const [authDebugOpen, setAuthDebugOpen] = useState(false);
+  const [authDebugLines, setAuthDebugLines] = useState<string[]>([]);
   const [appleAvailable, setAppleAvailable] = useState(false);
   const [onboardingSeen, setOnboardingSeen] = useState(false);
   const [onboardingReady, setOnboardingReady] = useState(false);
@@ -482,6 +497,7 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const threadsRef = useRef<ChatThread[]>([]);
   const activeThreadIdRef = useRef('');
+  const authAttemptRef = useRef(0);
 
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
   const [viewerUri, setViewerUri] = useState<string | null>(null);
@@ -898,6 +914,18 @@ export default function App() {
     setErrorToastUpgrade(opts?.showUpgrade ?? false);
   }, []);
 
+  const startAuthDebug = useCallback(() => {
+    if (!AUTH_DEBUG) return;
+    setAuthDebugLines([]);
+    setAuthDebugOpen(true);
+  }, []);
+
+  const pushAuthDebug = useCallback((message: string) => {
+    if (!AUTH_DEBUG) return;
+    const stamp = new Date().toISOString().slice(11, 19);
+    setAuthDebugLines((prev) => [...prev, `${stamp} ${message}`]);
+  }, []);
+
   useEffect(() => {
     if (!errorToastVisible) return;
     const timer = setTimeout(() => {
@@ -1170,27 +1198,48 @@ export default function App() {
 
   const signInWithApple = async () => {
     if (authBusy) return;
+    const attemptId = authAttemptRef.current + 1;
+    authAttemptRef.current = attemptId;
+    const isCurrent = () => authAttemptRef.current === attemptId;
     setAuthBusy(true);
-    setAuthError(null);
+    startAuthDebug();
+    pushAuthDebug('Starting Apple sign-in');
     try {
-      const credential = await AppleAuthentication.signInAsync({
-        requestedScopes: [
-          AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
-          AppleAuthentication.AppleAuthenticationScope.EMAIL,
-        ],
-      });
-      if (!credential.identityToken) throw new Error('Missing identity token.');
-      const res = await fetch(`${apiBase}/api/auth/verify`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          provider: 'apple',
-          identityToken: credential.identityToken,
-          authorizationCode: credential.authorizationCode,
-          fullName: credential.fullName,
-          email: credential.email,
+      const credential = await withTimeout(
+        AppleAuthentication.signInAsync({
+          requestedScopes: [
+            AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+            AppleAuthentication.AppleAuthenticationScope.EMAIL,
+          ],
         }),
-      });
+        20000,
+        'Apple sign-in timed out. Please try again.',
+      );
+      if (!isCurrent()) return;
+      pushAuthDebug('Received Apple credential');
+      if (!credential.identityToken) throw new Error('Missing identity token.');
+      pushAuthDebug('Verifying with server');
+      const controller = new AbortController();
+      const verifyTimer = setTimeout(() => controller.abort(), 15000);
+      let res: Response;
+      try {
+        res = await fetch(`${apiBase}/api/auth/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider: 'apple',
+            identityToken: credential.identityToken,
+            authorizationCode: credential.authorizationCode,
+            fullName: credential.fullName,
+            email: credential.email,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(verifyTimer);
+      }
+      if (!isCurrent()) return;
+      pushAuthDebug(`Verify response ${res.status}`);
       if (!res.ok) {
         const detail = await res.text();
         try {
@@ -1209,11 +1258,16 @@ export default function App() {
       await AsyncStorage.setItem(AUTH_PROVIDER_STORAGE_KEY, 'apple');
       setAuthProvider('apple');
       setUserId(nextUserId);
+      pushAuthDebug('Sign-in complete');
     } catch (err: any) {
-      const message = String(err?.message ?? 'Sign in failed.').trim();
+      let message = String(err?.message ?? 'Sign in failed.').trim();
+      if (err?.name === 'AbortError') {
+        message = 'Sign in timed out while contacting the server.';
+      }
+      pushAuthDebug(`Error: ${message}`);
       showErrorToast(message);
     } finally {
-      setAuthBusy(false);
+      if (isCurrent()) setAuthBusy(false);
     }
   };
 
@@ -1756,6 +1810,8 @@ export default function App() {
             appleAvailable={appleAvailable}
             authBusy={authBusy}
             onSignIn={signInWithApple}
+            debugEnabled={AUTH_DEBUG}
+            onShowDebug={() => setAuthDebugOpen(true)}
           />
         </SafeAreaView>
       </SafeAreaProvider>
@@ -1804,6 +1860,14 @@ export default function App() {
               : undefined
           }
         />
+        {AUTH_DEBUG && (
+          <AuthDebugModal
+            visible={authDebugOpen}
+            lines={authDebugLines}
+            onClose={() => setAuthDebugOpen(false)}
+            onClear={() => setAuthDebugLines([])}
+          />
+        )}
 
       <View style={[styles.shell, !isWide && styles.shellMobile]}>
           {isWide ? (
@@ -3742,6 +3806,8 @@ function AuthScreen(props: {
   appleAvailable: boolean;
   authBusy: boolean;
   onSignIn: () => void;
+  debugEnabled?: boolean;
+  onShowDebug?: () => void;
 }) {
   return (
     <View style={styles.authScreen}>
@@ -3771,8 +3837,48 @@ function AuthScreen(props: {
           </View>
         )}
         {props.authBusy && <ActivityIndicator color={COLORS.text} />}
+        {props.debugEnabled && (
+          <Pressable
+            onPress={props.onShowDebug}
+            style={({ pressed }) => [styles.authDebugLink, pressed && styles.pressed]}
+          >
+            <Text style={styles.authDebugLinkText}>Show debug status</Text>
+          </Pressable>
+        )}
       </View>
     </View>
+  );
+}
+
+function AuthDebugModal(props: { visible: boolean; lines: string[]; onClose: () => void; onClear: () => void }) {
+  return (
+    <Modal visible={props.visible} transparent animationType="fade" onRequestClose={props.onClose}>
+      <View style={styles.debugBackdrop}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={props.onClose} />
+        <View style={styles.debugCard}>
+          <View style={styles.debugHeader}>
+            <Text style={styles.debugTitle}>Sign-in debug</Text>
+            <Pressable onPress={props.onClear} style={({ pressed }) => [styles.debugClear, pressed && styles.pressed]}>
+              <Text style={styles.debugClearText}>Clear</Text>
+            </Pressable>
+          </View>
+          <ScrollView style={styles.debugScroll} contentContainerStyle={styles.debugScrollContent}>
+            {props.lines.length === 0 ? (
+              <Text style={styles.debugEmpty}>No events yet.</Text>
+            ) : (
+              props.lines.map((line, idx) => (
+                <Text key={`${line}-${idx}`} style={styles.debugLine}>
+                  {line}
+                </Text>
+              ))
+            )}
+          </ScrollView>
+          <Pressable onPress={props.onClose} style={({ pressed }) => [styles.debugButton, pressed && styles.pressed]}>
+            <Text style={styles.debugButtonText}>Close</Text>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
   );
 }
 
@@ -4486,6 +4592,15 @@ const styles = StyleSheet.create({
     width: '100%',
     height: 44,
   },
+  authDebugLink: {
+    marginTop: 10,
+    paddingVertical: 6,
+  },
+  authDebugLinkText: {
+    color: COLORS.link,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
   onboardingScreen: {
     flex: 1,
     backgroundColor: COLORS.bg,
@@ -4768,6 +4883,76 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.surfaceAlt,
   },
   toastSecondaryText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  debugBackdrop: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    paddingHorizontal: 18,
+    paddingBottom: 24,
+    backgroundColor: 'rgba(0,0,0,0.28)',
+  },
+  debugCard: {
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    padding: 16,
+    maxHeight: '70%',
+    gap: 12,
+  },
+  debugHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 12,
+  },
+  debugTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  debugClear: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  debugClearText: {
+    color: COLORS.text,
+    fontSize: 11,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  debugScroll: {
+    maxHeight: 260,
+  },
+  debugScrollContent: {
+    gap: 6,
+  },
+  debugLine: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+  },
+  debugEmpty: {
+    color: COLORS.muted2,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+  },
+  debugButton: {
+    alignSelf: 'flex-end',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  debugButtonText: {
     color: COLORS.text,
     fontSize: 12,
     fontFamily: FONT_SANS_SEMIBOLD,

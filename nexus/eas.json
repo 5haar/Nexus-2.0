@@ -9,6 +9,7 @@
         "EXPO_PUBLIC_ENABLE_PAYWALL": "1",
         "EXPO_PUBLIC_ENABLE_AUTH": "1",
         "EXPO_PUBLIC_REQUIRE_AUTH": "1",
+        "EXPO_PUBLIC_AUTH_DEBUG": "1",
         "EXPO_PUBLIC_IAP_STARTER_PRODUCT_ID": "com.ragobble.Nexus.starter",
         "EXPO_PUBLIC_IAP_PRO_PRODUCT_ID": "com.ragobble.Nexus.pro",
         "EXPO_PUBLIC_IAP_MAX_PRODUCT_ID": "com.ragobble.Nexus.max"
