@@ -6,6 +6,7 @@ import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system';
 import { useFonts } from 'expo-font';
 import * as AppleAuthentication from 'expo-apple-authentication';
+import * as ImageManipulator from 'expo-image-manipulator';
 import * as RNIap from 'react-native-iap';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
@@ -342,9 +343,18 @@ const ensureUploadUri = async (item: ResolvedAsset) => {
 const inferImageContentType = (filename: string | null | undefined) => {
   const name = String(filename ?? '').toLowerCase();
   if (name.endsWith('.png')) return 'image/png';
-  if (name.endsWith('.heic') || name.endsWith('.heif')) return 'image/heic';
+  if (name.endsWith('.heic')) return 'image/heic';
+  if (name.endsWith('.heif')) return 'image/heif';
   if (name.endsWith('.webp')) return 'image/webp';
   return 'image/jpeg';
+};
+
+const transcodeToJpeg = async (uri: string) => {
+  const result = await ImageManipulator.manipulateAsync(uri, [], {
+    compress: 0.92,
+    format: ImageManipulator.SaveFormat.JPEG,
+  });
+  return result.uri;
 };
 
 const withTimeout = async <T,>(promise: Promise<T>, ms: number, message: string): Promise<T> => {
@@ -1334,9 +1344,22 @@ export default function App() {
 
   const uploadItemToServer = async (item: UploadItem) => {
     if (!userId) throw new Error('Missing user id');
-    const uri = await ensureUploadUri(item);
-    const filename = item.filename || `${item.id}.jpg`;
-    const contentType = inferImageContentType(filename);
+    let uri = await ensureUploadUri(item);
+    let filename = item.filename || `${item.id}.jpg`;
+    let contentType = inferImageContentType(filename);
+
+    if (contentType === 'image/heic' || contentType === 'image/heif') {
+      try {
+        uri = await transcodeToJpeg(uri);
+        const base = filename.replace(/\.[^.]+$/, '') || item.id;
+        filename = `${base}.jpg`;
+        contentType = 'image/jpeg';
+      } catch (err) {
+        throw new Error(
+          'HEIC screenshots are not supported by the server yet. In iOS Camera settings, switch Formats to "Most Compatible" or try again later.',
+        );
+      }
+    }
 
     const form = new FormData();
     form.append('file', {
