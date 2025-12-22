@@ -16,7 +16,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.ragobble.Nexus",
-      "buildNumber": "11",
+      "buildNumber": "13",
       "usesAppleSignIn": true,
       "infoPlist": {
         "NSPhotoLibraryUsageDescription": "We need access to your photo library to import screenshots for AI categorization.",
