@@ -5,7 +5,7 @@ This repo is a small monorepo with:
 - `nexus/`: Expo (React Native) iOS app (single-screen-style app in one large `App.tsx`)
 - `server/`: Node/Express API + WebSocket (RAG + uploads), deployed to AWS Elastic Beanstalk/ALB
 
-Current product features include: Apple Sign In gate, paywall + IAP entitlements, screenshot-only uploads, category or screenshot scoped chat, and model selection.
+Current product features include: Apple Sign In gate, Google Sign In for Drive Chat, paywall + IAP entitlements, screenshot-only uploads, category or screenshot scoped chat, Drive folder chat with citations, and model selection.
 
 Use this file as the source of truth for how to work safely and consistently in this codebase.
 
@@ -26,7 +26,7 @@ Use this file as the source of truth for how to work safely and consistently in 
 - Set API base:
   - Dev: use the in-app “API base URL” setting (or `EXPO_PUBLIC_API_BASE_URL`).
   - Prod: `EXPO_PUBLIC_API_BASE_URL=https://nexus.ragobble.com` (and WebSocket becomes `wss://` automatically).
-- IAP requires a native build (TestFlight or dev client). It will not work in Expo Go.
+- IAP and Google Sign In require a native build (TestFlight or dev client). They will not work in Expo Go.
 
 ## Repo Invariants (Don’t Break These)
 
@@ -38,6 +38,11 @@ Use this file as the source of truth for how to work safely and consistently in 
 - **Uploads are screenshots only**. No videos or documents.
 - **Category fan-out is capped per screenshot** (default `MAX_CATEGORIES_PER_DOC=2`). Don’t reintroduce “category spam”.
 - **Chat scope is required**. Chat requires a category or a specific screenshot (no “all screenshots” mode).
+- **Drive Chat is a separate scope**. Do not mix Drive chat with screenshot chat.
+- **Drive ingestion is folder-only**. Drive links must resolve to a folder (not a file) and should allow drilling into subfolders.
+- **Drive files are limited and typed**. Max 50 files per query; allow Google Docs, PDFs, and plain text only.
+- **Drive chat is on-demand**. Do not store Drive chat threads; refresh on each app launch.
+- **Sign-in is exclusive**. Users sign in with Apple or Google, not both at once.
 
 ## Coding Style & Structure
 
@@ -69,6 +74,7 @@ Use this file as the source of truth for how to work safely and consistently in 
 - `EXPO_PUBLIC_ENABLE_PAYWALL`, `EXPO_PUBLIC_ENABLE_AUTH`, `EXPO_PUBLIC_REQUIRE_AUTH`
 - `EXPO_PUBLIC_IAP_STARTER_PRODUCT_ID`, `EXPO_PUBLIC_IAP_PRO_PRODUCT_ID`, `EXPO_PUBLIC_IAP_MAX_PRODUCT_ID`
 - `EXPO_PUBLIC_AUTH_DEBUG` (debug sign-in UI; set to `0` for production)
+- `EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID` (Google OAuth for iOS)
 
 **Server**
 - `OPENAI_API_KEY`
@@ -83,12 +89,15 @@ Use this file as the source of truth for how to work safely and consistently in 
 - Bundle ID: `com.ragobble.Nexus` in `nexus/app.json`
 - Increment `expo.ios.buildNumber` for every TestFlight submission.
 - IAP requires a native build on a physical device (Expo Go does not support StoreKit).
+- Keep the app scheme aligned with the Google reversed client ID when changing the Google iOS client ID.
 
 ## Server API Notes
 
 - Apple auth verification: `POST /api/auth/verify`
+- Google auth verification: `POST /api/auth/verify` with `provider: "google"` and access token
 - Paywall enforcement: `PAYWALL_ENFORCED` + entitlements in `entitlements` table
 - IAP receipt verification: `POST /api/iap/verify`
+- Drive: `POST /api/drive/resolve-link`, `GET /api/drive/folders/:id`, WS `drive_search`
 
 ## Inter-Agent Context & Handoff
 
@@ -103,6 +112,7 @@ Use this file as the source of truth for how to work safely and consistently in 
 - Smoke test (optional but recommended):
   - Start server and confirm `GET /api/health`
   - From app: Apple sign-in → Import screenshots → Index → Chat with category/screenshot
+  - From app: Google sign-in → Drive Chat → Resolve folder link → Ask a question and open citations
   - Trigger paywall and confirm upgrade modal shows
 
 ## Deployment Notes (AWS Elastic Beanstalk)
