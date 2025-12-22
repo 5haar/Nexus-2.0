@@ -413,9 +413,6 @@ export default function App() {
   const bootOpacity = useRef(new Animated.Value(1)).current;
 
   const [apiBase, setApiBase] = useState(() => resolveApiBase(DEFAULT_API_BASE));
-  const [apiModalOpen, setApiModalOpen] = useState(false);
-  const [apiDraft, setApiDraft] = useState('');
-  const apiInputRef = useRef<TextInput | null>(null);
   const [userId, setUserId] = useState('');
   const [authProvider, setAuthProvider] = useState('');
   const [authReady, setAuthReady] = useState(false);
@@ -806,28 +803,6 @@ export default function App() {
       cancelled = true;
     };
   }, []);
-
-  const openApiModal = () => {
-    setApiDraft(apiBase);
-    setApiModalOpen(true);
-  };
-
-  useEffect(() => {
-    if (!apiModalOpen) return;
-    const t = setTimeout(() => apiInputRef.current?.focus(), 50);
-    return () => clearTimeout(t);
-  }, [apiModalOpen]);
-
-  const saveApiBase = async () => {
-    const next = normalizeApiBase(apiDraft);
-    if (!next) {
-      Alert.alert('Invalid URL', 'Please enter a valid API base URL.');
-      return;
-    }
-    setApiBase(next);
-    await AsyncStorage.setItem(API_BASE_STORAGE_KEY, next);
-    setApiModalOpen(false);
-  };
 
   const saveChatModel = async (next: string) => {
     const trimmed = next.trim();
@@ -1875,13 +1850,11 @@ export default function App() {
       <View style={[styles.shell, !isWide && styles.shellMobile]}>
           {isWide ? (
             <Sidebar
-              apiBase={apiBase}
               route={route}
               onNavigate={(next) => {
                 setRoute(next);
                 setMenuOpen(false);
               }}
-              onPressApi={openApiModal}
               showPaywall={FEATURE_FLAGS.paywall}
               onPressPaywall={() => openPaywall()}
               showAuth={FEATURE_FLAGS.auth}
@@ -2042,7 +2015,6 @@ export default function App() {
 
 	      {!isWide && (
 	        <HamburgerMenu
-	          apiBase={apiBase}
 	          visible={menuOpen}
 	          route={route}
 	          threads={threads}
@@ -2067,10 +2039,6 @@ export default function App() {
 	          }}
             onRenameThread={async (threadId, nextTitle) => {
               await renameThreadById(threadId, nextTitle);
-            }}
-            onPressApi={() => {
-              setMenuOpen(false);
-              requestAnimationFrame(openApiModal);
             }}
             showPaywall={FEATURE_FLAGS.paywall}
             onPressPaywall={() => {
@@ -2127,36 +2095,6 @@ export default function App() {
         </Animated.View>
       )}
 
-      <Modal visible={apiModalOpen} transparent animationType="fade" onRequestClose={() => setApiModalOpen(false)}>
-        <View style={styles.renameBackdrop}>
-          <Pressable style={StyleSheet.absoluteFill} onPress={() => setApiModalOpen(false)} />
-          <View style={styles.renameCard}>
-            <Text style={styles.renameTitle}>API base URL</Text>
-            <TextInput
-              ref={apiInputRef}
-              value={apiDraft}
-              onChangeText={setApiDraft}
-              placeholder="http://192.168.0.5:4000"
-              placeholderTextColor={COLORS.muted2}
-              autoCapitalize="none"
-              autoCorrect={false}
-              autoFocus
-              style={styles.renameInput}
-            />
-            <View style={styles.renameActions}>
-              <Pressable
-                onPress={() => setApiModalOpen(false)}
-                style={({ pressed }) => [styles.renameButton, pressed && styles.pressed]}
-              >
-                <Text style={styles.renameButtonText}>Cancel</Text>
-              </Pressable>
-              <Pressable onPress={saveApiBase} style={({ pressed }) => [styles.renameButtonPrimary, pressed && styles.pressed]}>
-                <Text style={styles.renameButtonPrimaryText}>Save</Text>
-              </Pressable>
-            </View>
-          </View>
-        </View>
-      </Modal>
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -2218,10 +2156,8 @@ function NewThreadIcon(props: { size?: number; color?: string }) {
 }
 
 function Sidebar(props: {
-  apiBase: string;
   route: RouteKey;
   onNavigate: (route: RouteKey) => void;
-  onPressApi?: () => void;
   showPaywall?: boolean;
   onPressPaywall?: () => void;
   showAuth?: boolean;
@@ -2301,12 +2237,6 @@ function Sidebar(props: {
             </View>
           </View>
         )}
-        <Text style={styles.sidebarFooterLabel}>API</Text>
-        <Pressable onPress={props.onPressApi} disabled={!props.onPressApi} style={({ pressed }) => pressed && styles.pressed}>
-          <Text style={styles.sidebarFooterValue} numberOfLines={2}>
-            {props.apiBase}
-          </Text>
-        </Pressable>
       </View>
     </View>
   );
@@ -2326,7 +2256,6 @@ function BrandMark(props: { size?: number }) {
 }
 
 function HamburgerMenu(props: {
-  apiBase: string;
   visible: boolean;
   route: RouteKey;
   onClose: () => void;
@@ -2337,7 +2266,6 @@ function HamburgerMenu(props: {
   onNewThread?: () => void | Promise<void>;
   onDeleteThread?: (threadId: string) => void | Promise<void>;
   onRenameThread?: (threadId: string, nextTitle: string) => void | Promise<void>;
-  onPressApi?: () => void;
   showPaywall?: boolean;
   onPressPaywall?: () => void;
   showAuth?: boolean;
@@ -2529,17 +2457,6 @@ function HamburgerMenu(props: {
                   </View>
                 </View>
               )}
-              <Text style={styles.menuFooterLabel}>API</Text>
-              <Pressable
-                onPress={props.onPressApi}
-                style={({ pressed }) => [styles.menuFooterButton, pressed && styles.pressed]}
-                hitSlop={10}
-              >
-                <Text style={styles.menuFooterValue} numberOfLines={2}>
-                  {props.apiBase}
-                </Text>
-                <Ionicons name="chevron-forward" size={16} color={COLORS.muted} />
-              </Pressable>
             </View>
           </View>
         </SafeAreaView>
@@ -3744,17 +3661,17 @@ function OnboardingScreen(props: { onDone: () => void }) {
     {
       title: 'Import screenshots',
       body: 'Bring in your screenshots to index them.',
-      image: require('./assets/splash-icon.png'),
+      image: require('./assets/Import.jpg'),
     },
     {
       title: 'Organize automatically',
       body: 'Nexus assigns a category so you can find things fast.',
-      image: require('./assets/nexus-logo.jpg'),
+      image: require('./assets/Categorize.jpg'),
     },
     {
       title: 'Ask questions',
       body: 'Chat with a category or a specific screenshot.',
-      image: require('./assets/icon.png'),
+      image: require('./assets/Chat.jpg'),
     },
   ];
   return (
@@ -3765,7 +3682,7 @@ function OnboardingScreen(props: { onDone: () => void }) {
         <View style={styles.onboardingSteps}>
           {steps.map((step) => (
             <View key={step.title} style={styles.onboardingCard}>
-              <Image source={step.image} style={styles.onboardingImage} resizeMode="contain" />
+              <Image source={step.image} style={styles.onboardingImage} resizeMode="cover" />
               <Text style={styles.onboardingCardTitle}>{step.title}</Text>
               <Text style={styles.onboardingCardBody}>{step.body}</Text>
             </View>
@@ -5258,7 +5175,6 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   menuAccount: {
-    paddingBottom: 12,
     gap: 8,
   },
   menuAccountActions: {
@@ -6635,7 +6551,6 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   sidebarAccount: {
-    paddingBottom: 12,
     gap: 8,
   },
   sidebarAccountActions: {
