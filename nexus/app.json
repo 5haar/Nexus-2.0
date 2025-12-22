@@ -2,6 +2,7 @@
   "expo": {
     "name": "nexus",
     "slug": "nexus",
+    "scheme": "com.googleusercontent.apps.400877626975-8pmgqvohk4i6ddmsmqidcskv4s7t2mh4",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",

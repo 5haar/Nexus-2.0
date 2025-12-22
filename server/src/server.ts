@@ -13,6 +13,7 @@ import mysql from 'mysql2/promise';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import pdfParse from 'pdf-parse';
 
 const USER_ID_REGEX = /^[a-zA-Z0-9._-]{3,64}$/;
 
@@ -21,6 +22,14 @@ const getUserIdFromHeader = (req: express.Request) => {
   if (!raw) return 'public';
   if (!USER_ID_REGEX.test(raw)) throw new Error('Invalid user id');
   return raw;
+};
+
+const getGoogleAccessTokenFromHeader = (req: express.Request) => {
+  const auth = String(req.header('authorization') ?? '').trim();
+  if (auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
+  return String(req.header('x-google-access-token') ?? '').trim();
 };
 
 const writeSse = (res: express.Response, data: unknown) => {
@@ -53,6 +62,15 @@ type ScreenshotDoc = {
   text: string;
   embedding: number[];
   createdAt: number;
+};
+
+type DriveFile = {
+  id: string;
+  name: string;
+  mimeType: string;
+  link?: string | null;
+  text: string;
+  embedding: number[];
 };
 
 type UserRecord = {
@@ -138,6 +156,15 @@ const IAP_PRODUCT_IDS = {
 } as const;
 const APPLE_IAP_VERIFY_URL = 'https://buy.itunes.apple.com/verifyReceipt';
 const APPLE_IAP_SANDBOX_URL = 'https://sandbox.itunes.apple.com/verifyReceipt';
+const GOOGLE_USERINFO_URL = 'https://openidconnect.googleapis.com/v1/userinfo';
+const GOOGLE_DRIVE_FILES_URL = 'https://www.googleapis.com/drive/v3/files';
+const DRIVE_FOLDER_MIME = 'application/vnd.google-apps.folder';
+const DRIVE_DOC_MIME = 'application/vnd.google-apps.document';
+const DRIVE_ALLOWED_MIME = new Set([DRIVE_DOC_MIME, 'application/pdf', 'text/plain']);
+const DRIVE_MAX_FILES_PER_QUERY = Number(process.env.DRIVE_MAX_FILES_PER_QUERY || 50);
+const DRIVE_FILE_MAX_BYTES = Number(process.env.DRIVE_FILE_MAX_BYTES || 10 * 1024 * 1024);
+const DRIVE_DOC_TEXT_MAX_CHARS = Number(process.env.DRIVE_DOC_TEXT_MAX_CHARS || 6000);
+const DRIVE_DOC_EXCERPT_MAX_CHARS = Number(process.env.DRIVE_DOC_EXCERPT_MAX_CHARS || 600);
 
 if (!OPENAI_API_KEY) {
   console.warn('OPENAI_API_KEY is not set. Vision and search will fail.');
@@ -161,6 +188,21 @@ const verifyAppleIdentityToken = async (token: string) => {
 };
 
 const buildAppleUserId = (sub: string) => `apple_${sub}`;
+const buildGoogleUserId = (sub: string) => `google_${sub}`;
+
+const verifyGoogleAccessToken = async (token: string) => {
+  const fetchFn = (globalThis as any).fetch;
+  if (!fetchFn) throw new Error('fetch is not available on this runtime');
+  const res = await fetchFn(GOOGLE_USERINFO_URL, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Google token invalid (${res.status})`);
+  return (await res.json()) as {
+    sub?: string;
+    email?: string;
+    name?: string;
+  };
+};
 
 const sanitizeModelName = (value: unknown) => {
   const text = String(value ?? '').trim();
@@ -714,6 +756,14 @@ const updateUserProfile = async (userId: string, updates: Partial<UserRecord>) =
   entry.displayName = updates.displayName ?? entry.displayName;
   entry.updatedAt = now;
   writeDB(db);
+};
+
+const requireGoogleUser = async (req: express.Request) => {
+  const userId = getUserIdFromHeader(req);
+  if (!userId.startsWith('google_')) throw new Error('Google sign-in required');
+  const user = await getUserRecord(userId);
+  if (user.provider && user.provider !== 'google') throw new Error('Google sign-in required');
+  return userId;
 };
 
 const buildPaywallPayload = (scope: 'messages' | 'uploads', used: number, limit: number | null, plan: string) => ({
@@ -1420,6 +1470,181 @@ const toPublicDoc = async (doc: ScreenshotDoc) => {
   return { ...rest, uri };
 };
 
+const driveFetch = async (token: string, url: string, init?: RequestInit) => {
+  const fetchFn = (globalThis as any).fetch;
+  if (!fetchFn) throw new Error('fetch is not available on this runtime');
+  const headers = new Headers(init?.headers ?? {});
+  headers.set('Authorization', `Bearer ${token}`);
+  return await fetchFn(url, { ...init, headers });
+};
+
+const driveFetchJson = async (token: string, url: string, init?: RequestInit) => {
+  const res = await driveFetch(token, url, init);
+  if (!res.ok) throw new Error(`Google Drive request failed (${res.status})`);
+  return await res.json();
+};
+
+const driveFetchText = async (token: string, url: string, init?: RequestInit) => {
+  const res = await driveFetch(token, url, init);
+  if (!res.ok) throw new Error(`Google Drive request failed (${res.status})`);
+  return await res.text();
+};
+
+const parseDriveIdFromLink = (link: string) => {
+  const raw = String(link ?? '').trim();
+  if (!raw) return '';
+  const patterns = [
+    /\/folders\/([a-zA-Z0-9_-]+)/,
+    /\/file\/d\/([a-zA-Z0-9_-]+)/,
+    /\/document\/d\/([a-zA-Z0-9_-]+)/,
+    /\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/,
+    /\/presentation\/d\/([a-zA-Z0-9_-]+)/,
+    /[?&]id=([a-zA-Z0-9_-]+)/,
+    /\/d\/([a-zA-Z0-9_-]+)/,
+  ];
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return '';
+};
+
+const getDriveFileMeta = async (token: string, fileId: string) => {
+  const params = new URLSearchParams({
+    fields: 'id,name,mimeType,parents,webViewLink',
+    supportsAllDrives: 'false',
+  });
+  return await driveFetchJson(token, `${GOOGLE_DRIVE_FILES_URL}/${fileId}?${params.toString()}`);
+};
+
+const listDriveChildren = async (token: string, folderId: string) => {
+  const params = new URLSearchParams({
+    q: `'${folderId}' in parents and trashed=false`,
+    pageSize: '200',
+    fields: 'files(id,name,mimeType,webViewLink,parents),nextPageToken',
+    supportsAllDrives: 'false',
+    includeItemsFromAllDrives: 'false',
+    corpora: 'user',
+  });
+  const data = await driveFetchJson(token, `${GOOGLE_DRIVE_FILES_URL}?${params.toString()}`);
+  return Array.isArray(data?.files) ? (data.files as any[]) : [];
+};
+
+const downloadDriveFile = async (token: string, fileId: string) => {
+  const params = new URLSearchParams({
+    alt: 'media',
+    supportsAllDrives: 'false',
+  });
+  const res = await driveFetch(token, `${GOOGLE_DRIVE_FILES_URL}/${fileId}?${params.toString()}`);
+  if (!res.ok) throw new Error(`Google Drive download failed (${res.status})`);
+  const length = Number(res.headers.get('content-length') ?? 0);
+  if (length && length > DRIVE_FILE_MAX_BYTES) throw new Error('Drive file too large');
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > DRIVE_FILE_MAX_BYTES) throw new Error('Drive file too large');
+  return buf;
+};
+
+const fetchDriveFileText = async (token: string, file: { id: string; mimeType: string }) => {
+  if (file.mimeType === DRIVE_DOC_MIME) {
+    const params = new URLSearchParams({ mimeType: 'text/plain' });
+    return await driveFetchText(token, `${GOOGLE_DRIVE_FILES_URL}/${file.id}/export?${params.toString()}`);
+  }
+  if (file.mimeType === 'text/plain') {
+    const buf = await downloadDriveFile(token, file.id);
+    return buf.toString('utf-8');
+  }
+  if (file.mimeType === 'application/pdf') {
+    const buf = await downloadDriveFile(token, file.id);
+    const data = await pdfParse(buf);
+    return data?.text ?? '';
+  }
+  return '';
+};
+
+const buildDriveRetrievalContext = async (
+  query: string,
+  folderId: string,
+  token: string,
+  topK: number,
+) => {
+  const requestedTopK = clampInt(topK, 1, RAG_TOPK_MAX);
+  const filesRaw = await listDriveChildren(token, folderId);
+  const files = filesRaw
+    .filter((f) => typeof f?.id === 'string' && typeof f?.mimeType === 'string')
+    .filter((f) => DRIVE_ALLOWED_MIME.has(String(f.mimeType)))
+    .slice(0, Math.max(1, DRIVE_MAX_FILES_PER_QUERY));
+
+  if (!files.length) {
+    return { context: '', ranked: [] as { doc: DriveFile; score: number }[], reason: 'No readable files found.' };
+  }
+
+  const docs: DriveFile[] = [];
+  for (const file of files) {
+    try {
+      const textRaw = await fetchDriveFileText(token, { id: String(file.id), mimeType: String(file.mimeType) });
+      const text = truncate(textRaw || '', DRIVE_DOC_TEXT_MAX_CHARS);
+      if (!text.trim()) continue;
+      docs.push({
+        id: String(file.id),
+        name: String(file.name ?? 'Untitled'),
+        mimeType: String(file.mimeType),
+        link: file.webViewLink ? String(file.webViewLink) : null,
+        text,
+        embedding: [],
+      });
+    } catch (err) {
+      console.warn('Drive text extraction failed', err);
+    }
+  }
+
+  if (!docs.length) {
+    return { context: '', ranked: [] as { doc: DriveFile; score: number }[], reason: 'No readable text found.' };
+  }
+
+  const openaiClient = requireOpenAI();
+  const input = [query, ...docs.map((d) => d.text)];
+  const embeddingResult = await openaiClient.embeddings.create({
+    model: EMBED_MODEL,
+    input,
+  });
+  const embeddings = embeddingResult.data?.map((d) => d.embedding) ?? [];
+  const queryEmbedding = embeddings[0] ?? [];
+  const docEmbeddings = embeddings.slice(1);
+  const queryTokens = tokenize(query);
+
+  const ranked = docs
+    .map((doc, index) => {
+      const embedding = docEmbeddings[index] ?? [];
+      const cosineScore = cosine(queryEmbedding, embedding);
+      const docTokens = tokenize(`${doc.name}\n${doc.text}`);
+      const overlap =
+        queryTokens.length === 0 ? 0 : queryTokens.filter((t) => docTokens.includes(t)).length / queryTokens.length;
+      const hybrid = cosineScore + RAG_LEXICAL_WEIGHT * overlap;
+      return { doc: { ...doc, embedding }, score: hybrid, cosine: cosineScore, overlap };
+    })
+    .filter((r) => r.cosine >= RAG_MIN_COSINE || r.overlap >= 0.34)
+    .filter((r) => r.score >= RAG_MIN_HYBRID_SCORE)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, requestedTopK);
+
+  if (!ranked.length) {
+    return {
+      context: '',
+      ranked: [] as { doc: DriveFile; score: number }[],
+      reason: 'No relevant files found for that question.',
+    };
+  }
+
+  const context = ranked
+    .map(({ doc, score, cosine, overlap }) => {
+      const text = truncate(doc.text, DRIVE_DOC_EXCERPT_MAX_CHARS);
+      return `score:${score.toFixed(3)} cos:${cosine.toFixed(3)} lex:${overlap.toFixed(2)} | file:${doc.name} | text:${text}`;
+    })
+    .join('\n');
+
+  return { context, ranked };
+};
+
 const deleteS3Object = async (key: string) => {
   if (!s3 || !S3_BUCKET) return;
   await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: key }));
@@ -1485,39 +1710,72 @@ app.post('/api/auth/prepare', async (req, res) => {
 
 app.post('/api/auth/verify', async (req, res) => {
   const provider = String((req.body as any)?.provider ?? '').trim().toLowerCase();
-  if (provider !== 'apple') {
-    return res.status(400).json({ error: 'Unsupported provider' });
+  if (provider === 'apple') {
+    const identityToken = String((req.body as any)?.identityToken ?? '').trim();
+    if (!identityToken) return res.status(400).json({ error: 'identityToken is required' });
+    try {
+      const payload = await verifyAppleIdentityToken(identityToken);
+      const sub = String(payload.sub ?? '').trim();
+      if (!sub) return res.status(400).json({ error: 'Invalid Apple token' });
+      const email = typeof payload.email === 'string' ? payload.email : undefined;
+      const fullName = (req.body as any)?.fullName as { givenName?: string; familyName?: string } | undefined;
+      const displayName = [fullName?.givenName, fullName?.familyName].filter(Boolean).join(' ').trim() || undefined;
+      const userId = buildAppleUserId(sub);
+      await updateUserProfile(userId, {
+        provider: 'apple',
+        providerSub: sub,
+        email,
+        displayName,
+      });
+      return res.json({
+        ok: true,
+        provider: 'apple',
+        userId,
+        user: {
+          id: userId,
+          email: email ?? null,
+          displayName: displayName ?? null,
+        },
+      });
+    } catch (err: any) {
+      console.error('Apple verify failed', err);
+      return res.status(401).json({ error: err?.message ?? 'Invalid Apple token' });
+    }
   }
-  const identityToken = String((req.body as any)?.identityToken ?? '').trim();
-  if (!identityToken) return res.status(400).json({ error: 'identityToken is required' });
-  try {
-    const payload = await verifyAppleIdentityToken(identityToken);
-    const sub = String(payload.sub ?? '').trim();
-    if (!sub) return res.status(400).json({ error: 'Invalid Apple token' });
-    const email = typeof payload.email === 'string' ? payload.email : undefined;
-    const fullName = (req.body as any)?.fullName as { givenName?: string; familyName?: string } | undefined;
-    const displayName = [fullName?.givenName, fullName?.familyName].filter(Boolean).join(' ').trim() || undefined;
-    const userId = buildAppleUserId(sub);
-    await updateUserProfile(userId, {
-      provider: 'apple',
-      providerSub: sub,
-      email,
-      displayName,
-    });
-    return res.json({
-      ok: true,
-      provider: 'apple',
-      userId,
-      user: {
-        id: userId,
-        email: email ?? null,
-        displayName: displayName ?? null,
-      },
-    });
-  } catch (err: any) {
-    console.error('Apple verify failed', err);
-    return res.status(401).json({ error: err?.message ?? 'Invalid Apple token' });
+
+  if (provider === 'google') {
+    const accessToken = String((req.body as any)?.accessToken ?? '').trim();
+    if (!accessToken) return res.status(400).json({ error: 'accessToken is required' });
+    try {
+      const payload = await verifyGoogleAccessToken(accessToken);
+      const sub = String(payload?.sub ?? '').trim();
+      if (!sub) return res.status(400).json({ error: 'Invalid Google token' });
+      const email = typeof payload.email === 'string' ? payload.email : undefined;
+      const displayName = typeof payload.name === 'string' ? payload.name : undefined;
+      const userId = buildGoogleUserId(sub);
+      await updateUserProfile(userId, {
+        provider: 'google',
+        providerSub: sub,
+        email,
+        displayName,
+      });
+      return res.json({
+        ok: true,
+        provider: 'google',
+        userId,
+        user: {
+          id: userId,
+          email: email ?? null,
+          displayName: displayName ?? null,
+        },
+      });
+    } catch (err: any) {
+      console.error('Google verify failed', err);
+      return res.status(401).json({ error: err?.message ?? 'Invalid Google token' });
+    }
   }
+
+  return res.status(400).json({ error: 'Unsupported provider' });
 });
 
 app.post('/api/auth/refresh', async (_req, res) => {
@@ -1626,6 +1884,85 @@ app.get('/api/me', async (req, res) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: err?.message ?? 'Failed to load profile' });
+  }
+});
+
+app.post('/api/drive/resolve-link', async (req, res) => {
+  let userId = '';
+  try {
+    userId = await requireGoogleUser(req);
+  } catch (err: any) {
+    return res.status(401).json({ error: err?.message ?? 'Google sign-in required' });
+  }
+  const token = getGoogleAccessTokenFromHeader(req);
+  if (!token) return res.status(401).json({ error: 'Google access token required' });
+  const link = String((req.body as any)?.link ?? '').trim();
+  if (!link) return res.status(400).json({ error: 'link is required' });
+
+  try {
+    const fileId = parseDriveIdFromLink(link);
+    if (!fileId) return res.status(400).json({ error: 'Invalid Google Drive link' });
+    const meta = await getDriveFileMeta(token, fileId);
+    const mimeType = String(meta?.mimeType ?? '');
+    if (mimeType !== DRIVE_FOLDER_MIME) {
+      return res.status(400).json({ error: 'Only Drive folder links are supported.' });
+    }
+    return res.json({
+      ok: true,
+      userId,
+      folder: { id: String(meta.id), name: String(meta.name ?? 'Folder') },
+    });
+  } catch (err: any) {
+    console.error('Drive resolve failed', err);
+    return res.status(400).json({ error: err?.message ?? 'Failed to resolve Drive link' });
+  }
+});
+
+app.get('/api/drive/folders/:id', async (req, res) => {
+  let userId = '';
+  try {
+    userId = await requireGoogleUser(req);
+  } catch (err: any) {
+    return res.status(401).json({ error: err?.message ?? 'Google sign-in required' });
+  }
+  const token = getGoogleAccessTokenFromHeader(req);
+  if (!token) return res.status(401).json({ error: 'Google access token required' });
+  const folderId = String(req.params.id ?? '').trim() || 'root';
+
+  try {
+    const folderMeta =
+      folderId === 'root'
+        ? { id: 'root', name: 'My Drive', mimeType: DRIVE_FOLDER_MIME }
+        : await getDriveFileMeta(token, folderId);
+    if (String(folderMeta?.mimeType ?? '') !== DRIVE_FOLDER_MIME) {
+      return res.status(400).json({ error: 'Not a folder' });
+    }
+
+    const children = await listDriveChildren(token, folderId);
+    const folders = children
+      .filter((item) => String(item?.mimeType ?? '') === DRIVE_FOLDER_MIME)
+      .map((item) => ({ id: String(item.id), name: String(item.name ?? 'Folder') }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const files = children
+      .filter((item) => DRIVE_ALLOWED_MIME.has(String(item?.mimeType ?? '')))
+      .map((item) => ({
+        id: String(item.id),
+        name: String(item.name ?? 'Untitled'),
+        mimeType: String(item.mimeType ?? ''),
+        link: item.webViewLink ? String(item.webViewLink) : null,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    return res.json({
+      ok: true,
+      userId,
+      folder: { id: String(folderMeta.id), name: String(folderMeta.name ?? 'Folder') },
+      folders,
+      files,
+    });
+  } catch (err: any) {
+    console.error('Drive list failed', err);
+    return res.status(400).json({ error: err?.message ?? 'Failed to list Drive folder' });
   }
 });
 
@@ -2220,8 +2557,93 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (message?.type !== 'search') {
+    const type = message?.type;
+    if (type !== 'search' && type !== 'drive_search') {
       wsSend(ws, { type: 'error', message: 'Unknown message type' });
+      return;
+    }
+
+    if (type === 'drive_search') {
+      const query = typeof message?.query === 'string' ? message.query.trim() : '';
+      const folderId = typeof message?.folderId === 'string' ? message.folderId.trim() : '';
+      const topK = typeof message?.topK === 'number' ? message.topK : 5;
+      const accessToken =
+        typeof message?.accessToken === 'string' ? message.accessToken.trim() : '';
+      const model = resolveChatModel(message?.model);
+      const userIdRaw = typeof message?.userId === 'string' ? message.userId.trim() : '';
+      const userId = userIdRaw && USER_ID_REGEX.test(userIdRaw) ? userIdRaw : '';
+      if (!query) {
+        wsSend(ws, { type: 'error', message: 'query is required' });
+        return;
+      }
+      if (!folderId) {
+        wsSend(ws, { type: 'error', message: 'folderId is required' });
+        return;
+      }
+      if (!accessToken) {
+        wsSend(ws, { type: 'error', message: 'Google access token required', code: 'DRIVE_AUTH_REQUIRED' });
+        return;
+      }
+      if (!userId.startsWith('google_')) {
+        wsSend(ws, { type: 'error', message: 'Google sign-in required', code: 'DRIVE_AUTH_REQUIRED' });
+        return;
+      }
+
+      abortActive();
+      activeController = new AbortController();
+
+      try {
+        const { context, ranked, reason } = await buildDriveRetrievalContext(query, folderId, accessToken, topK);
+        if (!ranked.length) {
+          wsSend(ws, { type: 'info', message: reason || 'No readable files found.' });
+          wsSend(ws, { type: 'done' });
+          return;
+        }
+
+        const matches = ranked.map(({ doc, score }) => ({
+          id: doc.id,
+          name: doc.name,
+          link: doc.link ?? null,
+          score,
+        }));
+        wsSend(ws, { type: 'matches', matches });
+
+        const openaiClient = requireOpenAI();
+        const stream = await openaiClient.chat.completions.create(
+          {
+            model,
+            stream: true,
+            messages: [
+              {
+                role: 'system',
+                content:
+                  'You answer questions using the provided Google Drive context. If the context is insufficient, say so. Be concise.',
+              },
+              { role: 'user', content: `Context:\n${context}\n\nQuestion: ${query}` },
+            ],
+          },
+          { signal: activeController.signal },
+        );
+
+        for await (const part of stream) {
+          const deltaContent = part.choices?.[0]?.delta?.content;
+          if (typeof deltaContent !== 'string' || !deltaContent) continue;
+          wsSend(ws, { type: 'chunk', text: deltaContent });
+        }
+
+        wsSend(ws, { type: 'done' });
+      } catch (err: any) {
+        const messageText = err?.message ?? 'Drive search failed';
+        const isAbort =
+          activeController?.signal.aborted ||
+          err?.name === 'AbortError' ||
+          (typeof messageText === 'string' && /aborted|abort/i.test(messageText));
+        if (!isAbort) {
+          wsSend(ws, { type: 'error', message: messageText });
+        }
+      } finally {
+        activeController = null;
+      }
       return;
     }
 

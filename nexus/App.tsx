@@ -6,6 +6,8 @@ import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system';
 import { useFonts } from 'expo-font';
 import * as AppleAuthentication from 'expo-apple-authentication';
+import * as AuthSession from 'expo-auth-session';
+import * as WebBrowser from 'expo-web-browser';
 import * as ImageManipulator from 'expo-image-manipulator';
 import * as RNIap from 'react-native-iap';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -48,6 +50,8 @@ import {
   PlusJakartaSans_800ExtraBold,
 } from '@expo-google-fonts/plus-jakarta-sans';
 
+WebBrowser.maybeCompleteAuthSession();
+
 type ServerDoc = {
   id: string;
   caption: string;
@@ -61,6 +65,19 @@ type ServerDoc = {
   originalName?: string;
 };
 
+type DriveFolder = {
+  id: string;
+  name: string;
+};
+
+type DriveFile = {
+  id: string;
+  name: string;
+  mimeType?: string;
+  link?: string | null;
+  score?: number;
+};
+
 type CategorySummary = { name: string; count: number; updatedAt: number };
 
 type ChatEntry = {
@@ -71,6 +88,14 @@ type ChatEntry = {
   sources?: ServerDoc[];
 };
 
+type DriveChatEntry = {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  streaming?: boolean;
+  sources?: DriveFile[];
+};
+
 type ChatThread = {
   id: string;
   title: string;
@@ -79,7 +104,7 @@ type ChatThread = {
   messages: ChatEntry[]; // newest-first (same order as chatHistory)
 };
 
-type RouteKey = 'chat' | 'import' | 'categories' | 'documents';
+type RouteKey = 'chat' | 'import' | 'categories' | 'documents' | 'drive';
 
 type ResolvedAsset = {
   id: string;
@@ -137,6 +162,14 @@ const resolveApiBase = (configured: string) => {
 
 const DEFAULT_API_BASE = process.env.EXPO_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
 const DEFAULT_CHAT_MODEL = process.env.EXPO_PUBLIC_CHAT_MODEL ?? 'gpt-5.2';
+const GOOGLE_IOS_CLIENT_ID = process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID ?? '';
+const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+const GOOGLE_IOS_SCHEME = GOOGLE_IOS_CLIENT_ID
+  ? `com.googleusercontent.apps.${GOOGLE_IOS_CLIENT_ID.split('.apps.googleusercontent.com')[0]}`
+  : '';
+const GOOGLE_REDIRECT_URI = GOOGLE_IOS_SCHEME
+  ? `${GOOGLE_IOS_SCHEME}:/oauthredirect`
+  : AuthSession.makeRedirectUri({ scheme: 'nexus' });
 const API_BASE_STORAGE_KEY = 'nexus.apiBase';
 const CHAT_MODEL_STORAGE_KEY = 'nexus.chatModel';
 const USER_ID_STORAGE_KEY = 'nexus.userId';
@@ -409,6 +442,17 @@ export default function App() {
     PlusJakartaSans_700Bold,
     PlusJakartaSans_800ExtraBold,
   });
+  const googleDiscovery = AuthSession.useAutoDiscovery('https://accounts.google.com');
+  const [googleRequest, , promptGoogleAsync] = AuthSession.useAuthRequest(
+    {
+      clientId: GOOGLE_IOS_CLIENT_ID,
+      scopes: ['openid', 'profile', 'email', GOOGLE_DRIVE_SCOPE],
+      redirectUri: GOOGLE_REDIRECT_URI,
+      responseType: AuthSession.ResponseType.Code,
+      usePKCE: true,
+    },
+    googleDiscovery,
+  );
 
   const [bootSplashVisible, setBootSplashVisible] = useState(true);
   const bootOpacity = useRef(new Animated.Value(1)).current;
@@ -424,6 +468,8 @@ export default function App() {
   const [authDebugOpen, setAuthDebugOpen] = useState(false);
   const [authDebugLines, setAuthDebugLines] = useState<string[]>([]);
   const [appleAvailable, setAppleAvailable] = useState(false);
+  const [googleAccessToken, setGoogleAccessToken] = useState('');
+  const [googleAccessTokenExpiresAt, setGoogleAccessTokenExpiresAt] = useState(0);
   const [onboardingSeen, setOnboardingSeen] = useState(false);
   const [onboardingReady, setOnboardingReady] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
@@ -457,6 +503,14 @@ export default function App() {
 
   const [docs, setDocs] = useState<ServerDoc[]>([]);
   const [userProfile, setUserProfile] = useState<{ email?: string | null; displayName?: string | null } | null>(null);
+  const [driveLinkInput, setDriveLinkInput] = useState('');
+  const [driveFolderStack, setDriveFolderStack] = useState<DriveFolder[]>([]);
+  const [driveFolders, setDriveFolders] = useState<DriveFolder[]>([]);
+  const [driveFiles, setDriveFiles] = useState<DriveFile[]>([]);
+  const [driveLoading, setDriveLoading] = useState(false);
+  const [driveChatInput, setDriveChatInput] = useState('');
+  const [driveChatHistory, setDriveChatHistory] = useState<DriveChatEntry[]>([]);
+  const [driveChatThinking, setDriveChatThinking] = useState(false);
 
   const [chatInput, setChatInput] = useState('');
   const [chatHistory, setChatHistory] = useState<ChatEntry[]>([]);
@@ -477,6 +531,7 @@ export default function App() {
   } | null>(null);
   const [purchaseBusy, setPurchaseBusy] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const driveWsRef = useRef<WebSocket | null>(null);
   const threadsRef = useRef<ChatThread[]>([]);
   const activeThreadIdRef = useRef('');
   const authAttemptRef = useRef(0);
@@ -768,6 +823,15 @@ export default function App() {
   }, [route, userId]);
 
   useEffect(() => {
+    if (route === 'drive') return;
+    setDriveFolderStack([]);
+    setDriveFolders([]);
+    setDriveFiles([]);
+    setDriveChatHistory([]);
+    setDriveChatInput('');
+  }, [route]);
+
+  useEffect(() => {
     if (route !== 'import') return;
     if (importAutoLoadAttemptedRef.current) return;
     if (screenshots.length) return;
@@ -887,6 +951,122 @@ export default function App() {
     [openPaywall, showErrorToast],
   );
 
+  const ensureDriveAccessToken = useCallback(() => {
+    if (!googleAccessToken) {
+      throw new Error('Connect Google Drive to continue.');
+    }
+    if (googleAccessTokenExpiresAt && Date.now() > googleAccessTokenExpiresAt - 60_000) {
+      throw new Error('Google Drive session expired. Please reconnect.');
+    }
+    return googleAccessToken;
+  }, [googleAccessToken, googleAccessTokenExpiresAt]);
+
+  const driveApiFetch = useCallback(
+    async <T,>(path: string, init?: RequestInit): Promise<T> => {
+      const token = ensureDriveAccessToken();
+      const headers = new Headers(init?.headers ?? {});
+      headers.set('Authorization', `Bearer ${token}`);
+      return await apiFetch<T>(apiBase, userId, path, { ...init, headers });
+    },
+    [apiBase, ensureDriveAccessToken, userId],
+  );
+
+  const loadDriveFolderData = useCallback(
+    async (folderId: string) => {
+      const data = await driveApiFetch<{
+        folder: DriveFolder;
+        folders: DriveFolder[];
+        files: DriveFile[];
+      }>(`/api/drive/folders/${encodeURIComponent(folderId)}`);
+      setDriveFolders(Array.isArray(data.folders) ? data.folders : []);
+      setDriveFiles(Array.isArray(data.files) ? data.files : []);
+      return data.folder;
+    },
+    [driveApiFetch],
+  );
+
+  const openDriveRoot = useCallback(async () => {
+    setDriveLoading(true);
+    try {
+      const folder = await loadDriveFolderData('root');
+      setDriveFolderStack([folder]);
+      setDriveChatHistory([]);
+    } catch (err: any) {
+      showErrorToast(err?.message ?? 'Failed to load Drive folder');
+    } finally {
+      setDriveLoading(false);
+    }
+  }, [loadDriveFolderData, showErrorToast]);
+
+  const openDriveFolder = useCallback(
+    async (folderId: string) => {
+      setDriveLoading(true);
+      try {
+        const folder = await loadDriveFolderData(folderId);
+        setDriveFolderStack((prev) => [...prev, folder]);
+        setDriveChatHistory([]);
+      } catch (err: any) {
+        showErrorToast(err?.message ?? 'Failed to load Drive folder');
+      } finally {
+        setDriveLoading(false);
+      }
+    },
+    [loadDriveFolderData, showErrorToast],
+  );
+
+  const handleDriveBack = useCallback(async () => {
+    if (driveFolderStack.length <= 1) {
+      setDriveFolderStack([]);
+      setDriveFolders([]);
+      setDriveFiles([]);
+      setDriveChatHistory([]);
+      return;
+    }
+    const nextStack = driveFolderStack.slice(0, -1);
+    const nextFolder = nextStack[nextStack.length - 1];
+    setDriveLoading(true);
+    try {
+      if (nextFolder) {
+        await loadDriveFolderData(nextFolder.id);
+        setDriveFolderStack(nextStack);
+        setDriveChatHistory([]);
+      }
+    } catch (err: any) {
+      showErrorToast(err?.message ?? 'Failed to load Drive folder');
+    } finally {
+      setDriveLoading(false);
+    }
+  }, [driveFolderStack, loadDriveFolderData, showErrorToast]);
+
+  const resolveDriveLink = useCallback(async () => {
+    const link = driveLinkInput.trim();
+    if (!link) return;
+    setDriveLoading(true);
+    try {
+      const data = await driveApiFetch<{ folder: DriveFolder }>(`/api/drive/resolve-link`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ link }),
+      });
+      const folder = data.folder;
+      if (!folder?.id) throw new Error('Folder not found');
+      await loadDriveFolderData(folder.id);
+      setDriveFolderStack([folder]);
+      setDriveChatHistory([
+        {
+          id: randomId(),
+          role: 'assistant',
+          text: `Drive folder loaded: ${folder.name}. Ask a question when you're ready.`,
+        },
+      ]);
+      setDriveLinkInput('');
+    } catch (err: any) {
+      showErrorToast(err?.message ?? 'Failed to resolve Drive link');
+    } finally {
+      setDriveLoading(false);
+    }
+  }, [driveApiFetch, driveLinkInput, loadDriveFolderData, showErrorToast]);
+
   const loadUserProfile = useCallback(async () => {
     if (!userId) {
       setUserProfile(null);
@@ -911,6 +1091,35 @@ export default function App() {
       if (AUTH_DEBUG) pushAuthDebug(`Profile load failed: ${String(err?.message ?? err)}`);
     }
   }, [apiBase, userId, pushAuthDebug]);
+
+  const signOut = useCallback(async () => {
+    try {
+      await AsyncStorage.removeItem(USER_ID_STORAGE_KEY);
+      await AsyncStorage.removeItem(AUTH_PROVIDER_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+    wsRef.current?.close();
+    driveWsRef.current?.close();
+    setUserId('');
+    setAuthProvider('');
+    setUserProfile(null);
+    setDocs([]);
+    setChatHistory([]);
+    setThreads([]);
+    setActiveThreadId('');
+    setChatScopeCategory('');
+    setChatScopeDocId('');
+    setGoogleAccessToken('');
+    setGoogleAccessTokenExpiresAt(0);
+    setDriveLinkInput('');
+    setDriveFolderStack([]);
+    setDriveFolders([]);
+    setDriveFiles([]);
+    setDriveChatHistory([]);
+    setDriveChatInput('');
+    setDriveChatThinking(false);
+  }, []);
 
   const iapProductIds = useMemo(() => PAYWALL_PLANS.map((plan) => plan.productId).filter(Boolean), []);
 
@@ -1110,6 +1319,18 @@ export default function App() {
   }, [apiBase, userId]);
 
   useEffect(() => {
+    if (authProvider === 'google') return;
+    setGoogleAccessToken('');
+    setGoogleAccessTokenExpiresAt(0);
+    setDriveFolderStack([]);
+    setDriveFolders([]);
+    setDriveFiles([]);
+    setDriveChatHistory([]);
+    setDriveChatInput('');
+    if (route === 'drive') setRoute('chat');
+  }, [authProvider, route]);
+
+  useEffect(() => {
     if (!userId) {
       setUserProfile(null);
       return;
@@ -1247,6 +1468,111 @@ export default function App() {
       if (isCurrent()) setAuthBusy(false);
     }
   };
+
+  const signInWithGoogle = async () => {
+    if (authBusy) return;
+    const attemptId = authAttemptRef.current + 1;
+    authAttemptRef.current = attemptId;
+    const isCurrent = () => authAttemptRef.current === attemptId;
+
+    if (!GOOGLE_IOS_CLIENT_ID) {
+      showErrorToast('Google sign-in is not configured.');
+      return;
+    }
+    if (!googleDiscovery || !googleRequest) {
+      showErrorToast('Google sign-in is not ready yet.');
+      return;
+    }
+
+    setAuthBusy(true);
+    startAuthDebug();
+    pushAuthDebug('Starting Google sign-in');
+    try {
+      const result = await promptGoogleAsync();
+      if (result.type !== 'success') {
+        if (result.type === 'dismiss') throw new Error('Google sign-in was dismissed.');
+        throw new Error('Google sign-in was cancelled.');
+      }
+      const code = String(result.params?.code ?? '').trim();
+      if (!code) throw new Error('Missing Google auth code.');
+
+      const tokenResult = await AuthSession.exchangeCodeAsync(
+        {
+          clientId: GOOGLE_IOS_CLIENT_ID,
+          code,
+          redirectUri: GOOGLE_REDIRECT_URI,
+          extraParams: {
+            code_verifier: googleRequest.codeVerifier ?? '',
+          },
+        },
+        googleDiscovery,
+      );
+      const accessToken = String(tokenResult.accessToken ?? '').trim();
+      if (!accessToken) throw new Error('Missing Google access token.');
+      const expiresIn = Number(tokenResult.expiresIn ?? 0);
+      setGoogleAccessToken(accessToken);
+      setGoogleAccessTokenExpiresAt(expiresIn ? Date.now() + expiresIn * 1000 : 0);
+
+      pushAuthDebug('Verifying with server');
+      const res = await fetch(`${apiBase}/api/auth/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'google',
+          accessToken,
+        }),
+      });
+      pushAuthDebug(`Verify response ${res.status}`);
+      if (!res.ok) {
+        const detail = await res.text();
+        try {
+          const parsed = JSON.parse(detail);
+          const msg = String(parsed?.error ?? parsed?.message ?? '').trim();
+          if (msg) throw new Error(msg);
+        } catch {
+          // ignore
+        }
+        throw new Error(detail || 'Google sign in failed.');
+      }
+      const data = (await res.json()) as {
+        userId?: string;
+        provider?: string;
+        user?: { email?: string | null; displayName?: string | null };
+      };
+      const nextUserId = String(data.userId ?? '').trim();
+      if (!nextUserId) throw new Error('Missing user id.');
+      await AsyncStorage.setItem(USER_ID_STORAGE_KEY, nextUserId);
+      await AsyncStorage.setItem(AUTH_PROVIDER_STORAGE_KEY, 'google');
+      setAuthProvider('google');
+      if (data.user) {
+        setUserProfile({
+          email: data.user?.email ?? null,
+          displayName: data.user?.displayName ?? null,
+        });
+      }
+      setUserId(nextUserId);
+      pushAuthDebug('Sign-in complete');
+    } catch (err: any) {
+      let message = String(err?.message ?? 'Google sign-in failed.').trim();
+      if (err?.name === 'AbortError') {
+        message = 'Google sign in timed out while contacting the server.';
+      }
+      pushAuthDebug(`Error: ${message}`);
+      showErrorToast(message);
+    } finally {
+      if (isCurrent()) setAuthBusy(false);
+    }
+  };
+
+  const openAuthPrompt = useCallback(() => {
+    const options = [];
+    if (appleAvailable) {
+      options.push({ text: 'Sign in with Apple', onPress: signInWithApple });
+    }
+    options.push({ text: 'Sign in with Google', onPress: signInWithGoogle });
+    options.push({ text: 'Cancel', style: 'cancel' });
+    Alert.alert('Sign in', 'Choose a provider', options as any);
+  }, [appleAvailable, signInWithApple, signInWithGoogle]);
 
   const loadScreenshots = async () => {
     if (loadingScreenshots) return;
@@ -1477,6 +1803,8 @@ export default function App() {
     setSelected(new Set());
   };
 
+  const driveActiveFolder = driveFolderStack.length ? driveFolderStack[driveFolderStack.length - 1] : null;
+
   const handleAsk = async () => {
     if (!chatInput.trim() || chatThinking) return;
     if (!chatScopeDocId && !chatScopeCategory) {
@@ -1701,6 +2029,166 @@ export default function App() {
 	    }
 	  };
 
+  const handleDriveAsk = async () => {
+    if (!driveChatInput.trim() || driveChatThinking) return;
+    if (!driveActiveFolder) {
+      Alert.alert('Select a folder', 'Choose a Google Drive folder before asking.');
+      return;
+    }
+    if (!googleAccessToken) {
+      Alert.alert('Connect Google Drive', 'Sign in with Google to access Drive.');
+      return;
+    }
+    const prompt = driveChatInput.trim();
+    setDriveChatInput('');
+    setDriveChatThinking(true);
+
+    const userEntry: DriveChatEntry = { id: randomId(), role: 'user', text: prompt };
+    const assistantId = randomId();
+    const assistantStub: DriveChatEntry = { id: assistantId, role: 'assistant', text: '', streaming: true };
+    setDriveChatHistory((prev) => [assistantStub, userEntry, ...prev]);
+
+    const updateAssistant = (text: string) => {
+      setDriveChatHistory((prev) => {
+        const existing = prev.find((e) => e.id === assistantId);
+        if (existing) return prev.map((e) => (e.id === assistantId ? { ...e, text } : e));
+        return [{ id: assistantId, role: 'assistant', text, streaming: true }, ...prev];
+      });
+    };
+
+    const setAssistantStreaming = (streaming: boolean) => {
+      setDriveChatHistory((prev) => prev.map((e) => (e.id === assistantId ? { ...e, streaming } : e)));
+    };
+
+    const setAssistantSources = (sources: DriveFile[]) => {
+      setDriveChatHistory((prev) => prev.map((e) => (e.id === assistantId ? { ...e, sources } : e)));
+    };
+
+    const dedupeSources = (docs: DriveFile[]) => {
+      const out: DriveFile[] = [];
+      const seen = new Set<string>();
+      for (const doc of docs) {
+        const idKey = String(doc.id || '');
+        if (idKey && seen.has(idKey)) continue;
+        if (idKey) seen.add(idKey);
+        out.push(doc);
+        if (out.length >= 8) break;
+      }
+      return out;
+    };
+
+    let assistantText = '';
+    let doneReceived = false;
+    let finished = false;
+    let flushScheduled = false;
+
+    const scheduleFlush = () => {
+      if (flushScheduled) return;
+      flushScheduled = true;
+      requestAnimationFrame(() => {
+        flushScheduled = false;
+        updateAssistant(assistantText);
+      });
+    };
+
+    const finishOnce = (fn: () => void) => {
+      if (finished) return;
+      finished = true;
+      fn();
+    };
+
+    try {
+      driveWsRef.current?.close();
+      const ws = new WebSocket(toWsUrl(apiBase));
+      driveWsRef.current = ws;
+
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.send(
+            JSON.stringify({
+              type: 'drive_search',
+              query: prompt,
+              folderId: driveActiveFolder.id,
+              accessToken: googleAccessToken,
+              userId,
+              model: chatModel,
+            }),
+          );
+        };
+
+        ws.onmessage = (evt) => {
+          let parsed: any;
+          try {
+            parsed = JSON.parse(String(evt.data));
+          } catch {
+            return;
+          }
+
+          if (parsed.type === 'matches') {
+            const matches = Array.isArray(parsed.matches) ? (parsed.matches as DriveFile[]) : [];
+            if (matches.length) setAssistantSources(dedupeSources(matches));
+            return;
+          }
+
+          if (parsed.type === 'info') {
+            const msg = String(parsed.message ?? '').trim();
+            if (msg) {
+              assistantText += (assistantText ? '\n' : '') + msg;
+              scheduleFlush();
+            }
+            return;
+          }
+
+          if (parsed.type === 'chunk') {
+            assistantText += parsed.text ?? '';
+            scheduleFlush();
+          } else if (parsed.type === 'done') {
+            doneReceived = true;
+            scheduleFlush();
+            finishOnce(() => {
+              setAssistantStreaming(false);
+              try {
+                ws.close();
+              } finally {
+                resolve();
+              }
+            });
+          } else if (parsed.type === 'error') {
+            if (parsed.code === 'DRIVE_AUTH_REQUIRED') {
+              showErrorToast('Google Drive access expired. Please sign in again.');
+            }
+            finishOnce(() => {
+              setAssistantStreaming(false);
+              try {
+                ws.close();
+              } finally {
+                reject(new Error(parsed.message ?? 'Stream error'));
+              }
+            });
+          }
+        };
+
+        ws.onerror = () => finishOnce(() => reject(new Error('WebSocket error')));
+        ws.onclose = () => {
+          if (finished) return;
+          if (doneReceived) finishOnce(() => resolve());
+          else finishOnce(() => reject(new Error('WebSocket closed')));
+        };
+      });
+    } catch (err: any) {
+      const message = err?.message ?? 'Failed to run Drive search';
+      showErrorToast(message, { showUpgrade: false });
+      setAssistantStreaming(false);
+    } finally {
+      setDriveChatThinking(false);
+      if (!assistantText) {
+        assistantText = 'No response (no readable files yet?).';
+        scheduleFlush();
+        setAssistantStreaming(false);
+      }
+    }
+  };
+
   const categories = useMemo((): CategorySummary[] => {
     const map: Record<string, { count: number; updatedAt: number }> = {};
     for (const doc of docs) {
@@ -1740,7 +2228,16 @@ export default function App() {
     refreshDocs();
   };
 
-  const headerTitle = route === 'chat' ? 'Chat' : route === 'import' ? 'Import' : route === 'categories' ? 'Categories' : 'Screenshots';
+  const headerTitle =
+    route === 'chat'
+      ? 'Chat'
+      : route === 'import'
+        ? 'Import'
+        : route === 'categories'
+          ? 'Categories'
+          : route === 'documents'
+            ? 'Screenshots'
+            : 'Drive Chat';
 
   useEffect(() => {
     if (!fontsLoaded) return;
@@ -1766,8 +2263,8 @@ export default function App() {
     if (name) return name;
     const email = userProfile?.email?.trim();
     if (email) return email;
-    return 'Signed in with Apple';
-  }, [isAuthenticated, userProfile]);
+    return authProvider === 'google' ? 'Signed in with Google' : 'Signed in with Apple';
+  }, [authProvider, isAuthenticated, userProfile]);
 
   if (!fontsLoaded || !authReady || !onboardingReady) {
     return (
@@ -1803,6 +2300,7 @@ export default function App() {
             appleAvailable={appleAvailable}
             authBusy={authBusy}
             onSignIn={signInWithApple}
+            onSignInGoogle={signInWithGoogle}
             debugEnabled={AUTH_DEBUG}
             onShowDebug={() => setAuthDebugOpen(true)}
           />
@@ -1872,18 +2370,14 @@ export default function App() {
                 setRoute(next);
                 setMenuOpen(false);
               }}
+              showDrive={authProvider === 'google' && isAuthenticated}
               showPaywall={FEATURE_FLAGS.paywall}
               onPressPaywall={() => openPaywall()}
               showAuth={FEATURE_FLAGS.auth}
               authSignedIn={isAuthenticated}
               authLabel={accountLabel}
-              onPressAuth={
-                isAuthenticated
-                  ? undefined
-                  : () => {
-                      Alert.alert('Sign in', 'Apple and Google sign-in will be enabled once the Apple Developer account is restored.');
-                    }
-              }
+              onPressAuth={isAuthenticated ? undefined : () => openAuthPrompt()}
+              onPressSignOut={isAuthenticated ? () => signOut() : undefined}
             />
           ) : (
 	          <AppHeader
@@ -1937,6 +2431,30 @@ export default function App() {
               assetStageById={assetStageById}
               assetErrorById={assetErrorById}
               onShowError={showErrorToast}
+            />
+	          ) : route === 'drive' ? (
+            <DriveScreen
+              enabled={authProvider === 'google' && isAuthenticated}
+              driveConnected={!!googleAccessToken}
+              loading={driveLoading}
+              linkValue={driveLinkInput}
+              onChangeLink={setDriveLinkInput}
+              onResolveLink={resolveDriveLink}
+              onConnect={signInWithGoogle}
+              onBrowseRoot={openDriveRoot}
+              folderStack={driveFolderStack}
+              folders={driveFolders}
+              files={driveFiles}
+              onOpenFolder={openDriveFolder}
+              onBackFolder={handleDriveBack}
+              chatInput={driveChatInput}
+              onChangeChatInput={setDriveChatInput}
+              chatHistory={driveChatHistory}
+              chatThinking={driveChatThinking}
+              onAsk={handleDriveAsk}
+              onOpenFile={(file) => {
+                if (file.link) Linking.openURL(file.link).catch(() => {});
+              }}
             />
 	          ) : route === 'categories' ? (
             <CategoriesScreen
@@ -2054,29 +2572,36 @@ export default function App() {
 	          onDeleteThread={async (threadId) => {
 	            await deleteThreadById(threadId);
 	          }}
-            onRenameThread={async (threadId, nextTitle) => {
-              await renameThreadById(threadId, nextTitle);
-            }}
-            showPaywall={FEATURE_FLAGS.paywall}
-            onPressPaywall={() => {
-              setMenuOpen(false);
-              requestAnimationFrame(() => openPaywall());
-            }}
-            showAuth={FEATURE_FLAGS.auth}
-            authSignedIn={isAuthenticated}
-            authLabel={accountLabel}
-            onPressAuth={
-              isAuthenticated
-                ? undefined
-                : () => {
-                    setMenuOpen(false);
-                    requestAnimationFrame(() =>
-                      Alert.alert('Sign in', 'Apple and Google sign-in will be enabled once the Apple Developer account is restored.'),
-                    );
-                  }
-            }
-          />
-        )}
+          onRenameThread={async (threadId, nextTitle) => {
+            await renameThreadById(threadId, nextTitle);
+          }}
+          showDrive={authProvider === 'google' && isAuthenticated}
+          showPaywall={FEATURE_FLAGS.paywall}
+          onPressPaywall={() => {
+            setMenuOpen(false);
+            requestAnimationFrame(() => openPaywall());
+          }}
+          showAuth={FEATURE_FLAGS.auth}
+          authSignedIn={isAuthenticated}
+          authLabel={accountLabel}
+          onPressAuth={
+            isAuthenticated
+              ? undefined
+              : () => {
+                  setMenuOpen(false);
+                  requestAnimationFrame(() => openAuthPrompt());
+                }
+          }
+          onPressSignOut={
+            isAuthenticated
+              ? () => {
+                  setMenuOpen(false);
+                  requestAnimationFrame(() => void signOut());
+                }
+              : undefined
+          }
+        />
+      )}
 
 	      <Modal visible={!!viewerUri} transparent animationType="fade" onRequestClose={closeViewer}>
 	        <View style={styles.viewerBackdrop}>
@@ -2175,12 +2700,14 @@ function NewThreadIcon(props: { size?: number; color?: string }) {
 function Sidebar(props: {
   route: RouteKey;
   onNavigate: (route: RouteKey) => void;
+  showDrive?: boolean;
   showPaywall?: boolean;
   onPressPaywall?: () => void;
   showAuth?: boolean;
   authSignedIn?: boolean;
   authLabel?: string;
   onPressAuth?: () => void;
+  onPressSignOut?: () => void;
 }) {
   const items: { key: RouteKey; label: string; icon: keyof typeof Ionicons.glyphMap }[] = [
     { key: 'chat', label: 'Chat', icon: 'chatbubbles-outline' },
@@ -2188,6 +2715,9 @@ function Sidebar(props: {
     { key: 'categories', label: 'Categories', icon: 'folder-open-outline' },
     { key: 'documents', label: 'Screenshots', icon: 'images-outline' },
   ];
+  if (props.showDrive) {
+    items.push({ key: 'drive', label: 'Drive Chat', icon: 'cloud-outline' });
+  }
 
   return (
     <View style={styles.sidebar}>
@@ -2202,7 +2732,7 @@ function Sidebar(props: {
           return (
             <Pressable
               key={item.key}
-              onPress={() => props.onNavigate(item.key)}
+              onPress={() => props.onNavigate(item.key as RouteKey)}
               style={({ pressed }) => [
                 styles.navItem,
                 active && styles.navItemActive,
@@ -2242,6 +2772,14 @@ function Sidebar(props: {
                     {props.authLabel || 'Signed in with Apple'}
                   </Text>
                 </View>
+              )}
+              {props.showAuth && props.authSignedIn && props.onPressSignOut && (
+                <Pressable
+                  onPress={props.onPressSignOut}
+                  style={({ pressed }) => [styles.sidebarAccountButton, pressed && styles.pressed]}
+                >
+                  <Text style={styles.sidebarAccountText}>Sign out</Text>
+                </Pressable>
               )}
               {props.showPaywall && (
                 <Pressable
@@ -2283,12 +2821,14 @@ function HamburgerMenu(props: {
   onNewThread?: () => void | Promise<void>;
   onDeleteThread?: (threadId: string) => void | Promise<void>;
   onRenameThread?: (threadId: string, nextTitle: string) => void | Promise<void>;
+  showDrive?: boolean;
   showPaywall?: boolean;
   onPressPaywall?: () => void;
   showAuth?: boolean;
   authSignedIn?: boolean;
   authLabel?: string;
   onPressAuth?: () => void;
+  onPressSignOut?: () => void;
 }) {
   const [scrollViewportHeight, setScrollViewportHeight] = useState(0);
   const [scrollContentHeight, setScrollContentHeight] = useState(0);
@@ -2376,12 +2916,13 @@ function HamburgerMenu(props: {
                     { key: 'import', label: 'Import', icon: 'image-outline' as const },
                     { key: 'categories', label: 'Categories', icon: 'folder-open-outline' as const },
                     { key: 'documents', label: 'Screenshots', icon: 'images-outline' as const },
+                    ...(props.showDrive ? [{ key: 'drive', label: 'Drive Chat', icon: 'cloud-outline' as const }] : []),
                   ] as const).map((item) => {
                     const isActive = props.route === item.key;
                     return (
                       <Pressable
                         key={item.key}
-                        onPress={() => props.onNavigate(item.key)}
+                        onPress={() => props.onNavigate(item.key as RouteKey)}
                         style={({ pressed }) => [
                           styles.menuItem,
                           isActive && styles.menuItemActive,
@@ -2462,6 +3003,14 @@ function HamburgerMenu(props: {
                           {props.authLabel || 'Signed in with Apple'}
                         </Text>
                       </View>
+                    )}
+                    {props.showAuth && props.authSignedIn && props.onPressSignOut && (
+                      <Pressable
+                        onPress={props.onPressSignOut}
+                        style={({ pressed }) => [styles.menuAccountButton, pressed && styles.pressed]}
+                      >
+                        <Text style={styles.menuAccountText}>Sign out</Text>
+                      </Pressable>
                     )}
                     {props.showPaywall && (
                       <Pressable
@@ -3713,10 +4262,249 @@ function OnboardingScreen(props: { onDone: () => void }) {
   );
 }
 
+function DriveScreen(props: {
+  enabled: boolean;
+  driveConnected: boolean;
+  loading: boolean;
+  linkValue: string;
+  onChangeLink: (value: string) => void;
+  onResolveLink: () => void;
+  onConnect: () => void;
+  onBrowseRoot: () => void;
+  folderStack: DriveFolder[];
+  folders: DriveFolder[];
+  files: DriveFile[];
+  onOpenFolder: (folderId: string) => void;
+  onBackFolder: () => void;
+  chatInput: string;
+  onChangeChatInput: (value: string) => void;
+  chatHistory: DriveChatEntry[];
+  chatThinking: boolean;
+  onAsk: () => void;
+  onOpenFile: (file: DriveFile) => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const activeFolder = props.folderStack[props.folderStack.length - 1] ?? null;
+  const canChat = !!activeFolder;
+  const canSend = !!props.chatInput.trim() && !props.chatThinking && canChat;
+  const empty = props.chatHistory.length === 0;
+  const folderTrail = props.folderStack.map((f) => f.name).join(' / ');
+
+  return (
+    <View style={[styles.driveScreen, { paddingBottom: Math.max(18, insets.bottom) }]}>
+      <View style={styles.driveHeaderCard}>
+        <View>
+          <Text style={styles.driveTitle}>Google Drive</Text>
+          <Text style={styles.driveSubtitle}>Chat with files in a selected folder.</Text>
+        </View>
+        {!props.enabled && (
+          <View style={styles.driveNotice}>
+            <Text style={styles.driveNoticeText}>Sign in with Google to use Drive.</Text>
+          </View>
+        )}
+        {props.enabled && !props.driveConnected && (
+          <Pressable
+            onPress={props.onConnect}
+            style={({ pressed }) => [styles.drivePrimaryButton, pressed && styles.pressed]}
+          >
+            <Ionicons name="logo-google" size={18} color={COLORS.accentText} />
+            <Text style={styles.drivePrimaryButtonText}>Connect Google Drive</Text>
+          </Pressable>
+        )}
+        {props.enabled && props.driveConnected && (
+          <View style={styles.driveActions}>
+            <View style={styles.driveLinkRow}>
+              <TextInput
+                value={props.linkValue}
+                onChangeText={props.onChangeLink}
+                placeholder="Paste a Google Drive link"
+                placeholderTextColor={COLORS.muted2}
+                style={styles.driveLinkInput}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              <Pressable
+                onPress={props.onResolveLink}
+                disabled={!props.linkValue.trim() || props.loading}
+                style={({ pressed }) => [
+                  styles.driveLinkButton,
+                  (!props.linkValue.trim() || props.loading) && styles.disabled,
+                  pressed && styles.pressed,
+                ]}
+              >
+                <Text style={styles.driveLinkButtonText}>Use link</Text>
+              </Pressable>
+            </View>
+            <Pressable
+              onPress={props.onBrowseRoot}
+              style={({ pressed }) => [styles.driveSecondaryButton, pressed && styles.pressed]}
+            >
+              <Ionicons name="folder-open-outline" size={18} color={COLORS.text} />
+              <Text style={styles.driveSecondaryButtonText}>Browse My Drive</Text>
+            </Pressable>
+          </View>
+        )}
+      </View>
+
+      {props.enabled && props.driveConnected && (
+        <View style={styles.driveBrowserCard}>
+          <View style={styles.driveBrowserHeader}>
+            <View style={styles.driveBrowserTitles}>
+              <Text style={styles.driveSectionTitle}>Folder</Text>
+              {activeFolder && (
+                <Text style={styles.driveFolderPath} numberOfLines={1}>
+                  {folderTrail}
+                </Text>
+              )}
+            </View>
+            {props.folderStack.length > 1 && (
+              <Pressable
+                onPress={props.onBackFolder}
+                style={({ pressed }) => [styles.driveBackButton, pressed && styles.pressed]}
+              >
+                <Ionicons name="arrow-back" size={16} color={COLORS.text} />
+                <Text style={styles.driveBackButtonText}>Back</Text>
+              </Pressable>
+            )}
+          </View>
+
+          {!activeFolder && (
+            <Text style={styles.driveMuted}>Pick a folder to browse its files.</Text>
+          )}
+
+          {!!props.folders.length && (
+            <View style={styles.driveList}>
+              {props.folders.map((folder) => (
+                <Pressable
+                  key={folder.id}
+                  onPress={() => props.onOpenFolder(folder.id)}
+                  style={({ pressed }) => [styles.driveRow, pressed && styles.pressed]}
+                >
+                  <Ionicons name="folder-outline" size={18} color={COLORS.text} />
+                  <Text style={styles.driveRowText} numberOfLines={1}>
+                    {folder.name}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
+
+          {!!props.files.length && (
+            <View style={styles.driveList}>
+              {props.files.map((file) => (
+                <Pressable
+                  key={file.id}
+                  onPress={() => props.onOpenFile(file)}
+                  style={({ pressed }) => [styles.driveRow, pressed && styles.pressed]}
+                >
+                  <Ionicons name="document-text-outline" size={18} color={COLORS.muted} />
+                  <Text style={styles.driveRowText} numberOfLines={1}>
+                    {file.name}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
+        </View>
+      )}
+
+      <View style={styles.driveChatCard}>
+        <View style={styles.driveChatHeader}>
+          <Text style={styles.driveSectionTitle}>Drive chat</Text>
+          {props.loading && <ActivityIndicator size="small" color={COLORS.muted} />}
+        </View>
+
+        {!canChat && <Text style={styles.driveMuted}>Select a folder to start chatting.</Text>}
+
+        <FlatList
+          data={props.chatHistory}
+          inverted
+          keyExtractor={(item) => item.id}
+          style={{ flex: 1 }}
+          contentContainerStyle={[styles.driveChatList, empty && styles.driveChatListEmpty]}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+          renderItem={({ item }) => {
+            const isUser = item.role === 'user';
+            return (
+              <View style={[styles.messageRow, isUser ? styles.messageRowUser : styles.messageRowAi]}>
+                <View style={[styles.avatar, isUser ? styles.avatarUser : styles.avatarAi]}>
+                  {isUser ? (
+                    <Ionicons name="person" size={18} color={COLORS.accentText} />
+                  ) : item.streaming ? (
+                    <ActivityIndicator size="small" color={COLORS.muted} />
+                  ) : (
+                    <Ionicons name="sparkles" size={18} color={COLORS.muted} />
+                  )}
+                </View>
+                <View style={[styles.messageBubble, isUser ? styles.messageBubbleUser : styles.messageBubbleAi]}>
+                  {isUser ? (
+                    <Text style={[styles.messageText, styles.messageTextUser]}>{item.text}</Text>
+                  ) : (
+                    <View style={{ gap: 10 }}>
+                      <Markdown style={MARKDOWN_STYLES} mergeStyle>
+                        {item.text}
+                      </Markdown>
+                      {!!item.sources?.length && (
+                        <View style={styles.driveSources}>
+                          {item.sources.slice(0, 8).map((file) => (
+                            <Pressable
+                              key={file.id}
+                              onPress={() => props.onOpenFile(file)}
+                              style={({ pressed }) => [styles.driveSourceRow, pressed && styles.pressed]}
+                            >
+                              <Ionicons name="document-text-outline" size={16} color={COLORS.muted} />
+                              <Text style={styles.driveSourceText} numberOfLines={1}>
+                                {file.name}
+                              </Text>
+                            </Pressable>
+                          ))}
+                        </View>
+                      )}
+                    </View>
+                  )}
+                </View>
+              </View>
+            );
+          }}
+        />
+
+        <View style={styles.driveComposerRow}>
+          <TextInput
+            value={props.chatInput}
+            onChangeText={props.onChangeChatInput}
+            placeholder={canChat ? 'Ask about this folder' : 'Select a folder to chat'}
+            placeholderTextColor={COLORS.muted2}
+            style={styles.driveComposerInput}
+            editable={canChat && !props.chatThinking}
+            multiline
+          />
+          <Pressable
+            onPress={props.onAsk}
+            disabled={!canSend}
+            style={({ pressed }) => [
+              styles.driveSendButton,
+              !canSend && styles.disabled,
+              pressed && styles.pressed,
+            ]}
+          >
+            {props.chatThinking ? (
+              <ActivityIndicator color={COLORS.accentText} />
+            ) : (
+              <Ionicons name="arrow-up" size={18} color={COLORS.accentText} />
+            )}
+          </Pressable>
+        </View>
+      </View>
+    </View>
+  );
+}
+
 function AuthScreen(props: {
   appleAvailable: boolean;
   authBusy: boolean;
   onSignIn: () => void;
+  onSignInGoogle: () => void;
   debugEnabled?: boolean;
   onShowDebug?: () => void;
 }) {
@@ -3728,7 +4516,7 @@ function AuthScreen(props: {
         </View>
         <Text style={styles.authTitle}>Sign in to Nexus</Text>
         <Text style={styles.authSubtitle}>
-          Use Sign in with Apple to access your indexed library and chat history.
+          Use Apple or Google to access your indexed library and chat history.
         </Text>
         {!props.appleAvailable && (
           <View style={styles.authNotice}>
@@ -3736,8 +4524,8 @@ function AuthScreen(props: {
             <Text style={styles.authNoticeText}>Apple Sign In isn’t available on this device.</Text>
           </View>
         )}
-        {props.appleAvailable && (
-          <View style={styles.authButtonWrap}>
+        <View style={styles.authButtonWrap}>
+          {props.appleAvailable && (
             <AppleAuthentication.AppleAuthenticationButton
               buttonType={AppleAuthentication.AppleAuthenticationButtonType.SIGN_IN}
               buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
@@ -3745,8 +4533,15 @@ function AuthScreen(props: {
               style={styles.authButton}
               onPress={props.onSignIn}
             />
-          </View>
-        )}
+          )}
+          <Pressable
+            onPress={props.onSignInGoogle}
+            style={({ pressed }) => [styles.authAltButton, pressed && styles.pressed]}
+          >
+            <Ionicons name="logo-google" size={18} color={COLORS.text} />
+            <Text style={styles.authAltButtonText}>Continue with Google</Text>
+          </Pressable>
+        </View>
         {props.authBusy && <ActivityIndicator color={COLORS.text} />}
         {props.debugEnabled && (
           <Pressable
@@ -4519,6 +5314,24 @@ const styles = StyleSheet.create({
   authButton: {
     width: '100%',
     height: 44,
+  },
+  authAltButton: {
+    marginTop: 12,
+    width: '100%',
+    height: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.borderStrong,
+    backgroundColor: COLORS.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 10,
+  },
+  authAltButtonText: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
   },
   authDebugLink: {
     marginTop: 10,
@@ -6873,5 +7686,242 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 12,
     fontFamily: FONT_SANS_EXTRABOLD,
+  },
+  driveScreen: {
+    flex: 1,
+    padding: 20,
+    gap: 16,
+    backgroundColor: COLORS.bg,
+  },
+  driveHeaderCard: {
+    padding: 16,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    gap: 12,
+  },
+  driveTitle: {
+    color: COLORS.text,
+    fontSize: 18,
+    fontFamily: FONT_HEADING_BOLD,
+  },
+  driveSubtitle: {
+    color: COLORS.muted,
+    fontSize: 13,
+    marginTop: 4,
+    fontFamily: FONT_SANS,
+  },
+  driveNotice: {
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  driveNoticeText: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+  },
+  drivePrimaryButton: {
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: COLORS.accent,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  drivePrimaryButtonText: {
+    color: COLORS.accentText,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  driveActions: {
+    gap: 10,
+  },
+  driveLinkRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  driveLinkInput: {
+    flex: 1,
+    minHeight: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    paddingHorizontal: 12,
+    color: COLORS.text,
+    backgroundColor: COLORS.surface,
+    fontFamily: FONT_SANS,
+    fontSize: 13,
+  },
+  driveLinkButton: {
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: COLORS.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  driveLinkButtonText: {
+    color: COLORS.accentText,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  driveSecondaryButton: {
+    height: 42,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.borderStrong,
+    backgroundColor: COLORS.surface,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  driveSecondaryButtonText: {
+    color: COLORS.text,
+    fontSize: 13,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  driveBrowserCard: {
+    padding: 16,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    gap: 12,
+  },
+  driveBrowserHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  driveBrowserTitles: {
+    flex: 1,
+  },
+  driveSectionTitle: {
+    color: COLORS.text,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  driveFolderPath: {
+    color: COLORS.muted,
+    fontSize: 12,
+    marginTop: 4,
+    fontFamily: FONT_SANS,
+  },
+  driveBackButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  driveBackButtonText: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  driveMuted: {
+    color: COLORS.muted,
+    fontSize: 12,
+    fontFamily: FONT_SANS,
+  },
+  driveList: {
+    gap: 8,
+  },
+  driveRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+  },
+  driveRowText: {
+    color: COLORS.text,
+    fontSize: 13,
+    flex: 1,
+    fontFamily: FONT_SANS,
+  },
+  driveChatCard: {
+    flex: 1,
+    padding: 16,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    gap: 12,
+  },
+  driveChatHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  driveChatList: {
+    gap: 14,
+    paddingVertical: 8,
+  },
+  driveChatListEmpty: {
+    paddingVertical: 16,
+  },
+  driveComposerRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 10,
+    paddingTop: 4,
+  },
+  driveComposerInput: {
+    flex: 1,
+    minHeight: 44,
+    maxHeight: 110,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: COLORS.text,
+    fontFamily: FONT_SANS,
+    fontSize: 13,
+  },
+  driveSendButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: COLORS.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  driveSources: {
+    gap: 6,
+  },
+  driveSourceRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+    backgroundColor: COLORS.surfaceAlt,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  driveSourceText: {
+    color: COLORS.text,
+    fontSize: 12,
+    flex: 1,
+    fontFamily: FONT_SANS,
   },
 });

@@ -10,6 +10,7 @@
         "EXPO_PUBLIC_ENABLE_AUTH": "1",
         "EXPO_PUBLIC_REQUIRE_AUTH": "1",
         "EXPO_PUBLIC_AUTH_DEBUG": "0",
+        "EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID": "400877626975-8pmgqvohk4i6ddmsmqidcskv4s7t2mh4.apps.googleusercontent.com",
         "EXPO_PUBLIC_IAP_DEBUG": "1",
         "EXPO_PUBLIC_IAP_STARTER_PRODUCT_ID": "com.ragobble.Nexus.lite_tier",
         "EXPO_PUBLIC_IAP_PRO_PRODUCT_ID": "com.ragobble.Nexus.pro_tier",
