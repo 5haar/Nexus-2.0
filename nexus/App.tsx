@@ -4284,146 +4284,98 @@ function DriveScreen(props: {
   onOpenFile: (file: DriveFile) => void;
 }) {
   const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
+  const [chatStage, setChatStage] = useState<'select' | 'chat'>('select');
+  const keyboardAnim = useRef(new Animated.Value(0)).current;
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const [composerHeight, setComposerHeight] = useState(0);
   const activeFolder = props.folderStack[props.folderStack.length - 1] ?? null;
   const canChat = !!activeFolder;
   const canSend = !!props.chatInput.trim() && !props.chatThinking && canChat;
   const empty = props.chatHistory.length === 0;
   const folderTrail = props.folderStack.map((f) => f.name).join(' / ');
+  const canContinue = props.enabled && props.driveConnected && !!activeFolder;
 
-  return (
-    <View style={[styles.driveScreen, { paddingBottom: Math.max(18, insets.bottom) }]}>
-      <View style={styles.driveHeaderCard}>
-        <View>
-          <Text style={styles.driveTitle}>Google Drive</Text>
-          <Text style={styles.driveSubtitle}>Chat with files in a selected folder.</Text>
-        </View>
-        {!props.enabled && (
-          <View style={styles.driveNotice}>
-            <Text style={styles.driveNoticeText}>Sign in with Google to use Drive.</Text>
-          </View>
-        )}
-        {props.enabled && !props.driveConnected && (
-          <Pressable
-            onPress={props.onConnect}
-            style={({ pressed }) => [styles.drivePrimaryButton, pressed && styles.pressed]}
-          >
-            <Ionicons name="logo-google" size={18} color={COLORS.accentText} />
-            <Text style={styles.drivePrimaryButtonText}>Connect Google Drive</Text>
-          </Pressable>
-        )}
-        {props.enabled && props.driveConnected && (
-          <View style={styles.driveActions}>
-            <View style={styles.driveLinkRow}>
-              <TextInput
-                value={props.linkValue}
-                onChangeText={props.onChangeLink}
-                placeholder="Paste a Google Drive link"
-                placeholderTextColor={COLORS.muted2}
-                style={styles.driveLinkInput}
-                autoCapitalize="none"
-                autoCorrect={false}
-              />
-              <Pressable
-                onPress={props.onResolveLink}
-                disabled={!props.linkValue.trim() || props.loading}
-                style={({ pressed }) => [
-                  styles.driveLinkButton,
-                  (!props.linkValue.trim() || props.loading) && styles.disabled,
-                  pressed && styles.pressed,
-                ]}
-              >
-                <Text style={styles.driveLinkButtonText}>Use link</Text>
-              </Pressable>
-            </View>
-            <Pressable
-              onPress={props.onBrowseRoot}
-              style={({ pressed }) => [styles.driveSecondaryButton, pressed && styles.pressed]}
-            >
-              <Ionicons name="folder-open-outline" size={18} color={COLORS.text} />
-              <Text style={styles.driveSecondaryButtonText}>Browse My Drive</Text>
-            </Pressable>
-          </View>
-        )}
-      </View>
+  useEffect(() => {
+    if (!props.enabled || !props.driveConnected || !activeFolder) {
+      setChatStage('select');
+    }
+  }, [activeFolder, props.driveConnected, props.enabled]);
 
-      {props.enabled && props.driveConnected && (
-        <View style={styles.driveBrowserCard}>
-          <View style={styles.driveBrowserHeader}>
-            <View style={styles.driveBrowserTitles}>
-              <Text style={styles.driveSectionTitle}>Folder</Text>
-              {activeFolder && (
-                <Text style={styles.driveFolderPath} numberOfLines={1}>
-                  {folderTrail}
-                </Text>
-              )}
-            </View>
-            {props.folderStack.length > 1 && (
-              <Pressable
-                onPress={props.onBackFolder}
-                style={({ pressed }) => [styles.driveBackButton, pressed && styles.pressed]}
-              >
-                <Ionicons name="arrow-back" size={16} color={COLORS.text} />
-                <Text style={styles.driveBackButtonText}>Back</Text>
-              </Pressable>
+  useEffect(() => {
+    const animateTo = (nextHeight: number, duration: number) => {
+      setKeyboardHeight(nextHeight);
+      Animated.timing(keyboardAnim, {
+        toValue: nextHeight,
+        duration,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    };
+
+    if (Platform.OS === 'ios') {
+      const sub = Keyboard.addListener('keyboardWillChangeFrame', (e) => {
+        const endScreenY = e.endCoordinates?.screenY ?? windowHeight;
+        const raw = Math.max(0, windowHeight - endScreenY);
+        const adjusted = Math.max(0, raw - insets.bottom);
+        animateTo(adjusted, e.duration ?? 250);
+      });
+      return () => sub.remove();
+    }
+
+    const show = Keyboard.addListener('keyboardDidShow', (e) => {
+      const raw = Math.max(0, e.endCoordinates?.height ?? 0);
+      const adjusted = Math.max(0, raw - insets.bottom);
+      animateTo(adjusted, 180);
+    });
+    const hide = Keyboard.addListener('keyboardDidHide', () => animateTo(0, 180));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, [insets.bottom, keyboardAnim, windowHeight]);
+
+  const translateY = Animated.multiply(keyboardAnim, -1);
+  const spacerHeight = Math.max(0, composerHeight + 8 + keyboardHeight);
+
+  if (chatStage === 'chat') {
+    return (
+      <View style={styles.screen}>
+        <View style={styles.driveChatTopRow}>
+          <View style={styles.driveChatTopInfo}>
+            <Text style={styles.driveSectionTitle}>Drive chat</Text>
+            {activeFolder && (
+              <Text style={styles.driveFolderPath} numberOfLines={1}>
+                {folderTrail}
+              </Text>
             )}
           </View>
-
-          {!activeFolder && (
-            <Text style={styles.driveMuted}>Pick a folder to browse its files.</Text>
-          )}
-
-          {!!props.folders.length && (
-            <View style={styles.driveList}>
-              {props.folders.map((folder) => (
-                <Pressable
-                  key={folder.id}
-                  onPress={() => props.onOpenFolder(folder.id)}
-                  style={({ pressed }) => [styles.driveRow, pressed && styles.pressed]}
-                >
-                  <Ionicons name="folder-outline" size={18} color={COLORS.text} />
-                  <Text style={styles.driveRowText} numberOfLines={1}>
-                    {folder.name}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-          )}
-
-          {!!props.files.length && (
-            <View style={styles.driveList}>
-              {props.files.map((file) => (
-                <Pressable
-                  key={file.id}
-                  onPress={() => props.onOpenFile(file)}
-                  style={({ pressed }) => [styles.driveRow, pressed && styles.pressed]}
-                >
-                  <Ionicons name="document-text-outline" size={18} color={COLORS.muted} />
-                  <Text style={styles.driveRowText} numberOfLines={1}>
-                    {file.name}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-          )}
+          <View style={styles.driveChatTopActions}>
+            {props.loading && <ActivityIndicator size="small" color={COLORS.muted} />}
+            <Pressable
+              onPress={() => setChatStage('select')}
+              style={({ pressed }) => [styles.driveBackButton, pressed && styles.pressed]}
+            >
+              <Ionicons name="folder-open-outline" size={16} color={COLORS.text} />
+              <Text style={styles.driveBackButtonText}>Change folder</Text>
+            </Pressable>
+          </View>
         </View>
-      )}
-
-      <View style={styles.driveChatCard}>
-        <View style={styles.driveChatHeader}>
-          <Text style={styles.driveSectionTitle}>Drive chat</Text>
-          {props.loading && <ActivityIndicator size="small" color={COLORS.muted} />}
-        </View>
-
-        {!canChat && <Text style={styles.driveMuted}>Select a folder to start chatting.</Text>}
 
         <FlatList
           data={props.chatHistory}
           inverted
           keyExtractor={(item) => item.id}
           style={{ flex: 1 }}
-          contentContainerStyle={[styles.driveChatList, empty && styles.driveChatListEmpty]}
+          contentContainerStyle={[styles.chatList, empty && styles.chatListEmpty]}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="on-drag"
+          ListHeaderComponent={!empty ? <View style={{ height: spacerHeight }} /> : null}
+          ListEmptyComponent={
+            <Text style={styles.driveMuted}>
+              {canChat ? 'Ask a question about this folder.' : 'Select a folder to start chatting.'}
+            </Text>
+          }
           renderItem={({ item }) => {
             const isUser = item.role === 'user';
             return (
@@ -4469,33 +4421,200 @@ function DriveScreen(props: {
           }}
         />
 
-        <View style={styles.driveComposerRow}>
-          <TextInput
-            value={props.chatInput}
-            onChangeText={props.onChangeChatInput}
-            placeholder={canChat ? 'Ask about this folder' : 'Select a folder to chat'}
-            placeholderTextColor={COLORS.muted2}
-            style={styles.driveComposerInput}
-            editable={canChat && !props.chatThinking}
-            multiline
-          />
+        <Animated.View
+          style={[styles.composerOuter, { transform: [{ translateY }] }]}
+          onLayout={(e) => {
+            const next = Math.round(e.nativeEvent.layout.height);
+            setComposerHeight((prev) => (prev === next ? prev : next));
+          }}
+        >
+          <View style={styles.scopePillRow}>
+            <View style={styles.scopePill}>
+              <Ionicons name="folder-open-outline" size={14} color={COLORS.muted} />
+              <Text style={styles.scopePillText} numberOfLines={1}>
+                {activeFolder ? `Folder: ${activeFolder.name}` : 'Folder: none'}
+              </Text>
+            </View>
+          </View>
+          <View style={styles.composerRow}>
+            <View style={styles.composerPill}>
+              <TextInput
+                placeholder={canChat ? 'Ask about this folder' : 'Select a folder to chat'}
+                placeholderTextColor={COLORS.muted2}
+                value={props.chatInput}
+                onChangeText={props.onChangeChatInput}
+                style={styles.composerInput}
+                multiline
+                submitBehavior="newline"
+                returnKeyType="default"
+                blurOnSubmit={false}
+                editable={canChat && !props.chatThinking}
+              />
+              <Pressable
+                onPress={props.onAsk}
+                style={({ pressed }) => [
+                  styles.sendButton,
+                  canSend ? styles.sendButtonActive : styles.sendButtonInactive,
+                  !canSend && styles.disabled,
+                  pressed && styles.pressed,
+                ]}
+                hitSlop={10}
+                disabled={!canSend}
+              >
+                {props.chatThinking ? (
+                  <ActivityIndicator color={COLORS.accentText} />
+                ) : (
+                  <Ionicons name="arrow-up" size={16} color={canSend ? COLORS.accentText : COLORS.muted} />
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </Animated.View>
+      </View>
+    );
+  }
+
+  const selectBottomPad = Math.max(120, insets.bottom + 100);
+
+  return (
+    <View style={[styles.driveScreen, { paddingBottom: Math.max(18, insets.bottom) }]}>
+      <ScrollView
+        contentContainerStyle={[styles.driveSelectContent, { paddingBottom: selectBottomPad }]}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.driveHeaderCard}>
+          <View style={styles.driveHeaderRow}>
+            <View>
+              <Text style={styles.driveTitle}>Google Drive</Text>
+              <Text style={styles.driveSubtitle}>Chat with files in a selected folder.</Text>
+            </View>
+            {props.loading && <ActivityIndicator size="small" color={COLORS.muted} />}
+          </View>
+          {!props.enabled && (
+            <View style={styles.driveNotice}>
+              <Text style={styles.driveNoticeText}>Sign in with Google to use Drive.</Text>
+            </View>
+          )}
+          {props.enabled && !props.driveConnected && (
+            <Pressable
+              onPress={props.onConnect}
+              style={({ pressed }) => [styles.drivePrimaryButton, pressed && styles.pressed]}
+            >
+              <Ionicons name="logo-google" size={18} color={COLORS.accentText} />
+              <Text style={styles.drivePrimaryButtonText}>Connect Google Drive</Text>
+            </Pressable>
+          )}
+          {props.enabled && props.driveConnected && (
+            <View style={styles.driveActions}>
+              <View style={styles.driveLinkRow}>
+                <TextInput
+                  value={props.linkValue}
+                  onChangeText={props.onChangeLink}
+                  placeholder="Paste a Google Drive link"
+                  placeholderTextColor={COLORS.muted2}
+                  style={styles.driveLinkInput}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+                <Pressable
+                  onPress={props.onResolveLink}
+                  disabled={!props.linkValue.trim() || props.loading}
+                  style={({ pressed }) => [
+                    styles.driveLinkButton,
+                    (!props.linkValue.trim() || props.loading) && styles.disabled,
+                    pressed && styles.pressed,
+                  ]}
+                >
+                  <Text style={styles.driveLinkButtonText}>Use link</Text>
+                </Pressable>
+              </View>
+              <Pressable
+                onPress={props.onBrowseRoot}
+                style={({ pressed }) => [styles.driveSecondaryButton, pressed && styles.pressed]}
+              >
+                <Ionicons name="folder-open-outline" size={18} color={COLORS.text} />
+                <Text style={styles.driveSecondaryButtonText}>Browse My Drive</Text>
+              </Pressable>
+            </View>
+          )}
+        </View>
+
+        {props.enabled && props.driveConnected && (
+          <View style={styles.driveBrowserCard}>
+            <View style={styles.driveBrowserHeader}>
+              <View style={styles.driveBrowserTitles}>
+                <Text style={styles.driveSectionTitle}>Folder</Text>
+                {activeFolder && (
+                  <Text style={styles.driveFolderPath} numberOfLines={1}>
+                    {folderTrail}
+                  </Text>
+                )}
+              </View>
+              {props.folderStack.length > 1 && (
+                <Pressable
+                  onPress={props.onBackFolder}
+                  style={({ pressed }) => [styles.driveBackButton, pressed && styles.pressed]}
+                >
+                  <Ionicons name="arrow-back" size={16} color={COLORS.text} />
+                  <Text style={styles.driveBackButtonText}>Back</Text>
+                </Pressable>
+              )}
+            </View>
+
+            {!activeFolder && <Text style={styles.driveMuted}>Pick a folder to browse its files.</Text>}
+
+            {!!props.folders.length && (
+              <View style={styles.driveList}>
+                {props.folders.map((folder) => (
+                  <Pressable
+                    key={folder.id}
+                    onPress={() => props.onOpenFolder(folder.id)}
+                    style={({ pressed }) => [styles.driveRow, pressed && styles.pressed]}
+                  >
+                    <Ionicons name="folder-outline" size={18} color={COLORS.text} />
+                    <Text style={styles.driveRowText} numberOfLines={1}>
+                      {folder.name}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            )}
+
+            {!!props.files.length && (
+              <View style={styles.driveList}>
+                {props.files.map((file) => (
+                  <Pressable
+                    key={file.id}
+                    onPress={() => props.onOpenFile(file)}
+                    style={({ pressed }) => [styles.driveRow, pressed && styles.pressed]}
+                  >
+                    <Ionicons name="document-text-outline" size={18} color={COLORS.muted} />
+                    <Text style={styles.driveRowText} numberOfLines={1}>
+                      {file.name}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            )}
+          </View>
+        )}
+      </ScrollView>
+
+      {props.enabled && props.driveConnected && (
+        <View style={[styles.driveContinueBar, { bottom: Math.max(18, insets.bottom) }]}>
           <Pressable
-            onPress={props.onAsk}
-            disabled={!canSend}
+            onPress={() => setChatStage('chat')}
+            disabled={!canContinue || props.loading}
             style={({ pressed }) => [
-              styles.driveSendButton,
-              !canSend && styles.disabled,
+              styles.driveContinueButton,
+              (!canContinue || props.loading) && styles.disabled,
               pressed && styles.pressed,
             ]}
           >
-            {props.chatThinking ? (
-              <ActivityIndicator color={COLORS.accentText} />
-            ) : (
-              <Ionicons name="arrow-up" size={18} color={COLORS.accentText} />
-            )}
+            <Text style={styles.driveContinueButtonText}>Continue to chatting</Text>
           </Pressable>
         </View>
-      </View>
+      )}
     </View>
   );
 }
@@ -7693,12 +7812,21 @@ const styles = StyleSheet.create({
     gap: 16,
     backgroundColor: COLORS.bg,
   },
+  driveSelectContent: {
+    gap: 16,
+  },
   driveHeaderCard: {
     padding: 16,
     borderRadius: 18,
     borderWidth: 1,
     borderColor: COLORS.border,
     backgroundColor: COLORS.surface,
+    gap: 12,
+  },
+  driveHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     gap: 12,
   },
   driveTitle: {
@@ -7793,6 +7921,23 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
     backgroundColor: COLORS.surface,
     gap: 12,
+  },
+  driveChatTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 6,
+  },
+  driveChatTopInfo: {
+    flex: 1,
+  },
+  driveChatTopActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
   },
   driveBrowserHeader: {
     flexDirection: 'row',
@@ -7923,5 +8068,24 @@ const styles = StyleSheet.create({
     fontSize: 12,
     flex: 1,
     fontFamily: FONT_SANS,
+  },
+  driveContinueBar: {
+    position: 'absolute',
+    left: 20,
+    right: 20,
+    alignItems: 'center',
+  },
+  driveContinueButton: {
+    width: '100%',
+    height: 46,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.accent,
+  },
+  driveContinueButtonText: {
+    color: COLORS.accentText,
+    fontSize: 14,
+    fontFamily: FONT_SANS_SEMIBOLD,
   },
 });
