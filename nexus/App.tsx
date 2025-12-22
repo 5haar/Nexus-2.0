@@ -146,12 +146,12 @@ const ACTIVE_THREAD_STORAGE_KEY_PREFIX = 'nexus.thread.active.';
 const TUTORIAL_SEEN_STORAGE_KEY = 'nexus.tutorialSeen.v1';
 const ONBOARDING_SEEN_STORAGE_KEY = 'nexus.onboardingSeen.v1';
 const CHAT_MODEL_OPTIONS = (() => {
-  const raw = process.env.EXPO_PUBLIC_CHAT_MODELS;
+  const raw = String(process.env.EXPO_PUBLIC_CHAT_MODELS ?? '').trim();
   const parsed = raw
-    ? raw.split(',').map((model) => model.trim()).filter(Boolean)
+    ? raw.split(',').map((model: string) => model.trim()).filter(Boolean)
     : [];
   const fallback = parsed.length ? parsed : [DEFAULT_CHAT_MODEL, 'gpt-4.1', 'gpt-4o-mini'];
-  return Array.from(new Set(fallback));
+  return Array.from(new Set(fallback)) as string[];
 })();
 const FEATURE_FLAGS = {
   paywall: process.env.EXPO_PUBLIC_ENABLE_PAYWALL === '1',
@@ -1063,7 +1063,7 @@ export default function App() {
       const results = Array.isArray(response) ? response : response?.purchases ?? [];
       const receipts = Array.from(
         new Set(results.map((item: any) => String(item?.transactionReceipt ?? '').trim()).filter(Boolean)),
-      );
+      ) as string[];
       if (!receipts.length) {
         showErrorToast('No previous purchases found.');
         return;
