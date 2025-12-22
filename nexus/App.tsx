@@ -157,6 +157,7 @@ const FEATURE_FLAGS = {
   paywall: process.env.EXPO_PUBLIC_ENABLE_PAYWALL === '1',
   auth: process.env.EXPO_PUBLIC_ENABLE_AUTH === '1',
 } as const;
+const IAP_DEBUG = process.env.EXPO_PUBLIC_IAP_DEBUG === '1';
 const PAYWALL_PRODUCT_IDS = {
   starter: process.env.EXPO_PUBLIC_IAP_STARTER_PRODUCT_ID || '',
   pro: process.env.EXPO_PUBLIC_IAP_PRO_PRODUCT_ID || '',
@@ -469,6 +470,11 @@ export default function App() {
   const [paywallReason, setPaywallReason] = useState('');
   const [iapReady, setIapReady] = useState(false);
   const [iapProductsById, setIapProductsById] = useState<Record<string, { price?: string }>>({});
+  const [iapDebugSnapshot, setIapDebugSnapshot] = useState<{
+    requested: string[];
+    received: string[];
+    error?: string;
+  } | null>(null);
   const [purchaseBusy, setPurchaseBusy] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const threadsRef = useRef<ChatThread[]>([]);
@@ -940,7 +946,16 @@ export default function App() {
         next[productId] = { price };
       }
       setIapProductsById(next);
+      const received = results
+        .map((item) => String(item?.productId ?? '').trim())
+        .filter(Boolean);
+      setIapDebugSnapshot({ requested: iapProductIds, received });
     } catch (err: any) {
+      setIapDebugSnapshot({
+        requested: iapProductIds,
+        received: [],
+        error: String(err?.message ?? 'Unable to load App Store products.'),
+      });
       showErrorToast(err?.message ?? 'Unable to load App Store products.');
     }
   }, [iapProductIds, showErrorToast]);
@@ -1811,6 +1826,8 @@ export default function App() {
             reason={paywallReason}
             plans={PAYWALL_PLANS}
             storeReady={iapReady}
+            debugEnabled={IAP_DEBUG}
+            debugInfo={iapDebugSnapshot}
             purchaseBusy={purchaseBusy}
             pricesByProductId={iapProductsById}
             onClose={() => setPaywallOpen(false)}
@@ -3781,6 +3798,8 @@ function PaywallModal(props: {
   reason: string;
   plans: typeof PAYWALL_PLANS;
   storeReady?: boolean;
+  debugEnabled?: boolean;
+  debugInfo?: { requested: string[]; received: string[]; error?: string } | null;
   purchaseBusy?: boolean;
   pricesByProductId?: Record<string, { price?: string }>;
   onClose: () => void;
@@ -3863,6 +3882,21 @@ function PaywallModal(props: {
                 );
               })}
             </View>
+            {props.debugEnabled && (
+              <View style={styles.paywallDebug}>
+                <Text style={styles.paywallDebugTitle}>IAP debug</Text>
+                <Text style={styles.paywallDebugText}>ready: {String(props.storeReady ?? false)}</Text>
+                <Text style={styles.paywallDebugText}>
+                  requested: {props.debugInfo?.requested?.length ? props.debugInfo.requested.join(', ') : 'none'}
+                </Text>
+                <Text style={styles.paywallDebugText}>
+                  received: {props.debugInfo?.received?.length ? props.debugInfo.received.join(', ') : 'none'}
+                </Text>
+                {!!props.debugInfo?.error && (
+                  <Text style={styles.paywallDebugText}>error: {props.debugInfo.error}</Text>
+                )}
+              </View>
+            )}
             <View style={styles.paywallFooter}>
               <Pressable onPress={props.onRestore} style={({ pressed }) => [styles.paywallLink, pressed && styles.pressed]}>
                 <Text style={styles.paywallLinkText}>Restore purchases</Text>
@@ -4698,6 +4732,26 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 10,
+  },
+  paywallDebug: {
+    marginTop: 12,
+    padding: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surfaceAlt,
+    gap: 4,
+  },
+  paywallDebugTitle: {
+    color: COLORS.text,
+    fontSize: 12,
+    fontFamily: FONT_SANS_SEMIBOLD,
+  },
+  paywallDebugText: {
+    color: COLORS.muted,
+    fontSize: 11,
+    lineHeight: 16,
+    fontFamily: MONO_FONT,
   },
   paywallLink: {
     paddingVertical: 6,
